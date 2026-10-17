@@ -1,6 +1,6 @@
 /* Arklite: small quality-of-life patches for Oni (Anniversary Edition).
  *
- * Loaded by the realbink.dll loader (../custom-game) with LoadLibraryA("Arklite.dll").
+ * Loaded by Arklite's loader (loader.c, built as realbink.dll) with LoadLibraryA("Arklite.dll").
  * Addresses are for the original Oni.exe (sha256 363cf09684ca6b729b62f22f90701d7ebf9a33778e55b191f5040bccdcdd013d).
  *
  * Patches:
@@ -29,7 +29,8 @@
  *   - No dream-lab classes in random costumes (random_class.c): AE's shared level0 put the
  *     half-size striker_dream_lab in every level's striker_easy random pool.
  *   - 255 characters, all active at once (char_limit.c): the stock 64 active slots crash the
- *     game when more AIs than that go into combat. */
+ *     game when more AIs than that go into combat.
+ *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
 #include "arklite.h"
 
@@ -103,10 +104,15 @@ static void __fastcall desktop_draw_background(void *context, void *partspec, u3
 
 int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 {
+	if (reason == 0 && reserved) {   /* DLL_PROCESS_DETACH, process exiting */
+		crash_log_exit();
+		return 1;
+	}
 	if (reason != 1) return 1;   /* DLL_PROCESS_ATTACH */
 
 	log_open("Arklite.log");
 	log_msg("Arklite loaded");
+	crash_log_install(instance);
 	more_options_install();
 	if (patch_call(ONcMainMenu_MusicFadeCall, (u32)SSrMusic_Fade, (u32)main_menu_music_fade))
 		log_msg("pause menu music: patched");

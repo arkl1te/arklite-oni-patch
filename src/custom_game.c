@@ -27,10 +27,10 @@ static int  g_ncustom;
 static char g_dataDir[MAX_PATH];               /* absolute, ends with '\' */
 static char g_igmdFormat[256] = "IGMD\\%s";
 static int  g_slot = -1;
-/* Debug: ONICUSTOM_AUTOSTART=<folder> opens Custom Game and plays that folder, as if clicked. */
+/* Debug: ARKLITE_AUTOSTART=<folder> opens Custom Game and plays that folder, as if clicked. */
 static char g_autostart[64];
 static int  g_autostartPending;
-/* ONICUSTOM_SAVEPOINT=<n> (with AUTOSTART): start that level at save point n. */
+/* ARKLITE_SAVEPOINT=<n> (with AUTOSTART): start that level at save point n. */
 static u32  g_autostartSavePoint;
 static u32  g_startSavePoint;
 
@@ -426,13 +426,13 @@ void custom_game_install(void)
 {
 	if (!GetFullPathNameA("GameDataFolder\\", sizeof g_dataDir, g_dataDir, 0)) g_dataDir[0] = 0;
 	log_msg("custom game: data folder %s", g_dataDir);
-	if (GetEnvironmentVariableA("ONICUSTOM_AUTOSTART", g_autostart, sizeof g_autostart) - 1 < sizeof g_autostart - 1)
+	if (GetEnvironmentVariableA("ARKLITE_AUTOSTART", g_autostart, sizeof g_autostart) - 1 < sizeof g_autostart - 1)
 		g_autostartPending = 1;
 	else
 		g_autostart[0] = 0;
 	{
 		char sp[8];
-		if (GetEnvironmentVariableA("ONICUSTOM_SAVEPOINT", sp, sizeof sp) - 1 < sizeof sp - 1 &&
+		if (GetEnvironmentVariableA("ARKLITE_SAVEPOINT", sp, sizeof sp) - 1 < sizeof sp - 1 &&
 		    sp[0] >= '0' && sp[0] <= '9')
 			g_autostartSavePoint = (u32)(sp[0] - '0');
 	}
