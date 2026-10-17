@@ -15,3 +15,5 @@ EXPORTS
   GetPrivateProfileIntA@16
   WritePrivateProfileStringA@16
   GetModuleHandleA@4
+  AddVectoredExceptionHandler@8
+  LoadLibraryA@4

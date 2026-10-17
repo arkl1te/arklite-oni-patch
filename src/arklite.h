@@ -40,6 +40,7 @@ __declspec(dllimport) u32    WINAPI GetPrivateProfileIntA(const char *, const ch
 __declspec(dllimport) int    WINAPI WritePrivateProfileStringA(const char *, const char *, const char *, const char *);
 __declspec(dllimport) int    WINAPI wvsprintfA(char *, const char *, va_list);
 __declspec(dllimport) HANDLE WINAPI GetModuleHandleA(const char *);
+__declspec(dllimport) void * WINAPI AddVectoredExceptionHandler(u32, void *);
 
 /* ---- common.c ---------------------------------------------------------------------------- */
 
@@ -98,3 +99,8 @@ void random_class_install(void);
 /* ---- char_limit.c ------------------------------------------------------------------------- */
 
 void char_limit_install(void);
+
+/* ---- crash_log.c -------------------------------------------------------------------------- */
+
+void crash_log_install(void *instance);   /* log faults with registers and stack */
+void crash_log_exit(void);                /* log the stack when the process exits */
