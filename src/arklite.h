@@ -99,6 +99,17 @@ void random_class_install(void);
 /* ---- char_limit.c ------------------------------------------------------------------------- */
 
 void char_limit_install(void);
+u32  char_limit_gs_offset(u32 offset);   /* a stock game state offset, where it is now */
+
+/* ---- lockstep.c -------------------------------------------------------------------------- */
+
+void lockstep_install(void);   /* ARKLITE_RECORD / ARKLITE_REPLAY: input record and replay */
+void lockstep_exit(void);      /* finish the recording or the replay report */
+
+/* ---- live_menu.c ------------------------------------------------------------------------- */
+
+void live_menu_install(void);
+int  live_menu_open(void);     /* the pause menu is open and the game runs behind it */
 
 /* ---- crash_log.c -------------------------------------------------------------------------- */
 

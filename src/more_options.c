@@ -163,15 +163,16 @@ void more_options_init(WMtWindow *dialog)
 	/* The stock title is too narrow to rename, so ours replaces it on this page. */
 	add(title, "More options", 0, 5, 10, 200, 20);
 
-	/* Display: the Graphics frame (y 50..150). "Pause Background:" is about 125 px in the
-	 * dialog font and wraps at 130, so the labels get 155. */
+	/* Display: the Graphics frame (x 5..305, y 50..150; its border art is several px thick and
+	 * the stock controls end by x 280). "Pause Background:" is about 125 px in the dialog font
+	 * and wraps in a 130 px label; "100%" is about 36 px. Everything ends by x 285. */
 	add(header, "Display", 0, 50, 35, 150, 20);
-	add(rowLabel, "HUD Scale:", 0, 30, 65, 155, 20);
-	hud = add(slider, "hud scale", ID_HUD_SCALE, 188, 65, 72, 20);
-	g_hudValue = add(rowLabel, "", 0, 263, 65, 44, 20);
-	add(rowLabel, "Pause Background:", 0, 30, 90, 155, 20);
-	background = add(slider, "pause background", ID_PAUSE_BACKGROUND, 188, 90, 72, 20);
-	g_backgroundValue = add(rowLabel, "", 0, 263, 90, 44, 20);
+	add(rowLabel, "HUD Scale:", 0, 30, 65, 140, 20);
+	hud = add(slider, "hud scale", ID_HUD_SCALE, 173, 65, 64, 20);
+	g_hudValue = add(rowLabel, "", 0, 241, 65, 44, 20);
+	add(rowLabel, "Pause Background:", 0, 30, 90, 140, 20);
+	background = add(slider, "pause background", ID_PAUSE_BACKGROUND, 173, 90, 64, 20);
+	g_backgroundValue = add(rowLabel, "", 0, 241, 90, 44, 20);
 
 	/* When Game Pauses: the Sound frame (y 175..275) */
 	add(header, "When Game Pauses", 0, 50, 160, 200, 20);

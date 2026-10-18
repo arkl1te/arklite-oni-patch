@@ -291,7 +291,9 @@ static u8 ONI_FC options_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	u32 id = p1 & 0xffff;
 	u8 handled;
 
-	if (msg == WMcMessage_Cancel && more_options_cancel(dialog)) return 1;
+	/* Esc arrives as Close (id 2, click) with no window; a real Close click passes the button. */
+	if (msg == WMcMessage_Command && id == 2 && (p1 >> 16) == WMcNotify_Click && !p2 && more_options_cancel(dialog))
+		return 1;
 	if (msg == WMcMessage_Command && more_options_command(dialog, id, p1 >> 16)) return 1;
 	if (msg == WMcMessage_Command && (id == ID_SOUND || id == ID_MUSIC || id == ID_VOICE)) {
 		int c = id == ID_SOUND ? CAT_SOUND : id == ID_MUSIC ? CAT_MUSIC : CAT_VOICE;
@@ -336,6 +338,6 @@ void volume_install(void)
 	n += patch_call(SLcAmbient_StartCall, (u32)SSrAmbient_Start2D, (u32)script_ambient_start);
 	n += patch_push_imm32(SLcMusicStartPushAddr, (u32)SLrSound_AmbientStart, (u32)sound_music_start);
 	n += patch_push_imm32(ONcOptions_ProcPushAddr, ONcOptions_Proc, (u32)options_proc);
-	total += 7;
+	total += 6;
 	log_msg("volume: %d of %d patches applied (settings in %s)", n, total, ini_path());
 }

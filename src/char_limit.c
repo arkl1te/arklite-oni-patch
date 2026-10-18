@@ -136,6 +136,13 @@ static u32 relocate(u32 offset)
 	return offset;
 }
 
+static int g_installed;
+
+u32 char_limit_gs_offset(u32 offset)
+{
+	return g_installed ? relocate(offset) : offset;
+}
+
 static int sites_match(u32 base, const struct cl_site *s, unsigned n, const char *what)
 {
 	for (unsigned i = 0; i < n; i++)
@@ -192,6 +199,7 @@ void char_limit_install(void)
 		patch_write(edits[i].addr, edits[i].value, edits[i].n);
 	sites_patch(0, cl_oni_sites, n_oni);
 	if (daodan) sites_patch(daodan, cl_daodan_sites, n_daodan);
+	g_installed = 1;
 	log_msg("character limits: %d characters, all active (game state 0x%x bytes, %d + %d sites)",
 	        CL_LIMIT, CL_NEW_SIZE, n_oni, daodan ? n_daodan : 0);
 }

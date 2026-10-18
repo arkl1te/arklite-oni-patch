@@ -17,3 +17,8 @@ EXPORTS
   GetModuleHandleA@4
   AddVectoredExceptionHandler@8
   LoadLibraryA@4
+  ReadFile@20
+  CloseHandle@4
+  GetFileSize@8
+  VirtualAlloc@16
+  VirtualFree@12

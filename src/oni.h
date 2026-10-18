@@ -36,8 +36,10 @@ typedef u8 (ONI_FC *WMtDialogProc)(WMtWindow *dialog, u32 msg, u32 p1, u32 p2);
 
 #define WMcMessage_Command    0x17
 #define WMcMessage_InitDialog 0x3d
-/* Posted to a dialog for Esc (key 0x1b) by the default dialog proc (0x468cd0), which then
- * turns it into Command(id 2, notify 1, no window) unless the dialog proc handles it. */
+/* Esc (key 0x1b) in a dialog: the dialog class proc (0x468cd0) posts itself msg 0x14 and
+ * handles that itself, sending Command(id 2, notify 1, p2 = 0) to the dialog proc. The dialog
+ * proc only ever sees the Command (the class proc calls it for 0x17 only); a button click
+ * sends p2 = the button. If the dialog proc returns 0, the class proc ends the modal. */
 #define WMcMessage_Cancel     0x14
 #define WMcNotify_Click       1
 #define WMcNotify_DoubleClick 2

@@ -30,6 +30,8 @@
  *     half-size striker_dream_lab in every level's striker_easy random pool.
  *   - 255 characters, all active at once (char_limit.c): the stock 64 active slots crash the
  *     game when more AIs than that go into combat.
+ *   - Live pause menu (live_menu.c): the game keeps running behind the pause menu.
+ *   - Input record and replay (lockstep.c): the determinism test for multiplayer.
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
 #include "arklite.h"
@@ -63,8 +65,8 @@
 
 static void __stdcall main_menu_music_fade(float volume, float seconds)
 {
-	/* opened from a level: the pause menu */
-	if (ONrLevel_GetCurrent() && pause_music_mode() != PAUSE_MUSIC_THEME) {
+	/* opened from a level: the pause menu (no theme over a game that keeps running) */
+	if (ONrLevel_GetCurrent() && (pause_music_mode() != PAUSE_MUSIC_THEME || live_menu_open())) {
 		volume = 0.0f;
 		seconds = 0.0f;
 	}
@@ -76,6 +78,7 @@ static void main_menu_stop_channels(void)
 	u8 *pools[2] = { SSgChannels1, SSgChannels2 };
 	u32 counts[2] = { SSgChannelCount1, SSgChannelCount2 };
 
+	if (live_menu_open()) return;   /* the game goes on, and so do its sounds */
 	/* title screen, or the level's music isn't kept: as before */
 	if (!ONrLevel_GetCurrent() || pause_music_mode() != PAUSE_MUSIC_KEEP) {
 		SSrChannels_StopAll();
@@ -105,6 +108,7 @@ static void __fastcall desktop_draw_background(void *context, void *partspec, u3
 int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 {
 	if (reason == 0 && reserved) {   /* DLL_PROCESS_DETACH, process exiting */
+		lockstep_exit();
 		crash_log_exit();
 		return 1;
 	}
@@ -125,5 +129,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	hud_scale_install();
 	random_class_install();
 	char_limit_install();
+	lockstep_install();
+	live_menu_install();
 	return 1;
 }
