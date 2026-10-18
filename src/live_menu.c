@@ -1,4 +1,6 @@
-/* Live pause menu: Esc opens the menu, but the game keeps running behind it.
+/* Live pause menu, for multiplayer games only: Esc opens the menu, but the game keeps running
+ * behind it. In single player (no player 2, see multiplayer_active in players.c) Esc pauses
+ * exactly as in stock Oni: Arklite runs the stock sequence at once, inside the tick.
  *
  * Stock Oni: utility input (0x4f6200, called by the tick at 0x4fa91c; Daodan replaces that call)
  * sees Esc inside the tick and calls 0x4bec00: UI mode on (0x476110), game input off
@@ -22,7 +24,14 @@
  * longer being ours: leaving the level clears it) and while the game's own pause flag is set
  * (gs+0x1679ac, as the main loop does).
  *
- * Arklite.ini [options] live_menu=0 brings back the stock pause. */
+ * In a multiplayer game nothing pauses:
+ *   - the pause menu is always live;
+ *   - any other dialog opened outside a tick in a level runs live the same way (the help and
+ *     objectives screen, dialog 0x46, from the main loop through 0x5018c0);
+ *   - a dialog opened inside a tick isn't shown, since a game frame can't run in the middle of
+ *     a tick (the text console screen, dialog 0x47 from 0x504cc5);
+ *   - the game's own pause flag (gs+0x1679ac, read by the main loop through 0x4fc960) is
+ *     cleared every frame. */
 #include "arklite.h"
 
 #define ONrPauseMenu_Run        0x4bec00                   /* the whole Esc sequence, replaced */
@@ -47,7 +56,7 @@
 #define ONcPauseMenu_SoundPauseCall 0x4d2d4a               /* init: call SSrSetPaused(1) */
 #define SSrSetPaused            ((void (ONI_FC *)(u32))0x514e60)
 
-static int g_enabled, g_open, g_pending;
+static int g_open, g_pending;
 static u32 g_menu_level;
 static void (ONI_FC *g_utility_input)(void *);
 
@@ -90,9 +99,14 @@ static void live_frame(void)
 	ONrGameState_Display();
 }
 
+static int live_wanted(void)
+{
+	return multiplayer_active() && ONrLevel_GetCurrent();
+}
+
 static void run_menu(void)
 {
-	int live = g_enabled && ONrLevel_GetCurrent();
+	int live = live_wanted();
 
 	WMrUIMode_Enter();
 	LIrMode_SetGameInput(0);
@@ -114,7 +128,7 @@ static void run_menu(void)
 /* Replaces 0x4bec00, called from inside a tick */
 static void pause_request(void)
 {
-	if (!g_enabled || !ONrLevel_GetCurrent()) {
+	if (!live_wanted()) {
 		run_menu();
 		return;
 	}
@@ -125,6 +139,7 @@ static void pause_request(void)
 static void main_loop_sound(void)
 {
 	SSrUpdate();
+	if (multiplayer_active()) *gs_field(GS_PAUSED) = 0;
 	if (g_pending) {
 		g_pending = 0;
 		g_menu_level = ONrLevel_GetCurrent();
@@ -135,6 +150,28 @@ static void main_loop_sound(void)
 static void ONI_FC pause_menu_sound_pause(u32 paused)
 {
 	if (!g_open) SSrSetPaused(paused);   /* the game goes on: so do its new sounds */
+}
+
+u16 live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick)
+{
+	static int told;
+	u16 r;
+
+	if (g_open || !multiplayer_active() || !ONrLevel_GetCurrent())
+		return WMrDialog_ModalBegin(id, parent, proc, param, result);
+	if (in_tick) {
+		if (!told++) log_msg("live menu: dialog 0x%x opened inside a tick, not shown in a multiplayer game", id);
+		if (result) *result = 0;
+		return 0;
+	}
+	if (WMgDrawHook != ONrGameState_Display) return WMrDialog_ModalBegin(id, parent, proc, param, result);
+	g_menu_level = ONrLevel_GetCurrent();
+	g_open = 1;
+	WMgDrawHook = live_frame;
+	r = WMrDialog_ModalBegin(id, parent, proc, param, result);
+	if (WMgDrawHook == live_frame) WMgDrawHook = ONrGameState_Display;
+	g_open = 0;
+	return r;
 }
 
 static void ONI_FC utility_input(void *action)
@@ -148,17 +185,11 @@ void live_menu_install(void)
 	u8 jmp[5] = { 0xe9 };
 	u32 rel = (u32)pause_request - (ONrPauseMenu_Run + 5);
 
-	g_enabled = GetPrivateProfileIntA("options", "live_menu", 1, ini_path()) != 0;
-	if (!g_enabled) {
-		log_msg("live menu: off (live_menu=0), Esc pauses the game");
-		return;
-	}
 	g_utility_input = (void *)call_target(ONcTick_UtilityInputCall);
 	if (!code_matches(ONrPauseMenu_Run, entry, 1) || call_target(ONrPauseMenu_Run) != (u32)WMrUIMode_Enter ||
 	    call_target(ONcMainLoop_SoundCall) != (u32)SSrUpdate || !call_target(ONcMainLoop_UpdateCall) ||
 	    !g_utility_input || call_target(ONcPauseMenu_SoundPauseCall) != (u32)SSrSetPaused) {
-		log_msg("live menu: game code changed, skipped (Esc pauses the game)");
-		g_enabled = 0;
+		log_msg("live menu: game code changed, skipped (Esc pauses the game, also in multiplayer)");
 		return;
 	}
 	*(u32 *)(jmp + 1) = rel;
@@ -166,5 +197,5 @@ void live_menu_install(void)
 	patch_call(ONcMainLoop_SoundCall, (u32)SSrUpdate, (u32)main_loop_sound);
 	patch_call(ONcTick_UtilityInputCall, (u32)g_utility_input, (u32)utility_input);
 	patch_call(ONcPauseMenu_SoundPauseCall, (u32)SSrSetPaused, (u32)pause_menu_sound_pause);
-	log_msg("live menu: the game keeps running behind the pause menu");
+	log_msg("live menu: in multiplayer games the game keeps running behind the pause menu");
 }

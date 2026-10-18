@@ -1,24 +1,144 @@
-# Arklite (Oni AE mod)
+# Arklite for Oni
 
-Quality-of-life patches for Oni, in one DLL (`build/Arklite.dll`), plus a small loader that gets it into the game (see [Loading](#loading)).
+Quality-of-life patches and multiplayer groundwork for [Oni](https://oni.bungie.org/)'s
+Anniversary Edition, in one DLL. Arklite doesn't change any game file: it patches Oni in memory
+when the game starts, and checks every patch site first, so a patch that doesn't match is skipped
+and written to `AE/Arklite.log`.
 
-| Patch | What it does |
+Arklite is an unofficial fan project. It isn't affiliated with or endorsed by Bungie, Take-Two
+Interactive or Rockstar, and it contains no Oni code or data: you need your own copy of Oni.
+
+## What it offers
+
+| Feature | What it does |
 | --- | --- |
-| Custom Game | Adds a **Custom Game** button to the main menu that lists and starts custom levels. See below. |
-| Options > More... | A **More...** button next to Close opens a second page of options (below). Saved in `AE/Arklite.ini`, `[options]`. |
+| Custom Game | A **Custom Game** button on the main menu lists and starts custom levels from `AE/GameDataFolder/CustomLevels/`. Levels don't need a unique level number. See [Custom Game](#custom-game). |
+| Options > More... | A **More...** button next to Close opens a second page of options (below). |
 | HUD scale | **HUD Scale** (50–300%) grows or shrinks the health and weapon rings toward their screen corners. The stock HUD is a fixed number of pixels, so it gets tiny at high resolutions. |
-| Live pause menu | Esc opens the pause menu, but the game keeps running behind it: enemies keep fighting and Konoko stands still until you resume. Needed for multiplayer. `live_menu=0` in `AE/Arklite.ini` `[options]` brings back the stock pause. See below. |
+| Sound, Music and Voice volume | Options > Overall Volume becomes three sliders: **Sound Volume** (effects and ambience), **Music Volume** (music and Bink movies) and **Voice Volume** (character dialog). |
 | Pause menu background | **Pause Background** sets the opacity of the black behind the pause menu (default 33%, so the paused game shows through). 100% is the original. |
-| When game pauses | **Keep playing level music** (default): if the level is playing music (`sound_music_start`), it goes on under the pause menu; other sounds still pause. **Play Main Theme (original)**: the stock `main_menu_win`. **Silence**: everything pauses and nothing plays. The title screen always keeps its music. |
-| Sound, Music and Voice volume | Options > Overall Volume becomes three sliders: **Sound Volume** (effects and ambience), **Music Volume** (music and Bink movies) and **Voice Volume** (character dialog). Saved in `AE/Arklite.ini`. |
-| 255 characters, all active | Raises the character limit from 128 to 255 and the active-character limit from 64 to 255, so big fights no longer crash. See below. |
-| No tiny strikers outside the dream lab | Randomized enemies no longer pick the dream lab's half-size striker (or its giant Shinatama). AE moved those classes into the shared `level0`, so about one random striker in four came out tiny. See below. |
-| Sound RNG | Ambient sounds and sound variants pick from their own random numbers, so they no longer shift the game's (the AI's). Needed for multiplayer; sounds are as random as before. See below. |
-| Tick-only effects RNG | Particles, bullets included, no longer take their random numbers from a stream that drawing reseeds, so a bullet flies the same way whatever was on screen. Needed for multiplayer. See below. |
-| Speech timing | A character's line ends after its length in game ticks, not when the sound card says it stopped. Needed for multiplayer. See below. |
-| Input record and replay | Step 1 toward multiplayer: records a level's input and replays it, checking every tick that the game came out the same. Off unless `ARKLITE_RECORD` or `ARKLITE_REPLAY` is set. See below. |
+| When game pauses | **Keep playing level music** (default): level music goes on under the pause menu; other sounds still pause. **Play Main Theme (original)**: the stock menu theme. **Silence**: everything pauses and nothing plays. |
+| Live pause menu | Esc opens the pause menu, but the game keeps running behind it: enemies keep fighting and Konoko stands still until you resume. `live_menu=0` brings back the stock pause. See [Live pause menu](#live-pause-menu). |
+| 255 characters, all active | Raises the character limit from 128 to 255 and the active-character limit from 64 to 255, so big fights no longer crash the game. See [Character limits](#character-limits). |
+| No tiny strikers outside the dream lab | Randomized enemies no longer pick the dream lab's half-size striker (or its giant Shinatama). AE moved those classes into the shared `level0`, so about one random striker in four came out tiny. See [Random costumes](#random-costumes). |
+| Player 2 on a gamepad | A second character with the IsPlayer flag in a level is played on an XInput gamepad, next to Konoko on keyboard and mouse. See [Player 2](#player-2-multiplayer-step-2). |
+| Determinism fixes | Ambient sounds, particles and speech no longer depend on the frame rate, the sound card or what is on screen, so the same input always gives the same game. Multiplayer needs this; in normal play you won't notice a difference. |
+| Input record and replay | For testing: records a level's input and replays it, checking every tick that the game came out the same. Off unless `ARKLITE_RECORD` or `ARKLITE_REPLAY` is set. See [Record and replay](#record-and-replay-multiplayer-step-1). |
+| Crash log | If Oni crashes, `AE/Arklite.log` gets the registers and the stack values that point into Oni, Daodan or Arklite. |
 
-## How it works
+Multiplayer over the network isn't in yet; the player 2 and record/replay features are the
+first steps toward it.
+
+## Requirements
+
+- **Oni**, the retail PC version, installed. Arklite was made against the `Oni.exe` that AE
+  installs (sha256 `363cf09684ca6b729b62f22f90701d7ebf9a33778e55b191f5040bccdcdd013d`); with
+  another one, any patch that doesn't match is skipped.
+- **Oni Anniversary Edition** (AE 7, AE Installer 2) with its **Daodan DLL** (v4.1), installed
+  in `Oni/AE/`. Daodan is what loads Arklite. Get AE from <https://oni.bungie.org/>.
+- **Windows**, or **Linux/macOS with Wine**. Arklite is a 32-bit Windows DLL, like Oni.
+- Optional: an **XInput gamepad** (Xbox controller or compatible) for player 2.
+
+## Install
+
+1. Download `Arklite-<version>.zip` from the [Releases](../../releases) page and extract it
+   anywhere (into `Oni/` or `Oni/AE/` works best: the installer finds the game on its own).
+2. Close Oni.
+3. Run the installer:
+   - **Windows**: double-click `install.bat`. If Oni is in a protected folder such as
+     `C:\Program Files (x86)`, right-click it and pick **Run as administrator**. If it can't find
+     the game it asks for the AE folder; you can also pass it: `install.bat "D:\Games\Oni\AE"`.
+   - **Linux/macOS (Wine)**: `./install.sh`, or `./install.sh "/path/to/drive_c/Program Files (x86)/Oni/AE"`.
+     Without a path it looks in `~/.wine`, `~/Games/*` and Bottles prefixes, and next to itself.
+4. Start Oni from `Oni/AE/` as usual. The main menu has a **Custom Game** button, and
+   `AE/Arklite.log` lists what was patched.
+
+The installer puts three files in `AE/`:
+
+| File | What |
+| --- | --- |
+| `Arklite.dll` | The mod. |
+| `realbink.dll` | Arklite's 3.5 KB loader. Daodan loads a DLL by this name, so the loader takes it. |
+| `bink_orig.dll` | AE's original `realbink.dll` (the Bink video DLL), renamed. The loader forwards Bink calls to it. It isn't part of the download: the installer renames your own copy. |
+
+It also makes `AE/GameDataFolder/CustomLevels/` and, the first time, copies `AE/persist.dat`
+(your saves and settings) to `AE/persist.dat.before-arklite`.
+
+**Updating**: run the new version's installer over the old one. **After running the AE
+Installer**, run Arklite's installer again: the AE Installer may put the original
+`realbink.dll` back, and Oni then starts without Arklite (nothing breaks).
+
+## Uninstall
+
+- **Windows**: double-click `uninstall.bat` (as administrator if Oni is in `Program Files`).
+- **Linux/macOS (Wine)**: `./uninstall.sh` (or with the AE folder's path).
+
+This removes `Arklite.dll`, puts the original `realbink.dll` back and removes
+`CustomLevels/` if it's empty. Your settings (`AE/Arklite.ini`) and log are kept; pass
+`/purge` (Windows) or `--purge` (Linux) to remove them too. Custom levels, recordings (`*.akr`),
+`persist.dat` and `persist.dat.before-arklite` are never removed.
+
+To uninstall by hand: close Oni, delete `AE/Arklite.dll` and `AE/realbink.dll`, then rename
+`AE/bink_orig.dll` to `realbink.dll`.
+
+## Settings
+
+The Options dialog writes them, and you can edit `AE/Arklite.ini` with Oni closed:
+
+| Section | Key | Default | What |
+| --- | --- | --- | --- |
+| `[options]` | `hud_scale` | 100 | HUD scale in percent, 50–300 |
+| | `pause_background` | 33 | Opacity of the black behind the pause menu, 0–100 |
+| | `pause_music` | `keep` | `keep` (level music goes on), `theme` (original menu theme) or `silence` |
+| | `live_menu` | 1 | 0: the game pauses behind the pause menu, as in the original (not in a two-player game) |
+| `[volume]` | `sound`, `music`, `voice` | Overall Volume | 0–100 each; a missing key starts at your old Overall Volume |
+| `[players]` | `p2` | 1 | 0: no player 2 |
+| | `p2_pad` | 0 | Which gamepad plays player 2, 0–3 |
+| | `p2_aim_speed` | 8 | Aim per tick at full right stick |
+| | `p2_invert_y` | 0 | 1: invert the right stick's up/down |
+
+Environment variables, for testing (set them before starting `Oni.exe`):
+
+| Variable | What |
+| --- | --- |
+| `ARKLITE_AUTOSTART=<folder>` | Opens Custom Game and plays `CustomLevels/<folder>` |
+| `ARKLITE_SAVEPOINT=<n>` | With `ARKLITE_AUTOSTART`, starts at save point n |
+| `ARKLITE_RECORD=<file>` | Records the first level played into `AE/<file>` |
+| `ARKLITE_REPLAY=<file>` | Replays `AE/<file>` and writes `MATCHED` or `DESYNCED` to `AE/Arklite.log` |
+
+On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`, `Oni.exe`.
+
+## Troubleshooting
+
+- **No Custom Game button**: open `AE/Arklite.log`. If it is missing or says
+  `Arklite.dll not found`, run the installer again. Check that you started the `Oni.exe` in
+  `Oni/AE/`, not the one in `Oni/`.
+- **A feature does nothing**: `AE/Arklite.log` says which patches were applied. A patch is skipped
+  when the code at its address isn't what Arklite expects (a different `Oni.exe` or Daodan).
+- **Oni crashes**: the end of `AE/Arklite.log` has the crash registers and stack. Include
+  it, and the version on its first line, when you report the problem.
+
+## Building from source
+
+You need `clang`, `lld` and `llvm-dlltool` (any recent LLVM; no MinGW or Visual Studio). On
+Arch/CachyOS: `pacman -S clang lld llvm`; on Debian/Ubuntu: `apt install clang lld llvm`.
+
+```sh
+./build.sh      # build/Arklite.dll and build/realbink.dll
+./package.sh    # dist/Arklite-<version>.zip, the release zip
+./install.sh    # from the repository: links build/*.dll into AE/, so a rebuild needs no reinstall
+```
+
+The version is in `VERSION`, and Arklite writes it at the top of `AE/Arklite.log`.
+
+**Releasing**: put the new version in `VERSION`, commit, then tag and push it
+(`git tag v0.1.0 && git push origin v0.1.0`). The GitHub workflow
+(`.github/workflows/build.yml`) builds every push and pull request, and for a `v*` tag
+that matches `VERSION` it publishes a release with the zip attached.
+
+The rest of this file is how each patch works, with the Oni addresses it uses.
+
+## Pause menu music and background
 
 The pause menu is the main menu dialog (0x96). Its init handler (0x4d2cd0, msg 0x3d) starts
 the `main_menu_win` music at full volume, then fades it to 1.0 over 0.5 s with the call at
@@ -119,7 +239,61 @@ come out as 0xffff, the "no character" handle.
 that addresses the tail, and writes `src/char_limit_sites.h`. At load, Arklite checks every site
 first. If any of them differs, it patches nothing and the stock limits stay.
 
+## Player 2 (multiplayer step 2)
+
+Place a second character with the **IsPlayer** flag in the map (in Catwalk, copy the player
+start and give it another name). Konoko stays player 1 on keyboard and mouse; the other one is
+player 2, on the first XInput gamepad. The camera follows Konoko.
+
+| Gamepad | Action |
+| --- | --- |
+| Left stick | forward, backward, step left, step right |
+| Right stick | aim |
+| A / B / X / Y | jump / crouch / punch / kick |
+| RT / LT / R3 | fire1 / fire2 / fire3 |
+| RB / LB / L3 | action / walk / block |
+| Back | hypo |
+| D-pad up / left or right / down | reload / swap / drop |
+
+A game with player 2 is a **multiplayer game**, and in one:
+
+- **Auto-aim is off.** Auto-aim (0x4efad0, in the tick, called at 0x4de1ed and 0x4de211) pulls the
+  shooter's aim onto a hostile within 500 units that is on the local screen. Each player sees
+  different characters, and with lag players aim ahead of their target instead.
+- **Nothing pauses.** The pause menu is live. Any other dialog opened
+  outside a tick runs live the same way (the help and objectives screen, dialog 0x46, from the
+  main loop through 0x5018c0). A dialog opened inside a tick isn't shown, since a game frame
+  can't run in the middle of a tick (the text console screen, dialog 0x47, from 0x504cc5). The
+  game's own pause flag (gs+0x1679ac, read by the main loop through 0x4fc960) is cleared every frame.
+
+`[players]` in `AE/Arklite.ini`: `p2=0` turns player 2 off, `p2_pad` picks the gamepad (0–3),
+`p2_aim_speed` sets the aim per tick at full right stick (8; Konoko's mouse turns about 1–7
+per tick), `p2_invert_y=1` inverts up/down.
+
+How it works: AI setup (0x48a6b0) gives a Player-flagged placement `charType` 0 (+0x1e8, no AI;
+AI characters are 2), and the first one is `PlayerCharacter` (gs+0xac). Oni spawns only that first
+one: the level start walks the CHAR objects (0x4d0080) with 0x48a3a0, which spawns the first
+IsPlayer object (+0x2c bit 0; +0x2c |= 0x20 once spawned; `ONrGameState_NewCharacter` 0x4dac50)
+and stops. Arklite wraps the three walks that use it (0x48a2ee, 0x48a419, 0x48a518) and then
+spawns every other IsPlayer character that isn't spawned yet. Each tick turns its
+action record into the input state at gs+0xb8 (+0 aim up/down from record +0x28, +4 aim
+left/right from +0x24, then buttons held, not held, pressed and released as 64-bit masks; the
+buttons go through 0x4fa520, which reads gs+0xac) and gives it to the player with
+`ONrCharacter_SetInput` (0x4ed420, call at 0x4fa934), which copies it into the character's
+active data at +0x2158. The AI drives its characters through that same slot. Arklite wraps that
+call: after Konoko, it builds player 2's input state the same way from player 2's record, with
+gs+0xac pointing at player 2 while 0x4fa520 runs, and calls 0x4ed420 for player 2.
+
+Player 2's record is made once per frame from the gamepad (the first tick of the frame gets it,
+like Daodan's input does for Konoko) and goes into recordings, so record and replay cover both
+players. The action bits come from the binding table at 0x52daf8 (`{u16 type, u16 index, char
+name[32]}`): escape 0, console 1, forward 21, backward 22, turn 23/24, step 25/26, jump 27,
+crouch 28, punch 29, kick 30, block 31, walk 32, action 33, hypo 34, reload 35, swap 36, drop
+37, fire1–3 38–40; aim left/right and up/down are floats at +0x24 and +0x28.
+
 ## Live pause menu
+
+Only in a multiplayer game (one with player 2); single player pauses exactly as stock Oni.
 
 Stock Oni pauses when Esc opens the menu: utility input (0x4f6200, called by the tick at
 0x4fa91c, which Daodan replaces) sees Esc inside the tick and calls 0x4bec00, which turns UI
@@ -127,7 +301,8 @@ mode on (0x476110) and game input off (0x403f70(0)), runs the pause menu (0x4d2c
 0x96), and turns both back. The modal loop (0x4689d0) keeps drawing the game through the draw
 hook at 0x5e96cc (the game display 0x4fb480 while a level is loaded), but nothing updates it.
 
-Arklite replaces 0x4bec00. In a level, the request waits until the frame's update is done (the
+Arklite replaces 0x4bec00. In single player it runs the stock sequence at once. In a multiplayer
+game the request waits until the frame's update is done (the
 main loop's sound update call at 0x4d4746), so the menu never opens inside a tick. While the
 menu is open, the draw hook runs a whole game frame: the (empty) input buffer, server time, the
 game update through the main loop's own call (so record and replay still see it), the sound
@@ -140,7 +315,7 @@ could start), and Arklite skips that call while the game runs behind the menu.
 
 The game stops running behind the menu when the level ends (gs+0x1679bc) or is left (leaving
 clears the draw hook), and while the game's own pause flag is set (gs+0x1679ac), as in the main
-loop. `live_menu=0` in `[options]` of `AE/Arklite.ini` brings back the stock pause.
+loop.
 
 ## Record and replay (multiplayer step 1)
 
@@ -223,11 +398,23 @@ characters fighting; the replay loads the whole file.
 The button lists every level in `GameDataFolder/CustomLevels/` plus any installed level whose
 number isn't from the original game. The chosen level is added to the engine's level table
 under a free number (31 or lower) when it is picked, so custom levels don't need a unique
-level number. Level folder layout and known gaps: [../custom-game/README.md](../custom-game/README.md).
-Engine addresses: [../docs/custom-game.md](../docs/custom-game.md) and `src/oni.h`.
+level number: they aren't in `GameDataFolder` at startup, so the engine never sees two files
+with the same number.
 
-For testing (Catwalk's Play uses this), `ARKLITE_AUTOSTART=<folder>` opens Custom Game and
-plays that folder as if clicked, and `ARKLITE_SAVEPOINT=<n>` starts it at save point n.
+```
+CustomLevels/<AnyFolderName>/
+    level.ini              [level] name=Shown in the list
+    levelN_Final.dat/.raw  any N; other level*.dat files (plugins) in the folder are loaded too
+    IGMD/<level name>/     BSL scripts (optional; otherwise GameDataFolder/IGMD is used)
+```
+
+Known gaps: the screen reuses the Load Game dialog, so its background art still says "Load
+Game"; save points made in a custom level go to the persist.dat slot it was mounted in; and
+what happens when a custom level ends (its "next level") isn't handled yet. Engine addresses are
+in `src/oni.h`.
+
+For testing, `ARKLITE_AUTOSTART=<folder>` opens Custom Game and plays that folder as if
+clicked, and `ARKLITE_SAVEPOINT=<n>` starts it at save point n.
 
 ## Loading
 
@@ -238,10 +425,10 @@ it. Arklite's loader (`src/loader.c`, 3.5 KB) takes that name. It forwards the 1
 to the original Bink, renamed `bink_orig.dll` (`src/realbink.def`), and loads `Arklite.dll`.
 Everything else is in `Arklite.dll`.
 
-A release is three files for `AE/`: `Arklite.dll`, `realbink.dll` (the loader) and
-`bink_orig.dll` (a copy of AE's original `realbink.dll`). Running the AE Installer again may put
-the original `realbink.dll` back. On this machine `install.sh` links them instead (the original
-goes to `backup/`).
+A release ships `Arklite.dll` and `realbink.dll` (the loader). `bink_orig.dll` is the player's
+own `realbink.dll` from AE, which the installer renames, so no Bink or AE file is redistributed.
+The installers tell the loader from the original by its size (the loader is 3.5 KB, Bink about
+280 KB) and, in the shell scripts, by its "Arklite.dll not found" string.
 
 Arklite logs to `AE/Arklite.log`: what it patched, and for any crash the registers and every
 stack value that points into Oni.exe, Daodan or Arklite (Wine prints nothing when Oni dies
@@ -251,14 +438,15 @@ while loading a level). If `Arklite.dll` is missing, the loader writes that ther
 
 | File | What |
 | --- | --- |
-| `src/arklite.c` | `DllMain` and the pause menu patches |
+| `src/arklite.c` | `DllMain` (logs the version) and the pause menu patches |
 | `src/more_options.c` | Options > More...: the second page and its settings |
 | `src/hud_scale.c` | HUD scale: scales the HUD's draw calls |
 | `src/custom_game.c` | Custom Game: menu hook, dialog, level mounting, script-folder redirect |
 | `src/volume.c` | Sound/Music/Voice volume: mixer hooks and the Options dialog rows |
 | `src/random_class.c` | Keeps the dream lab classes out of random costume pools |
 | `src/char_limit.c`, `src/char_limit_sites.h` | 255 characters and active characters (the header is generated by `tools/gen_char_limit.py`) |
-| `src/live_menu.c` | Live pause menu: the game keeps running behind it |
+| `src/players.c` | Player 2: the second Player-flagged character, on a gamepad |
+| `src/live_menu.c` | Live pause menu (multiplayer only): the game keeps running behind it |
 | `src/lockstep.c` | Input record and replay: the determinism test for multiplayer |
 | `src/crash_log.c` | Crash log: a vectored exception handler and the stack at exit |
 | `src/loader.c`, `src/realbink.def` | The loader (`realbink.dll`): loads `Arklite.dll`, forwards the Bink exports to `bink_orig.dll` |
@@ -267,7 +455,11 @@ while loading a level). If `Arklite.dll` is missing, the loader writes that ther
 
 ## Scripts
 
-- `build.sh`: builds `build/Arklite.dll` and `build/realbink.dll` with clang + lld
-- `install.sh` / `uninstall.sh`: link `AE/Arklite.dll`, `AE/realbink.dll`, `AE/bink_orig.dll` and
-  `AE/GameDataFolder/CustomLevels` (`../custom-game/CustomLevels`), or remove the links and
-  put the original `realbink.dll` back
+| File | What |
+| --- | --- |
+| `build.sh` | Builds `build/Arklite.dll` and `build/realbink.dll` with clang + lld |
+| `package.sh` | Builds and makes `dist/Arklite-<version>.zip` |
+| `install.sh` / `uninstall.sh` | Install or remove (Linux/macOS, Wine). From a release, copies; from the repository, links `build/*.dll`, and links `AE/GameDataFolder/CustomLevels` to `../custom-game/CustomLevels` when that folder exists |
+| `install.bat` / `uninstall.bat` | Install or remove (Windows) |
+| `tools/gen_char_limit.py` | Regenerates `src/char_limit_sites.h` from your own `Oni.exe` and Daodan |
+| `.github/workflows/build.yml` | CI build; publishes a release for a `v*` tag |
