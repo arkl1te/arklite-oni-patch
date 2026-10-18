@@ -79,7 +79,8 @@
 #define MAX_CALLS    16384                     /* RNG callers kept per tick */
 
 #define REC_MAGIC    0x50524b41                /* "AKRP" */
-#define REC_VERSION  6
+#define REC_VERSION  7
+#define FRAME_P2     1                         /* RecFrame.flags: player 2's record follows the actions */
 #define TAG_TICK     0x4b434954                /* "TICK" */
 #define TAG_END      0x46444e45                /* "ENDF": end of a frame */
 
@@ -94,13 +95,14 @@ __declspec(dllimport) int    WINAPI VirtualFree(void *, u32, u32);
 
 /* File layout, little-endian:
  *   RecHeader, then the state at the level's first update (before any tick): a tick record
- *   per frame: RecFrame, actions[n_actions][0x30], a tick record per tick run, TAG_END
+ *   per frame: RecFrame, actions[n_actions][0x30], player 2's record [0x30] if FRAME_P2,
+ *              a tick record per tick run, TAG_END
  *   tick record: TAG_TICK, RecTick, RecChar[n_chars], then per character u32 n_changed and
  *                RecDword[n_changed], then u32 rng_callers[n_calls]
  * The dwords are of the character's image: the character (0x16a0), then its active data
  * (0x2838, zeros when not active); each one that changed since the character's last record. */
 typedef struct { u32 magic, version, level, start_tick, seed, fpu_cw, tick_local_seed, reserved; } RecHeader;
-typedef struct { u16 n_actions, reserved; } RecFrame;
+typedef struct { u16 n_actions, flags; } RecFrame;
 typedef struct { u32 tick, seed, n_chars, n_calls, fpu_cw, tick_local_seed; } RecTick;
 typedef struct {
 	u32 index, flags;
@@ -229,7 +231,7 @@ static u16 ONI_FC modal_begin(u32 id, WMtWindow *parent, WMtDialogProc proc, u32
 	u16 r;
 
 	g_in_tick = 0;
-	r = WMrDialog_ModalBegin(id, parent, proc, param, result);
+	r = live_menu_modal(id, parent, proc, param, result, in_tick);
 	g_in_tick = in_tick;
 	return r;
 }
@@ -721,27 +723,38 @@ static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 	u8 *gs = ONgGameState;
 	u32 level = ONrLevel_GetCurrent(), err, ran = 0;
 
-	if (g_mode == MODE_OFF) return ONrGameState_Update(count, actions, ticks_run);
-	if (g_session == SESSION_RUN && (level != g_level || GS_TICK(gs) < g_last_tick))
-		session_end(level != g_level ? "level left" : "level restarted");
-	if (g_session == SESSION_WAIT && level) session_begin(level);
-	if (g_session != SESSION_RUN) return ONrGameState_Update(count, actions, ticks_run);
+	const u32 *p2;
+
+	if (g_mode != MODE_OFF) {
+		if (g_session == SESSION_RUN && (level != g_level || GS_TICK(gs) < g_last_tick))
+			session_end(level != g_level ? "level left" : "level restarted");
+		if (g_session == SESSION_WAIT && level) session_begin(level);
+	}
+	if (g_mode == MODE_OFF || g_session != SESSION_RUN) {
+		players_begin_frame();   /* player 2's gamepad */
+		return ONrGameState_Update(count, actions, ticks_run);
+	}
 
 	count &= 0xffff;
 	if (count > MAX_ACTIONS) count = MAX_ACTIONS;
 	if (g_mode == MODE_RECORD) {
 		/* before the update, which edits the records */
-		RecFrame f = { (u16)count, 0 };
+		p2 = players_begin_frame();
+		RecFrame f = { (u16)count, p2 ? FRAME_P2 : 0 };
 		out_write(&f, sizeof f);
 		if (count) out_write(actions, count * ACTION_SIZE);
+		if (p2) out_write(p2, ACTION_SIZE);
 	} else {
 		RecFrame *f = take(sizeof *f);
 		void *a = f ? take(f->n_actions * ACTION_SIZE) : 0;
-		int n = (f && (a || !f->n_actions)) ? count_ticks() : -1;
+		p2 = f && (f->flags & FRAME_P2) ? take(ACTION_SIZE) : 0;
+		int n = (f && (a || !f->n_actions) && (p2 || !(f->flags & FRAME_P2))) ? count_ticks() : -1;
 		if (n < 0) {
 			session_end("end of recording");
+			players_begin_frame();
 			return ONrGameState_Update(count, actions, ticks_run);
 		}
+		players_replay_frame(p2);   /* the recorded gamepad, not the live one */
 		count = f->n_actions;
 		memcpy(g_replay_actions, a, count * ACTION_SIZE);
 		actions = g_replay_actions;
@@ -792,6 +805,10 @@ void lockstep_install(void)
 		log_msg("local RNG: game tick call changed, skipped");
 	}
 
+	/* the update hook makes player 2's record every frame, so it's always in too */
+	if (update_ok) patch_call(ONcGameState_UpdateCall, (u32)ONrGameState_Update, (u32)update_hook);
+	else log_msg("lockstep: game update call changed, no player 2 and no record/replay");
+
 	if (GetEnvironmentVariableA("ARKLITE_RECORD", g_path, sizeof g_path)) g_mode = MODE_RECORD;
 	else if (GetEnvironmentVariableA("ARKLITE_REPLAY", g_path, sizeof g_path)) g_mode = MODE_REPLAY;
 	if (g_mode == MODE_OFF) return;
@@ -800,7 +817,6 @@ void lockstep_install(void)
 		g_mode = MODE_OFF;
 		return;
 	}
-	patch_call(ONcGameState_UpdateCall, (u32)ONrGameState_Update, (u32)update_hook);
 	if (!rng_trace_install()) log_msg("lockstep: UUrRandom changed, RNG callers not traced");
 	g_trace = 1;
 	log_msg("lockstep: %s %s; starts with the next level", g_mode == MODE_RECORD ? "recording to" : "replaying", g_path);

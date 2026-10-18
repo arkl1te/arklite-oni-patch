@@ -30,7 +30,8 @@
  *     half-size striker_dream_lab in every level's striker_easy random pool.
  *   - 255 characters, all active at once (char_limit.c): the stock 64 active slots crash the
  *     game when more AIs than that go into combat.
- *   - Live pause menu (live_menu.c): the game keeps running behind the pause menu.
+ *   - Player 2 on a gamepad (players.c): multiplayer step 2.
+ *   - Live pause menu (live_menu.c): in multiplayer games the game keeps running behind it.
  *   - Input record and replay (lockstep.c): the determinism test for multiplayer.
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
@@ -105,6 +106,10 @@ static void __fastcall desktop_draw_background(void *context, void *partspec, u3
 	DCrDraw_PartSpec(context, partspec, flags, location, width, height, alpha);
 }
 
+#ifndef ARKLITE_VERSION
+#define ARKLITE_VERSION "dev"
+#endif
+
 int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 {
 	if (reason == 0 && reserved) {   /* DLL_PROCESS_DETACH, process exiting */
@@ -115,7 +120,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	if (reason != 1) return 1;   /* DLL_PROCESS_ATTACH */
 
 	log_open("Arklite.log");
-	log_msg("Arklite loaded");
+	log_msg("Arklite %s loaded", ARKLITE_VERSION);
 	crash_log_install(instance);
 	more_options_install();
 	if (patch_call(ONcMainMenu_MusicFadeCall, (u32)SSrMusic_Fade, (u32)main_menu_music_fade))
@@ -129,6 +134,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	hud_scale_install();
 	random_class_install();
 	char_limit_install();
+	players_install();
 	lockstep_install();
 	live_menu_install();
 	return 1;

@@ -106,10 +106,20 @@ u32  char_limit_gs_offset(u32 offset);   /* a stock game state offset, where it 
 void lockstep_install(void);   /* ARKLITE_RECORD / ARKLITE_REPLAY: input record and replay */
 void lockstep_exit(void);      /* finish the recording or the replay report */
 
+/* ---- players.c --------------------------------------------------------------------------- */
+
+void players_install(void);
+const u32 *players_begin_frame(void);         /* player 2's record for this frame, or 0 */
+void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
+int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
+
 /* ---- live_menu.c ------------------------------------------------------------------------- */
 
 void live_menu_install(void);
 int  live_menu_open(void);     /* the pause menu is open and the game runs behind it */
+/* WMrDialog_ModalBegin for every dialog (lockstep.c wraps the calls): in a multiplayer game a
+ * dialog outside a tick runs with the game going on behind it, one inside a tick isn't shown */
+u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick);
 
 /* ---- crash_log.c -------------------------------------------------------------------------- */
 
