@@ -86,7 +86,7 @@ To uninstall by hand: close Oni, delete `AE/Arklite.dll` and `AE/realbink.dll`, 
 
 ## Settings
 
-The Options dialog writes `[options]` and `[volume]`; `[players]` is only in the file. Edit
+The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multiplayer]` are only in the file. Edit
 `AE/Arklite.ini` with Oni closed:
 
 | Section | Key | Default | What |
@@ -99,6 +99,8 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` is only in the
 | | `p2_pad` | 0 | Which gamepad plays player 2, 0–3 |
 | | `p2_aim_speed` | 8 | Aim per tick at full right stick |
 | | `p2_invert_y` | 0 | 1: invert the right stick's up/down |
+| `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point |
+| | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 
@@ -160,6 +162,27 @@ A game with player 2 is a **multiplayer game**, and in one:
   different characters.
 - **Nothing pauses**: the game keeps running behind the pause menu and behind the help and
   objectives screen.
+- **Players respawn**: 1.5 seconds after dying (`respawn_delay`), a dead player presses an
+  attack button (punch, kick or any fire) to come back at a spawn point, with the starting
+  health and weapon of their placement. The body stays as a corpse.
+- **Items respawn**: a weapon or power-up placed in the level comes back at its spot 30 seconds
+  after someone takes it (`item_respawn`). A level made in Catwalk can set the time per item
+  (its **RespawnTime** field); 0 means it never comes back.
+
+On a **multiplayer map** (two or more IsPlayer characters, see below), also:
+
+- **Damage is x1.25**: every hit on a character does a quarter more (rounded).
+- **Overhealing drains a quarter faster**: health above the maximum (from a hypo) goes down
+  1 point every 8.8 ticks instead of every 11.
+
+### Spawn points
+
+Every character with the IsPlayer flag is a spawn point. The first one is Konoko and the second
+player 2; a third, fourth and so on (`player3`, `player4`...) aren't spawned, they only mark more
+spawn points. Each player starts at a random spawn point and respawns at one that no other living
+player is near (the farthest one if every point has someone close). The pick is the same on
+every PC and in every replay. A spawn point gives the position and the facing; the class, team,
+health and weapon come from the player's own placement.
 
 The `[players]` settings are in [Settings](#settings).
 

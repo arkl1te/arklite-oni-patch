@@ -66,10 +66,13 @@ char to_upper(char c);
 int  str_ieq_n(const char *a, const char *b, unsigned n);
 int  str_contains_i(const char *s, const char *sub);
 void fmt(char *buf, const char *f, ...);       /* wvsprintfA: at most 1024 bytes */
+const char *skip_space(const char *s);
+int  parse_float(const char **s, float *out);  /* "-12.5": advances *s; 0 if no number */
 
 /* ---- custom_game.c ----------------------------------------------------------------------- */
 
 void custom_game_install(void);
+const char *custom_game_level_ini(u32 level);   /* level.ini of the custom level in that slot, or 0 */
 
 /* ---- volume.c ----------------------------------------------------------------------------- */
 
@@ -112,6 +115,16 @@ void players_install(void);
 const u32 *players_begin_frame(void);         /* player 2's record for this frame, or 0 */
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
 int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
+int  multiplayer_map(void);                   /* two or more Player-flagged characters (spawn points) */
+
+/* ---- mp_rules.c -------------------------------------------------------------------------- */
+
+void mp_rules_install(void);   /* multiplayer maps: damage x1.25, overhealing drains 1.25x faster */
+
+/* ---- items.c ----------------------------------------------------------------------------- */
+
+void items_install(void);
+void items_tick(void);   /* in a multiplayer game's tick: taken items come back after a while */
 
 /* ---- live_menu.c ------------------------------------------------------------------------- */
 

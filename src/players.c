@@ -35,8 +35,25 @@
  *     aim onto a hostile on the local screen; with lag, players aim ahead instead.
  *   - nothing pauses: see live_menu.c.
  *
+ * Spawn points (a map with two or more Player-flagged characters is a multiplayer map): every
+ * Player-flagged CHAR placement is a spawn point. The first is Konoko's own placement and the
+ * second player 2's; the third and later ones (player3, player4, ...) are only spawn points and
+ * aren't spawned. Each player starts at a spawn point picked at random (Konoko by moving her
+ * placement there for the game's own walk, player 2 the same way for NewCharacter) and, after
+ * dying, comes back at one: once respawn_delay seconds have passed since the death tick (char
+ * +0x1638, set by the death function 0x4eb550 with the dead flag, +4 bit 0), the first tick
+ * whose input state has an attack button pressed (punch, kick, fire1-3) respawns that player:
+ * the body becomes a corpse
+ * (0x4ef340, as the character update does for dead AIs), the character is deleted
+ * (ONrGameState_DeleteCharacter 0x4dc480) and spawned again from its own placement, moved to the
+ * spawn point. A character spawned from a placement takes the placement's position (+0xc) and
+ * facing (+0x228). The pick is random among the points no other living player is near (the
+ * farthest one if none), from a hash of the level, the tick and the player, so every PC and
+ * every replay picks the same. Respawning runs in the tick, right after both players' input.
+ *
  * Arklite.ini [players]: p2=0 turns it off, p2_pad (0..3), p2_aim_speed (8: aim per tick at
- * full right stick), p2_invert_y. The camera follows Konoko. */
+ * full right stick), p2_invert_y. [multiplayer] respawn_delay (1.5 seconds). The camera follows
+ * Konoko. */
 #include "arklite.h"
 
 typedef unsigned long long u64;
@@ -64,6 +81,10 @@ typedef unsigned long long u64;
 #define OBJ_ISPLAYER            0x1
 #define OBJ_SPAWNED             0x20
 #define OBJ_NAME(o)             ((const char *)(o) + 0x70)
+#define OBJ_POS(o)              ((u32 *)((o) + 0xc))      /* x, y, z */
+#define OBJ_FACING(o)           (*(u32 *)((o) + 0x228))
+#define ONrGameState_DeleteCharacter ((void (ONI_FC *)(u8 *))0x4dc480)
+#define ONrCharacter_MakeCorpse ((void (ONI_FC *)(u8 *))0x4ef340)
 
 #define ONrCharacter_AutoAim    ((u8 (ONI_FC *)(u8 *, u8 *, u8 *))0x4efad0)
 
@@ -73,6 +94,11 @@ typedef unsigned long long u64;
 #define CHR_NOINPUT     0x400000   /* the tick drops the player's record */
 #define CHR_TYPE(c)     (*(u32 *)((c) + 0x1e8))   /* 0 player, 2 AI */
 #define CHR_HELD(c)     (*(u32 *)((c) + 0x162c))  /* no aiming while set */
+#define CHR_DEAD        0x1
+#define CHR_NOCORPSE    0x80000   /* the character update makes no corpse for it either */
+#define CHR_ACTIVE(c)   (*(u16 *)((c) + 2))       /* active data index, 0: none */
+#define CHR_POS(c)      ((float *)((c) + 0x148))
+#define CHR_DEATH_TICK(c) (*(u32 *)((c) + 0x1638))
 
 __declspec(dllimport) HANDLE WINAPI LoadLibraryA(const char *);
 __declspec(dllimport) void * WINAPI GetProcAddress(HANDLE, const char *);
@@ -96,6 +122,17 @@ static u32 g_level;
 static u32 g_input[12];                /* player 2's input state, like gs+0xb8 */
 static u32 g_record[12];               /* this frame's record */
 static int g_has_record, g_tick_index;
+
+#define MAX_SPAWN       64
+#define SPAWN_CLEAR     60.0f   /* no other living player this near: a free spawn point */
+static u8 *g_spawn[MAX_SPAWN];         /* Player-flagged placements: [0] Konoko's, [1] player 2's */
+static int g_nspawn;
+static u32 g_spawn_level;             /* for the spawn pick only: the level isn't current yet */
+static int g_p1_point = -1;            /* where Konoko just spawned, for player 2's pick */
+static u32 g_respawn_ticks = 90;       /* dead this long, an attack button brings a player back */
+/* Attack buttons in the input state (record bits 29 punch, 30 kick; 38-40 fire1-3) */
+#define ATTACK_LO       0x60000000u
+#define ATTACK_HI       0x1c0u
 
 static u8 *gs_field(u32 stock_offset)
 {
@@ -284,44 +321,186 @@ static void player2_tick(void)
 	ONrCharacter_SetInput(p2, g_input);
 }
 
+static void respawn_tick(const u32 *p1_input);
+
 static void ONI_FC set_input(u8 *chr, u32 *input)
 {
 	ONrCharacter_SetInput(chr, input);   /* Konoko */
 	if (g_p2 >= 0) player2_tick();
+	if (multiplayer_active()) {
+		respawn_tick(input);
+		items_tick();
+	}
 }
 
 /* ---- Spawning ------------------------------------------------------------------------------ */
 
-static u8 ONI_FC spawn_player(u8 *obj, u32 *first_seen)
+static u32 hash(u32 x)
 {
-	u32 f = OBJ_FLAGS(obj), index = 0;
+	x ^= x >> 16; x *= 0x7feb352d;
+	x ^= x >> 15; x *= 0x846ca68b;
+	x ^= x >> 16;
+	return x;
+}
+
+static float dist2(const float *a, const float *b)
+{
+	float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+	return dx * dx + dy * dy + dz * dz;
+}
+
+/* A spawn point for player `who`: random among those with nothing in avoid[] near, else the
+ * farthest from all of them */
+static int choose_spawn(const float *const *avoid, int navoid, u32 who)
+{
+	int free[MAX_SPAWN], nfree = 0, far = 0;
+	float far_d = -1;
+
+	for (int i = 0; i < g_nspawn; i++) {
+		const float *p = (const float *)OBJ_POS(g_spawn[i]);
+		float d = 1e30f;
+		for (int k = 0; k < navoid; k++) {
+			float e = dist2(p, avoid[k]);
+			if (e < d) d = e;
+		}
+		if (d >= SPAWN_CLEAR * SPAWN_CLEAR) free[nfree++] = i;
+		if (d > far_d) { far_d = d; far = i; }
+	}
+	if (!nfree) return far;
+	u32 r = hash(g_spawn_level * 0x9e3779b9u ^ hash(GS_TICK(ONgGameState) * 0x85ebca6bu + who));
+	return free[r % nfree];
+}
+
+static u8 ONI_FC collect_spawn(u8 *obj, u32 unused)
+{
+	if ((OBJ_FLAGS(obj) & OBJ_ISPLAYER) && g_nspawn < MAX_SPAWN) g_spawn[g_nspawn++] = obj;
+	return 1;
+}
+
+int multiplayer_map(void)
+{
+	return g_nspawn >= 2;   /* collected by every level's player spawn walk */
+}
+
+/* Spawns the character of placement obj at spawn point `point`; keeps gs+0xac (player 1) when
+ * asked, since NewCharacter makes any charType 0 character the player (0x4fc8f0 at 0x4db785) */
+static int spawn_at(u8 *obj, int point, int keep_player, u32 *index)
+{
+	u8 *gs = ONgGameState, *at = g_spawn[point];
+	u32 pos[3], facing = OBJ_FACING(obj);
+	u32 player = *(u32 *)(gs + 0xac), player_b0 = *(u32 *)(gs + 0xb0);
 	u16 err;
 
-	if (!(f & OBJ_ISPLAYER)) return 1;
-	if (!*first_seen) {   /* Konoko's, which the game just spawned */
-		*first_seen = 1;
-		return 1;
+	memcpy(pos, OBJ_POS(obj), sizeof pos);
+	memcpy(OBJ_POS(obj), OBJ_POS(at), sizeof pos);
+	OBJ_FACING(obj) = OBJ_FACING(at);
+	*index = 0;
+	err = ONrGameState_NewCharacter(obj, 0, 0, index);
+	memcpy(OBJ_POS(obj), pos, sizeof pos);
+	OBJ_FACING(obj) = facing;
+	if (keep_player) {
+		*(u32 *)(gs + 0xac) = player;
+		*(u32 *)(gs + 0xb0) = player_b0;
 	}
-	if (f & OBJ_SPAWNED) return 1;
-	OBJ_FLAGS(obj) = f | OBJ_SPAWNED;
-	/* NewCharacter makes any charType 0 character the player (0x4fc8f0 at 0x4db785):
-	 * keep Konoko as player 1 */
-	u8 *gs = ONgGameState;
-	u32 player = *(u32 *)(gs + 0xac), player_b0 = *(u32 *)(gs + 0xb0);
-	err = ONrGameState_NewCharacter(obj, 0, 0, &index);
-	*(u32 *)(gs + 0xac) = player;
-	*(u32 *)(gs + 0xb0) = player_b0;
+	*index &= 0xffff;
 	if (err) log_msg("players: can't spawn %s (error %d)", OBJ_NAME(obj), err);
-	else log_msg("players: spawned %s", OBJ_NAME(obj));
+	return !err;
+}
+
+static u8 ONI_FC spawn_player(u8 *obj, u32 *seen)
+{
+	u32 f = OBJ_FLAGS(obj), index;
+
+	if (!(f & OBJ_ISPLAYER)) return 1;
+	/* the first is Konoko's, which the game just spawned; the third and later are spawn points */
+	if ((*seen)++ != 1 || (f & OBJ_SPAWNED)) return 1;
+	OBJ_FLAGS(obj) = f | OBJ_SPAWNED;
+	if (multiplayer_map()) {
+		const float *avoid = g_p1_point >= 0 ? (const float *)OBJ_POS(g_spawn[g_p1_point]) : 0;
+		int point = choose_spawn(&avoid, avoid ? 1 : 0, 2);
+		if (spawn_at(obj, point, 1, &index))
+			log_msg("players: spawned %s at spawn point %d", OBJ_NAME(obj), point);
+	} else {
+		u8 *gs = ONgGameState;
+		u32 player = *(u32 *)(gs + 0xac), player_b0 = *(u32 *)(gs + 0xb0);
+		u16 err = ONrGameState_NewCharacter(obj, 0, 0, &index);
+		*(u32 *)(gs + 0xac) = player;
+		*(u32 *)(gs + 0xb0) = player_b0;
+		if (err) log_msg("players: can't spawn %s (error %d)", OBJ_NAME(obj), err);
+		else log_msg("players: spawned %s", OBJ_NAME(obj));
+	}
 	return 1;   /* keep walking */
 }
 
-/* Replaces the walks that spawn the player */
+/* Replaces the walks that spawn the player (all three walk CHAR with 0x48a3a0, which spawns the
+ * first Player-flagged placement) */
 static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 {
-	u32 r = OBJrEnumerate(type, callback, param), first_seen = 0;
-	OBJrEnumerate(OBJcType_CHAR, spawn_player, (u32)&first_seen);
+	u32 r, seen = 0;
+
+	g_nspawn = 0;
+	g_spawn_level = ONrLevel_GetCurrent();
+	OBJrEnumerate(OBJcType_CHAR, collect_spawn, 0);
+	g_p1_point = -1;
+	if (multiplayer_map()) {
+		/* Konoko: her placement moved to the spawn point while the game spawns her */
+		u8 *obj = g_spawn[0];
+		u32 pos[3], facing = OBJ_FACING(obj);
+		int point = choose_spawn(0, 0, 1);
+		memcpy(pos, OBJ_POS(obj), sizeof pos);
+		memcpy(OBJ_POS(obj), OBJ_POS(g_spawn[point]), sizeof pos);
+		OBJ_FACING(obj) = OBJ_FACING(g_spawn[point]);
+		r = OBJrEnumerate(type, callback, param);
+		memcpy(OBJ_POS(obj), pos, sizeof pos);
+		OBJ_FACING(obj) = facing;
+		g_p1_point = point;
+		log_msg("players: multiplayer map, %d spawn points; Konoko at spawn point %d", g_nspawn, point);
+	} else {
+		r = OBJrEnumerate(type, callback, param);
+	}
+	OBJrEnumerate(OBJcType_CHAR, spawn_player, (u32)&seen);
 	return r;
+}
+
+/* ---- Respawning ---------------------------------------------------------------------------- */
+
+/* Dead for respawn_delay and an attack button was pressed this tick (input: +0x20 pressed) */
+static int wants_respawn(u8 *c, const u32 *input)
+{
+	return (CHR_FLAGS(c) & CHR_INUSE) && (CHR_FLAGS(c) & CHR_DEAD) &&
+	       GS_TICK(ONgGameState) - CHR_DEATH_TICK(c) >= g_respawn_ticks &&
+	       ((input[8] & ATTACK_LO) || (input[9] & ATTACK_HI));
+}
+
+static int respawn(u8 *c, u8 *other, int is_p2)
+{
+	const float *avoid = 0;
+	u32 index;
+
+	if (other && (CHR_FLAGS(other) & CHR_INUSE) && !(CHR_FLAGS(other) & CHR_DEAD))
+		avoid = CHR_POS(other);
+	int point = choose_spawn(&avoid, avoid ? 1 : 0, is_p2 ? 2 : 1);
+	if (CHR_ACTIVE(c) && !(CHR_FLAGS(c) & CHR_NOCORPSE)) ONrCharacter_MakeCorpse(c);
+	ONrGameState_DeleteCharacter(c);
+	/* Konoko comes back as the player (NewCharacter sets gs+0xac); player 2 doesn't */
+	if (!spawn_at(g_spawn[is_p2], point, is_p2, &index)) return -1;
+	log_msg("players: %s respawned at spawn point %d (tick %u)", is_p2 ? "player 2" : "Konoko",
+	        point, GS_TICK(ONgGameState));
+	return (int)index;
+}
+
+static void respawn_tick(const u32 *p1_input)
+{
+	u8 *gs = ONgGameState, *p1 = GS_PLAYER(gs), *p2 = player2_valid() ? character(g_p2) : 0;
+
+	if (!multiplayer_map()) return;
+	if (p1 && wants_respawn(p1, p1_input)) respawn(p1, p2, 0);
+	p1 = GS_PLAYER(gs);
+	if (p2 && wants_respawn(p2, g_input)) {
+		int index = respawn(p2, p1, 1);
+		g_p2 = index;
+		memset(g_input, 0, sizeof g_input);
+	}
 }
 
 void players_install(void)
@@ -336,6 +515,13 @@ void players_install(void)
 	g_pad = GetPrivateProfileIntA("players", "p2_pad", 0, ini_path()) & 3;
 	g_aim_speed = (float)(int)GetPrivateProfileIntA("players", "p2_aim_speed", 8, ini_path());
 	g_invert_y = GetPrivateProfileIntA("players", "p2_invert_y", 0, ini_path()) != 0;
+	{
+		char buf[16];
+		const char *s = buf;
+		float seconds;
+		GetPrivateProfileStringA("multiplayer", "respawn_delay", "1.5", buf, sizeof buf, ini_path());
+		if (parse_float(&s, &seconds) && seconds >= 0) g_respawn_ticks = (u32)(seconds * 60 + 0.5f);
+	}
 	if (p[0] != 0xe8 || ONcTick_SetInputCall + 5 + *(u32 *)(p + 1) != (u32)ONrCharacter_SetInput) {
 		log_msg("players: 0x%x changed, no player 2", ONcTick_SetInputCall);
 		g_enabled = 0;
