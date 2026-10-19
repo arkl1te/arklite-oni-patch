@@ -10,7 +10,10 @@
  *   0x42e8c0 (ECX context, EDX 0): the font; 0x42eec0 (ECX font): its line height
  *   0x42df00 (ECX context, EDX string, [alpha], [0], [point]): draw at point = {x, y} (shorts,
  *            y the bottom of the line); ret 0xc
- * Each line gets a black shadow 1 pixel down and right.
+ * Each line gets a black shadow down and right. The context renders a string into a texture and
+ * draws it as one sprite (0x41a5e0, 2 corner points {x, y, z, 1/w}, called at 0x42deae); while
+ * we draw, that call doubles the sprite from its top-left corner, so our text is twice Oni's
+ * size (the user asked for double).
  *
  * Lobby: "Press F3 to be ready" in red, or "Press F3 to be unready" in green, and under it who
  * is ready or the countdown, until the match starts. Match (or a two-player game on one PC):
@@ -28,6 +31,9 @@
 #define ONrLevel_GetCurrent ((u16 (ONI_FC *)(void))0x5054c0)
 #define ONgGameState        (*(u8 **)0x5ece7c)
 
+#define M3rDraw_Sprite      ((u32 (ONI_FC *)(const float *, const void *))0x41a5e0)
+#define ONcText_SpriteCall  0x42deae
+#define TEXT_SCALE          2
 #define ONrTimer_Display    ((void (ONI_FC *)(void *))0x4fd500)
 #define ONcTimer_DisplayCall 0x50061f
 
@@ -37,7 +43,23 @@
 #define YELLOW  0xffffe040u
 #define SHADOW  0xff000000u
 
-static int g_line_height;
+static int g_line_height;         /* scaled */
+static int g_scaling;
+static float g_anchor_x, g_anchor_y;   /* the line's top-left, which stays put */
+
+/* A string is drawn in pieces (the loop back to 0x42dbd0); every piece is scaled about the same
+ * anchor, so the whole line grows */
+static u32 ONI_FC text_sprite(const float *pts, const void *uv)
+{
+	float p[8];
+	if (!g_scaling) return M3rDraw_Sprite(pts, uv);
+	for (int i = 0; i < 8; i++) p[i] = pts[i];
+	for (int k = 0; k < 8; k += 4) {
+		p[k] = g_anchor_x + (p[k] - g_anchor_x) * TEXT_SCALE;
+		p[k + 1] = g_anchor_y + (p[k + 1] - g_anchor_y) * TEXT_SCALE;
+	}
+	return M3rDraw_Sprite(p, uv);
+}
 
 enum { LEFT, CENTER, RIGHT };
 
@@ -50,17 +72,21 @@ static void text(const char *s, int x, int y, int align, u32 color)
 
 	if (!ctx) return;
 	TSrContext_Measure(ctx, s, rect);
-	w = rect[2] - rect[0];
+	w = (rect[2] - rect[0]) * TEXT_SCALE;
 	if (align == CENTER) x -= w / 2;
 	else if (align == RIGHT) x -= w;
-	at[0] = (short)(x + 1);
-	at[1] = (short)(y + g_line_height + 1);
-	TSrContext_SetColor(ctx, SHADOW);
-	TSrContext_Draw(ctx, s, 0xff, 0, at);
-	at[0]--;
-	at[1]--;
-	TSrContext_SetColor(ctx, color);
-	TSrContext_Draw(ctx, s, 0xff, 0, at);
+	/* the point is the line's bottom at Oni's size, the anchor its top-left */
+	g_scaling = 1;
+	for (int pass = 0; pass < 2; pass++) {
+		int off = pass ? 0 : TEXT_SCALE;   /* shadow first */
+		g_anchor_x = (float)(x + off);
+		g_anchor_y = (float)(y + off);
+		at[0] = (short)(x + off);
+		at[1] = (short)(y + off + g_line_height / TEXT_SCALE);
+		TSrContext_SetColor(ctx, pass ? color : SHADOW);
+		TSrContext_Draw(ctx, s, 0xff, 0, at);
+	}
+	g_scaling = 0;
 }
 
 static void draw_lobby(const NetHud *h, int width, int height)
@@ -84,7 +110,7 @@ static void draw_lobby(const NetHud *h, int width, int height)
 static void draw_score(int local, int width)
 {
 	char line[64];
-	int x = width - 16, y = 16;
+	int x = width - 24, y = 24;
 
 	for (int who = 0; who < 2; who++) {
 		fmt(line, local == who ? "Player %d (you)   %d" : "Player %d   %d", who + 1, players_score(who));
@@ -107,7 +133,7 @@ static void ONI_FC timer_display(void *timer)
 
 	width = M3rScreen_Width();
 	height = M3rScreen_Height();
-	g_line_height = TSrFont_LineHeight(TSrContext_GetFont(ctx, 0));
+	g_line_height = TSrFont_LineHeight(TSrContext_GetFont(ctx, 0)) * TEXT_SCALE;
 	color = *(u32 *)((u8 *)ctx + 0xc);   /* the timer's color, put back after */
 
 	if (h.state == NETHUD_LOBBY) draw_lobby(&h, width, height);
@@ -119,6 +145,8 @@ static void ONI_FC timer_display(void *timer)
 
 void mp_hud_install(void)
 {
+	if (!patch_call(ONcText_SpriteCall, (u32)M3rDraw_Sprite, (u32)text_sprite))
+		log_msg("mp hud: text sprite call changed, the text is Oni's size");
 	if (patch_call(ONcTimer_DisplayCall, (u32)ONrTimer_Display, (u32)timer_display))
 		log_msg("mp hud: lobby text and score on screen");
 }

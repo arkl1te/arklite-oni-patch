@@ -160,6 +160,7 @@ typedef struct {
 	u32 level, players, ready, countdown_ms;   /* countdown_ms 0xffffffff: none */
 	u32 go;                /* the match starts: reload the level */
 	u32 joiner_ready;      /* what the host knows of the joiner's ready flag */
+	u32 seed, local_seed;  /* with go: both RNG streams, set on both PCs before the reload */
 } PktLobby;
 typedef struct {
 	PktHead h;
@@ -225,6 +226,7 @@ static u32 g_countdown_end;            /* host: GetTickCount at 0, 0: no countdo
 static u32 g_lobby_players = 1, g_lobby_ready, g_lobby_countdown = 0xffffffffu, g_lobby_rx;   /* joiner: the host's view */
 static int g_host_heard;               /* joiner: a LOBBY arrived in this lobby */
 static u32 g_last_lobby;
+static u32 g_match_seed, g_match_local_seed;   /* the RNGs the match's level loads with */
 
 /* What both PCs must have the same of besides Oni.exe: Daodan patches Oni's code and has
  * gameplay settings, and level0 holds the characters and animations */
@@ -293,7 +295,9 @@ static u32 fpu_control_word(void)
 	return cw;
 }
 
-static u32 summarize(CharSum *c, u32 *count)
+/* seeds: 0 for the level-start check, which happens before the host's seeds are in place
+ * (drawing may draw from the game RNG between the level load and the first update) */
+static u32 summarize_with(CharSum *c, u32 *count, int seeds_too)
 {
 	u8 *chr = GS_CHARACTERS(ONgGameState);
 	u32 slots = ONgCharacterSlots, n = 0, seeds[2];
@@ -301,7 +305,7 @@ static u32 summarize(CharSum *c, u32 *count)
 
 	if (slots > MAX_CHARS) slots = MAX_CHARS;
 	lockstep_get_seeds(&seeds[0], &seeds[1]);
-	h = fnv(h, seeds, sizeof seeds);
+	if (seeds_too) h = fnv(h, seeds, sizeof seeds);
 	for (u32 i = 0; i < slots; i++, chr += CHR_SIZE) {
 		u32 flags = *(u32 *)(chr + 4);
 		if (!(flags & CHR_INUSE)) continue;
@@ -318,6 +322,8 @@ static u32 summarize(CharSum *c, u32 *count)
 	return h;
 }
 
+static u32 summarize(CharSum *c, u32 *count) { return summarize_with(c, count, 1); }
+
 /* The character's state, without what each PC's own drawing writes into it */
 static void image_of(u32 index, u8 *img)
 {
@@ -333,6 +339,7 @@ static void image_of(u32 index, u8 *img)
 	*(u32 *)(img + 0x163c) = *(u32 *)(img + 0x163c) != 0;   /* frames off screen */
 	*(u32 *)(img + 0x1660) = 0;                             /* distance to the camera */
 	memset(img + CHR_SIZE + 0x221c, 0, 10);                 /* detail level the drawing chose */
+	*(u32 *)(img + 0x166c) = 0;                             /* HUD hit arrows, faded for the viewer only */
 }
 
 static void capture_images(u32 slot)
@@ -484,6 +491,8 @@ static void send_lobby(int go)
 	p.countdown_ms = g_countdown_end ? (g_countdown_end - now < COUNTDOWN_MS + 1000 ? g_countdown_end - now : 0) : 0xffffffffu;
 	p.go = go;
 	p.joiner_ready = g_peer_ready;
+	p.seed = g_match_seed;
+	p.local_seed = g_match_local_seed;
 	send_to_peer(&p, sizeof p);
 	g_last_lobby = now;
 }
@@ -659,7 +668,11 @@ static void receive(void)
 			g_lobby_ready = p->ready;
 			g_lobby_countdown = p->countdown_ms;
 			g_lobby_rx = g_last_recv;
-			if (p->go) start_match();
+			if (p->go) {
+				g_match_seed = p->seed;
+				g_match_local_seed = p->local_seed;
+				start_match();
+			}
 		} else if (h->type == PKT_START && g_mode == NET_JOIN && (u32)n >= sizeof(PktStart)) {
 			const PktStart *p = (const PktStart *)buf;
 			g_last_recv = GetTickCount();
@@ -708,7 +721,7 @@ static void session_begin(u32 level)
 	g_gen = g_delay;   /* ticks 0..delay-1: no input from either PC */
 	g_start_tick = GS_TICK(ONgGameState);
 	g_start_fpu = fpu_control_word();
-	g_start_hash = summarize(c, &n);
+	g_start_hash = summarize_with(c, &n, 0);
 	g_ready = 0;
 	g_countdown_end = 0;
 	g_lobby_players = 1;
@@ -823,16 +836,22 @@ static int f3_pressed(void)
 }
 
 /* Reload the level for the match: both PCs do it, the host when its countdown ends, the joiner
- * when "go" arrives. The next frame begins a synced session (S_WAIT, then the START handshake). */
+ * when "go" arrives. The next frame begins a synced session (S_WAIT, then the START handshake).
+ * Loading a level draws from the game RNG (a character's idle timer +0x1e4 comes from it at
+ * creation, 0x4dc130), and the lobby ran each PC's RNG its own way, so both PCs load with the
+ * seeds the host put in "go". */
 static void start_match(void)
 {
 	u32 level = g_level;
 
-	log_msg("net: the match starts: reloading level %d", level);
-	if (g_mode == NET_HOST)
+	if (g_mode == NET_HOST) {
+		lockstep_get_seeds(&g_match_seed, &g_match_local_seed);
 		for (int i = 0; i < 3; i++) send_lobby(1);   /* and again for each HELLO that still says lobby */
+	}
+	log_msg("net: the match starts: reloading level %d (RNG %08x/%08x)", level, g_match_seed, g_match_local_seed);
 	g_match_pending = 1;
 	session_end("match starting");
+	lockstep_set_seeds(g_match_seed, g_match_local_seed);
 	ONrGame_StartLevel(level);
 }
 
@@ -1056,6 +1075,30 @@ static void ONI_FC camera_update(u32 ticks, u32 edx, u32 arg)
  * data in gs+0xb0 as SetPlayer 0x4fc8f0 sets it); Konoko goes back right after. Its first 8
  * bytes (sub esp,0x6c; mov eax,[0x5ece7c]) become a jump here and run in display_rest. */
 #define ONcDisplay              0x4fb480
+#define ONrHUD_Tick             ((void (*)(void))0x504780)
+#define ONcTick_HUDCall         0x4fa9e4
+
+/* The HUD's health ring and hypo bar animate toward values that 0x504780 takes, every tick, from
+ * the character in gs+0xac (via 0x4fc8a0; into the trackers at 0x630fc0..), and it fades that
+ * character's hit arrows (+0x166c, 4 bytes set by TakeDamage, read only by the HUD at
+ * 0x500ddc). Neither is game state that matters, so on the joiner it runs with player 2 in the
+ * player slot, like the display. */
+static void hud_tick(void)
+{
+	u8 *gs = ONgGameState, *p1 = gs ? GS_PLAYER(gs) : 0, *view = view_character(p1);
+	u32 b0;
+
+	if (!view || view == p1) {
+		ONrHUD_Tick();
+		return;
+	}
+	b0 = *(u32 *)(gs + 0xb0);
+	GS_PLAYER(gs) = view;
+	*(u8 **)(gs + 0xb0) = ONrCharacter_GetActive(view);
+	ONrHUD_Tick();
+	GS_PLAYER(gs) = p1;
+	*(u32 *)(gs + 0xb0) = b0;
+}
 
 __attribute__((naked)) static void display_rest(void)
 {
@@ -1104,6 +1147,8 @@ static void view_install(void)
 			memcpy(b + 1, &rel, 4);
 			patch_write(ONcDisplay, b, sizeof b);
 			log_msg("net: the HUD, laser sight and crosshair show player 2");
+			if (!patch_call(ONcTick_HUDCall, (u32)ONrHUD_Tick, (u32)hud_tick))
+				log_msg("net: HUD tick call 0x%x changed, the health ring follows Konoko", ONcTick_HUDCall);
 		} else {
 			log_msg("net: game display 0x%x changed, the HUD and crosshair show Konoko", ONcDisplay);
 		}

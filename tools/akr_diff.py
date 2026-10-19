@@ -22,7 +22,7 @@ IMG_DWORDS = (CHR_SIZE + ACTIVE_SIZE) // 4
 ACTION = 0x30
 FRAME_P2, FRAME_P2N = 1, 2
 
-RENDER = {0x163C // 4, 0x1640 // 4, 0x1660 // 4}
+RENDER = {0x163C // 4, 0x1640 // 4, 0x1660 // 4, 0x166C // 4}   # +0x166c: HUD hit arrows
 RENDER |= {(CHR_SIZE + o) // 4 for o in (0x2218, 0x221C, 0x2220, 0x2224, 0x27E8, 0x27FC)}
 MASKS = {1: ~0x4000 & 0xFFFFFFFF}   # flags: drawn this frame
 # the attack's particles (active +0x1ca8, 16 bytes each, count at +0x1ca4): +4 is the
