@@ -32,6 +32,8 @@
  *     game when more AIs than that go into combat.
  *   - Player 2 on a gamepad (players.c): multiplayer step 2.
  *   - Live pause menu (live_menu.c): in multiplayer games the game keeps running behind it.
+ *   - Spawn points and respawning (players.c), item respawn (items.c): multiplayer maps.
+ *   - Damage x1.25 and faster overhealing drain (mp_rules.c): multiplayer maps.
  *   - Input record and replay (lockstep.c): the determinism test for multiplayer.
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
@@ -135,6 +137,8 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	random_class_install();
 	char_limit_install();
 	players_install();
+	items_install();
+	mp_rules_install();
 	lockstep_install();
 	live_menu_install();
 	return 1;

@@ -27,6 +27,7 @@ static int  g_ncustom;
 static char g_dataDir[MAX_PATH];               /* absolute, ends with '\' */
 static char g_igmdFormat[256] = "IGMD\\%s";
 static int  g_slot = -1;
+static char g_mountedIni[MAX_PATH];           /* level.ini of the level mounted in g_slot */
 /* Debug: ARKLITE_AUTOSTART=<folder> opens Custom Game and plays that folder, as if clicked. */
 static char g_autostart[64];
 static int  g_autostartPending;
@@ -196,6 +197,7 @@ static int mount_custom_level(const CustomLevel *cl)
 		TMgLevelFiles[reuse[f]].file_index = (127u << 25) | 1;
 
 	TMgLevelValid[s] = 1;
+	fmt(g_mountedIni, "%sCustomLevels\\%s\\level.ini", g_dataDir, cl->folder);
 
 	fmt(path, "%sCustomLevels\\%s\\IGMD", g_dataDir, cl->folder);
 	if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
@@ -227,6 +229,11 @@ static u16 ONI_FC open_level_file_hook(char *ref, void **out)
 		break;
 	}
 	return error;
+}
+
+const char *custom_game_level_ini(u32 level)
+{
+	return g_slot >= 0 && level == (u32)g_slot && g_mountedIni[0] ? g_mountedIni : 0;
 }
 
 /* ---- "Custom Game" dialog (reuses the Load Game layout, dialog 0x97) ------------------------- */

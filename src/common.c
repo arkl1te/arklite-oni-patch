@@ -178,3 +178,25 @@ void fmt(char *buf, const char *f, ...)
 	wvsprintfA(buf, f, ap);
 	va_end(ap);
 }
+
+const char *skip_space(const char *s)
+{
+	while (*s == ' ' || *s == '\t') s++;
+	return s;
+}
+
+int parse_float(const char **ps, float *out)
+{
+	const char *s = skip_space(*ps);
+	float v = 0, scale = 1;
+	int neg = 0, digits = 0;
+
+	if (*s == '-' || *s == '+') neg = *s++ == '-';
+	for (; *s >= '0' && *s <= '9'; s++, digits++) v = v * 10 + (*s - '0');
+	if (*s == '.')
+		for (s++; *s >= '0' && *s <= '9'; s++, digits++) v += (*s - '0') * (scale /= 10);
+	if (!digits) return 0;
+	*out = neg ? -v : v;
+	*ps = s;
+	return 1;
+}
