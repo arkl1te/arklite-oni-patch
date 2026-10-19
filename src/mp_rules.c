@@ -7,8 +7,9 @@
  * Damage: every hit on a character goes through ONrCharacter_TakeDamage (0x4e65f0; ECX the
  * character, EDX the damage in hit points, five stack arguments, ret 0x14), from 11 call sites:
  * melee, bullets and particles, falling, and the kills that pass the health itself as damage.
- * Its first 5 bytes (sub esp,0x2c; push ebx; push ebp) become a jump to a stub that scales EDX
- * and runs them. 1.25x rounds half up (1 stays 1, 2 becomes 3, 4 becomes 5).
+ * Its first 5 bytes (sub esp,0x2c; push ebx; push ebp) become a jump to a stub that reports the
+ * hit for the score (4th stack argument: the owner handle, 0x51cda0 gives its character), scales
+ * EDX and runs them. 1.25x rounds half up (1 stays 1, 2 becomes 3, 4 becomes 5).
  *
  * Overhealing: the character's hypo tick (0x51bad0, ESI the character) counts a cooldown at
  * +0x1b0 down and, when it's 0 and health (+0x38) is over the maximum (+0x3c), takes 1 hit
@@ -111,9 +112,23 @@ static void free_for_all_install(void)
 	log_msg("mp rules: players can hurt each other on multiplayer maps (free for all)");
 }
 
+#define ONrOwner_Character  ((u8 *(ONI_FC *)(u32))0x51cda0)   /* owner handle -> character, or 0 */
+
+/* Who hit whom, for the score (players.c) */
+static void ONI_FC note_hit(u8 *victim, u32 owner)
+{
+	if (owner) players_note_hit(victim, ONrOwner_Character(owner));
+}
+
 __attribute__((naked)) static void take_damage_entry(void)
 {
 	__asm__ volatile(
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"movl 0x18(%%esp), %%edx\n\t"   /* 4th stack argument: the hit's owner */
+		"call %c1\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
 		"pushl %%ecx\n\t"
 		"movl %%edx, %%ecx\n\t"
 		"call %c0\n\t"
@@ -123,7 +138,7 @@ __attribute__((naked)) static void take_damage_entry(void)
 		"pushl %%ebx\n\t"
 		"pushl %%ebp\n\t"
 		"pushl $0x4e65f5\n\t"
-		"ret\n" :: "i"(damage_scaled));
+		"ret\n" :: "i"(damage_scaled), "i"(note_hit));
 }
 
 __attribute__((naked)) static void drain_stub(void)

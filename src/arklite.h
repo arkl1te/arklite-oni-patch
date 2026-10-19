@@ -123,6 +123,19 @@ void net_exit(void);
 int  net_active(void);
 u32  net_update(u32 count, void *actions, u32 *ticks_run);   /* the game update while it's on */
 void net_tick_done(void);      /* after every tick */
+enum { NETHUD_OFF, NETHUD_LOBBY, NETHUD_STARTING, NETHUD_MATCH };
+typedef struct {
+	int state;                 /* NETHUD_* */
+	int local_player;          /* 0 Konoko (host), 1 player 2 (joiner) */
+	int ready, connected;      /* this PC pressed F3; the host is / is heard */
+	u32 players, ready_count, needed;
+	int countdown_ms;          /* -1: none */
+} NetHud;
+void net_hud(NetHud *h);
+
+/* ---- mp_hud.c ---------------------------------------------------------------------------- */
+
+void mp_hud_install(void);     /* lobby text ("Press F3 to be ready"), countdown and score on screen */
 
 /* ---- players.c --------------------------------------------------------------------------- */
 
@@ -131,6 +144,9 @@ const u32 *players_begin_frame(void);         /* player 2's record for this fram
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
 void players_net_frame(const u32 (*records)[12], u32 n);   /* networked: tick i gets records[i] */
 u8  *players_p2(void);                        /* player 2's character, or 0 */
+void players_note_hit(u8 *victim, u8 *attacker);   /* from TakeDamage, in a tick */
+int  players_score(int who);                  /* 0: Konoko (player 1), 1: player 2 */
+void players_reset_scores(void);
 int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
 int  multiplayer_map(void);                   /* two or more Player-flagged characters (spawn points) */
 
