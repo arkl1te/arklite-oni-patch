@@ -100,7 +100,9 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `p2_pad` | 0 | Which gamepad plays player 2, 0–3 |
 | | `p2_aim_speed` | 8 | Aim per tick at full right stick |
 | | `p2_invert_y` | 0 | 1: invert the right stick's up/down |
-| `[net]` | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one |
+| `[net]` | `host` | 0 | 1: host a network game, as `ARKLITE_HOST=1` does. Set it back to 0 for single player |
+| | `join` | (empty) | `<ip>[:port]`: join that host, as `ARKLITE_JOIN` does. Empty it for single player |
+| | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one |
 | | `delay` | 4 | Input delay in ticks (1/60 s each). The host's value is used on both PCs; raise it if the game stutters over a slow connection |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never |
@@ -224,6 +226,10 @@ cd "/path/to/Oni/AE"
 ARKLITE_HOST=1 ARKLITE_AUTOSTART=NewLevel-Versus wine Oni.exe -noswitch               # PC 1
 ARKLITE_JOIN=192.168.1.10 ARKLITE_AUTOSTART=NewLevel-Versus wine Oni.exe -noswitch    # PC 2
 ```
+
+On Windows, set the variables in `cmd` (not PowerShell's `set`) and start `Oni.exe` from that
+same window, or put `join=<host's IP>` under `[net]` in `AE\Arklite.ini` and start Oni as usual.
+The log's `net:` lines say whether networking is on.
 
 Use the host's IP. On one PC, join `127.0.0.1`; `-noswitch` keeps both in windows. Each game
 stands still at the start of the level until the other PC is there, then both run together.

@@ -43,7 +43,7 @@
  *
  * If no packet arrives for 10 s during the game, the peer is lost: the game goes on with the
  * peer's player standing still. Arklite.ini [net]: port (27777), delay (4 ticks; the host's is
- * used on both PCs). */
+ * used on both PCs), and host=1 or join=<ip>[:port] when the environment doesn't say. */
 #include "arklite.h"
 
 typedef unsigned long long u64;
@@ -164,7 +164,8 @@ static struct { u32 tick, hash; } g_theirs[HASH_SLOTS];
 static u32 g_checked[HASH_SLOTS];        /* the tick each slot was last compared at */
 static u32 g_last_hash_tick, g_last_hash;
 static u32 g_checks, g_bad_checks, g_first_bad;
-static u8 *g_cam_set;                  /* the character the joiner's camera was pointed at */
+static u8 *g_cam_set;
+static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_send_errors;                  /* the character the joiner's camera was pointed at */
 
 static const char *mode_name(void) { return g_mode == NET_HOST ? "host" : "join"; }
 
@@ -265,7 +266,11 @@ static void head(PktHead *h, u8 type)
 static void send_to_peer(const void *p, u32 n)
 {
 	if (!g_have_peer) return;
-	sendto(g_sock, p, n, 0, &g_peer, sizeof g_peer);
+	if (sendto(g_sock, p, n, 0, &g_peer, sizeof g_peer) < 0) {
+		if (g_send_errors++ < 5) log_msg("net: send failed (error %d)", WSAGetLastError());
+	} else {
+		g_npackets_sent++;
+	}
 	g_last_send = GetTickCount();
 }
 
@@ -391,6 +396,7 @@ static void receive(void)
 		}
 		const PktHead *h = (const PktHead *)buf;
 		if ((u32)n < sizeof *h || h->magic != MAGIC) continue;
+		g_npackets_recv++;
 		if (h->proto != PROTO) {
 			log_msg("net: packet of protocol %d from the peer, this is %d: update Arklite on both PCs", h->proto, PROTO);
 			continue;
@@ -434,6 +440,7 @@ static void receive(void)
 			begin_run();
 		} else if (h->type == PKT_INPUT && (g_state == S_RUN)) {
 			g_last_recv = GetTickCount();
+			if (!g_ninputs_recv++) log_msg("net: first input from the %s", g_mode == NET_HOST ? "joiner" : "host");
 			on_input((const PktInput *)buf, n);
 		} else if (h->type == PKT_BYE && g_state == S_RUN) {
 			log_msg("net: the %s left; their player stands still", g_mode == NET_HOST ? "joiner" : "host");
@@ -461,6 +468,8 @@ static void session_begin(u32 level)
 	memset(g_checked, 0, sizeof g_checked);
 	g_last_hash_tick = g_last_hash = 0;
 	g_checks = g_bad_checks = g_first_bad = 0;
+	g_npackets_sent = g_npackets_recv = g_ninputs_recv = g_send_errors = 0;
+	g_last_status = GetTickCount();
 	g_gen = g_delay;   /* ticks 0..delay-1: no input from either PC */
 	g_start_tick = GS_TICK(ONgGameState);
 	g_start_fpu = fpu_control_word();
@@ -569,17 +578,24 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	}
 
 	receive();
+	now = GetTickCount();   /* after receive(), which stamps g_last_recv: now - g_last_recv mustn't wrap */
 	u32 wanted = GS_SERVER_TIME(gs) - GS_TICK(gs);
 	if (wanted > 6) wanted = 6;
 
 	if (g_state == S_WAIT) {
 		if (g_mode == NET_JOIN && now - g_last_hello >= HELLO_MS) send_hello();
+		if (now - g_last_status >= 5000) {
+			log_msg("net: still waiting for the %s (packets sent %d, received %d)", g_mode == NET_HOST ? "joiner" : "host",
+			        g_npackets_sent, g_npackets_recv);
+			g_last_status = now;
+		}
 		players_net_frame(0, 0);
 		return run_update(0, ticks_run);   /* the clock stands until the game starts */
 	}
 
-	if (g_state == S_RUN && now - g_last_recv > LOST_MS) {
-		log_msg("net: nothing from the %s for %d s; their player stands still", g_mode == NET_HOST ? "joiner" : "host", LOST_MS / 1000);
+	if (g_state == S_RUN && (int)(now - g_last_recv) > LOST_MS) {
+		log_msg("net: nothing from the %s for %d s; their player stands still (packets sent %d, received %d, inputs received %d)",
+		        g_mode == NET_HOST ? "joiner" : "host", LOST_MS / 1000, g_npackets_sent, g_npackets_recv, g_ninputs_recv);
 		g_state = S_LOST;
 	}
 
@@ -593,6 +609,13 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	if (n > g_gen - g_ticks) n = g_gen - g_ticks;
 	if (n > remote_avail) n = remote_avail;
 	if (n > 6) n = 6;
+	if (n || g_state != S_RUN) {
+		g_last_status = now;
+	} else if (now - g_last_status >= 1000) {   /* stuck waiting: say on what */
+		log_msg("net: waiting at tick %d: our inputs up to %d, the %s's up to %d; packets sent %d, received %d",
+		        g_ticks, g_gen, g_mode == NET_HOST ? "joiner" : "host", g_remote, g_npackets_sent, g_npackets_recv);
+		g_last_status = now;
+	}
 
 	for (u32 k = 0; k < n; k++) {
 		u32 slot = (g_ticks + k) % RING;
@@ -721,7 +744,16 @@ void net_install(void)
 
 	if (GetEnvironmentVariableA("ARKLITE_HOST", host_env, sizeof host_env)) g_mode = NET_HOST;
 	else if (GetEnvironmentVariableA("ARKLITE_JOIN", g_join, sizeof g_join)) g_mode = NET_JOIN;
-	if (g_mode == NET_OFF) return;
+	else {   /* Arklite.ini [net] host=1 or join=<ip>[:port], for Windows shortcuts */
+		host_env[0] = 0;
+		if (GetPrivateProfileIntA("net", "host", 0, ini_path())) g_mode = NET_HOST;
+		else if (GetPrivateProfileStringA("net", "join", "", g_join, sizeof g_join, ini_path()) && g_join[0])
+			g_mode = NET_JOIN;
+	}
+	if (g_mode == NET_OFF) {
+		log_msg("net: off (set ARKLITE_HOST or ARKLITE_JOIN, or host/join in Arklite.ini [net])");
+		return;
+	}
 
 	port = GetPrivateProfileIntA("net", "port", DEFAULT_PORT, ini_path());
 	g_delay = GetPrivateProfileIntA("net", "delay", 4, ini_path());
