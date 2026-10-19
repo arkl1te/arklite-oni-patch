@@ -25,6 +25,9 @@ FRAME_P2, FRAME_P2N = 1, 2
 RENDER = {0x163C // 4, 0x1640 // 4, 0x1660 // 4}
 RENDER |= {(CHR_SIZE + o) // 4 for o in (0x2218, 0x221C, 0x2220, 0x2224, 0x27E8, 0x27FC)}
 MASKS = {1: ~0x4000 & 0xFFFFFFFF}   # flags: drawn this frame
+# the attack's particles (active +0x1ca8, 16 bytes each, count at +0x1ca4): +4 is the
+# particle's handle, numbered from a pool each PC's own effects also take from
+RENDER |= {(CHR_SIZE + 0x1CA8 + 16 * i + 4) // 4 for i in range(16)}
 
 
 class Rec:
@@ -96,7 +99,9 @@ def where(k):
 def pointer(v):
     """Looks like a heap or image address (pointers differ between PCs); as a float it would
     be a meaningless tiny number. 0: none."""
-    return v == 0 or (0x00100000 <= v < 0x20000000 and not v & 3)
+    if v == 0 or (0x00100000 <= v < 0x20000000 and not v & 3):
+        return True
+    return v >> 24 == 0x80   # a particle handle (bit 31 + pool, slot, serial); as a float, about -1e-38
 
 
 def as_float(v):
