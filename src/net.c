@@ -3,12 +3,22 @@
  *   ARKLITE_HOST=[port]       host: Konoko is this PC's player (port 27777 by default)
  *   ARKLITE_JOIN=host[:port]  join: player 2 (the second Player-flagged character) is this PC's
  *
- * Both PCs start the same map, the same way (ARKLITE_AUTOSTART=<folder>). At the level's first
- * game update each one stops the clock (server time = game tick, so no tick runs) until the
- * other answers: the joiner sends HELLO, the host answers START with its RNG seeds (game RNG
- * 0x5326d4 and lockstep.c's tick-local stream), which both put in place right before the first
- * tick. HELLO and START also carry a hash of the level-start state, the start tick and the x87
- * control word; a difference is logged (the map or the way it was started isn't the same).
+ * Both PCs play the same map (ARKLITE_AUTOSTART=<folder>, or Custom Game). A level starts in the
+ * lobby: each PC plays its own player alone (warm-up; the other player stands), and F3 toggles
+ * "ready" (shown on screen by mp_hud.c). The joiner says HELLO (phase 0, its ready flag) every
+ * 200 ms; the host answers LOBBY: how many players there are, how many are ready, the countdown.
+ * When at least two players are there and 51% of them are ready, the host counts down 7 s (back
+ * to the lobby if that stops being true); at 0 it sends LOBBY with "go" and both PCs reload the
+ * level (ONrGame_StartLevel 0x4beb40, what Load Game does from the pause menu), so the match
+ * starts from the same state on both: joining never interrupts the host's game, and nobody
+ * needs the other's game state.
+ *
+ * After the reload each PC stops the clock (server time = game tick, so no tick runs) until the
+ * other answers: the joiner sends HELLO (phase 1), the host answers START with its RNG seeds
+ * (game RNG 0x5326d4 and lockstep.c's tick-local stream), which both put in place right before
+ * the first tick. HELLO and START also carry a hash of the level-start state, the start tick,
+ * the x87 control word and the game files; a difference is logged. The score (players.c) starts
+ * at 0 with the match.
  *
  * Ticks are numbered from the session's start. Each frame, for every tick the clock wants
  * (server time - game tick, what Daodan's DDrActionBuffer_Get computes before it hands over the
@@ -40,8 +50,8 @@
  * Each PC sees its own player: on the joiner the camera (gs+0x80, mode +0 == 1 follows the
  * character at +0x54; updated by 0x4d5ca0, called at 0x4fb141 per tick and 0x4fb170 per frame)
  * and the sound listener (0x4e33e0/0x4e3460 position, 0x4e3640 facing, called with gs+0xac at
- * 0x4fb1f4, 0x4fb1fb, 0x4fb20f) follow player 2, and the HUD (0x4fff50, called at 0x4fbbc4)
- * draws with player 2 in the player slot.
+ * 0x4fb1f4, 0x4fb1fb, 0x4fb20f) follow player 2, and the whole game display (0x4fb480: HUD,
+ * laser sight, crosshair) draws with player 2 in the player slot.
  *
  * Testing on one PC: Oni refuses a second instance (FindWindowA at 0x50f687, je at 0x50f68f),
  * so with networking on that check is skipped. The joiner's log is Arklite-join.log.
@@ -73,7 +83,6 @@ typedef unsigned long long u64;
 #define ONrListener_PositionAlt ((void (ONI_FC *)(u8 *, void *))0x4e33e0)
 #define ONrListener_Facing      ((void (ONI_FC *)(u8 *, void *))0x4e3640)
 #define ONcSingleInstanceJe     0x50f68f
-#define ONcHUD_DisplayCall      0x4fbbc4
 #define ONrCharacter_GetActive  ((u8 *(ONI_FC *)(u8 *))0x4f1180)
 
 #define CHR_SIZE        0x16a0
@@ -85,7 +94,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    27777
-#define PROTO           2
+#define PROTO           3
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -96,6 +105,8 @@ typedef unsigned long long u64;
 #define LOST_MS         10000
 #define HELLO_MS        200
 #define RESEND_MS       30
+#define COUNTDOWN_MS    7000
+#define VK_F3           0x72
 
 void *memcpy(void *, const void *, unsigned);
 void *memset(void *, int, unsigned);
@@ -122,13 +133,17 @@ __declspec(dllimport) int  WINAPI CloseHandle(HANDLE);
 __declspec(dllimport) int  WINAPI ReadFile(HANDLE, void *, u32, u32 *, void *);
 __declspec(dllimport) u32  WINAPI GetPrivateProfileSectionA(const char *, char *, u32, const char *);
 __declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
+__declspec(dllimport) short WINAPI GetAsyncKeyState(int);
+__declspec(dllimport) void * WINAPI GetForegroundWindow(void);
+__declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
+__declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
 
 #define INVALID_SOCKET  0xffffffffu
 #define FIONBIO         0x8004667e
 
 /* ---- Packets ------------------------------------------------------------------------------ */
 
-enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE };
+enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY };
 
 typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
 #define NFILES 4
@@ -137,7 +152,15 @@ typedef struct {
 	u32 level, start_tick, state_hash, fpu_cw, delay;
 	char version[16];
 	u32 files[NFILES];
+	u32 phase;             /* 0: in the lobby, 1: waiting for the match to start */
+	u32 ready;             /* the joiner pressed F3 */
 } PktHello;
+typedef struct {
+	PktHead h;
+	u32 level, players, ready, countdown_ms;   /* countdown_ms 0xffffffff: none */
+	u32 go;                /* the match starts: reload the level */
+	u32 joiner_ready;      /* what the host knows of the joiner's ready flag */
+} PktLobby;
 typedef struct {
 	PktHead h;
 	u32 level, start_tick, state_hash, fpu_cw, seed, local_seed, delay;
@@ -154,7 +177,7 @@ typedef struct {
 /* ---- State -------------------------------------------------------------------------------- */
 
 enum { NET_OFF, NET_HOST, NET_JOIN };
-enum { S_IDLE, S_WAIT, S_RUN, S_LOST };
+enum { S_IDLE, S_LOBBY, S_WAIT, S_RUN, S_LOST };
 
 static int g_mode, g_state;
 static u32 g_sock = INVALID_SOCKET;
@@ -191,8 +214,17 @@ static u32 g_checks, g_bad_checks, g_first_bad;
 typedef struct { u32 index, pad; u8 img[IMG_SIZE]; } CharImage;
 static CharImage (*g_images)[IMG_CHARS];
 static u32 g_nimages[HASH_SLOTS];
-static u8 *g_cam_set;
-static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_send_errors;                  /* the character the joiner's camera was pointed at */
+static u8 *g_cam_set;                  /* the character the joiner's camera was pointed at */
+static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_send_errors;
+
+/* The lobby */
+static int g_match_pending;            /* the level was reloaded for the match: start synced */
+static int g_ready, g_f3_down;         /* this PC's player pressed F3 */
+static int g_peer_seen, g_peer_ready;  /* host: a joiner is in the lobby, and its ready flag */
+static u32 g_countdown_end;            /* host: GetTickCount at 0, 0: no countdown */
+static u32 g_lobby_players = 1, g_lobby_ready, g_lobby_countdown = 0xffffffffu, g_lobby_rx;   /* joiner: the host's view */
+static int g_host_heard;               /* joiner: a LOBBY arrived in this lobby */
+static u32 g_last_lobby;
 
 /* What both PCs must have the same of besides Oni.exe: Daodan patches Oni's code and has
  * gameplay settings, and level0 holds the characters and animations */
@@ -414,6 +446,8 @@ static void send_hello(void)
 	p.delay = g_delay;
 	str_cpy(p.version, sizeof p.version, ARKLITE_VERSION);
 	memcpy(p.files, g_files, sizeof p.files);
+	p.phase = g_state != S_LOBBY;
+	p.ready = g_ready;
 	send_to_peer(&p, sizeof p);
 	g_last_hello = GetTickCount();
 }
@@ -433,6 +467,25 @@ static void send_start(void)
 	str_cpy(p.version, sizeof p.version, ARKLITE_VERSION);
 	memcpy(p.files, g_files, sizeof p.files);
 	send_to_peer(&p, sizeof p);
+}
+
+static u32 lobby_players(void) { return 1 + (g_peer_seen != 0); }
+static u32 lobby_ready(void) { return (g_ready != 0) + (g_peer_seen && g_peer_ready); }
+
+static void send_lobby(int go)
+{
+	PktLobby p;
+	u32 now = GetTickCount();
+	memset(&p, 0, sizeof p);
+	head(&p.h, PKT_LOBBY);
+	p.level = g_level;
+	p.players = lobby_players();
+	p.ready = lobby_ready();
+	p.countdown_ms = g_countdown_end ? (g_countdown_end - now < COUNTDOWN_MS + 1000 ? g_countdown_end - now : 0) : 0xffffffffu;
+	p.go = go;
+	p.joiner_ready = g_peer_ready;
+	send_to_peer(&p, sizeof p);
+	g_last_lobby = now;
 }
 
 static void send_inputs(void)
@@ -483,6 +536,21 @@ static void check_start(const char *who, u32 level, u32 start_tick, u32 state_ha
 	else
 		log_msg("net: level-start state matches the %s's (%08x)", who, state_hash);
 }
+
+static void check_files(const char *who, const char *version, const u32 *files)
+{
+	char v[17];
+	for (u32 i = 0; i < NFILES; i++)
+		if (files[i] != g_files[i])
+			log_msg("net: %s differs on the %s (%08x there, %08x here): the games will come apart; use the same AE install on both PCs",
+			        g_file_names[i], who, files[i], g_files[i]);
+	memcpy(v, version, 16);
+	v[16] = 0;
+	if (!str_ieq_n(v, ARKLITE_VERSION, 17))
+		log_msg("net: the %s runs Arklite %s, this PC %s", who, v, ARKLITE_VERSION);
+}
+
+static void start_match(void);
 
 static void strip(u32 *rec)
 {
@@ -537,21 +605,42 @@ static void receive(void)
 			continue;
 		}
 		if (g_have_peer && (from.addr != g_peer.addr || from.port != g_peer.port)) {
-			if (g_mode == NET_JOIN || g_state == S_RUN) continue;   /* one peer per game */
+			/* one joiner at a time: another only takes an empty lobby's place */
+			if (g_mode == NET_JOIN || g_state != S_LOBBY || g_peer_seen) continue;
 		}
 		if (g_state == S_IDLE) continue;   /* not in a level yet: the peer will resend */
 
 		if (h->type == PKT_HELLO && g_mode == NET_HOST && (u32)n >= sizeof(PktHello)) {
 			const PktHello *p = (const PktHello *)buf;
+			static u32 warned_level;
 			if (p->level != g_level) {
-				log_msg("net: a joiner is on level %d, this is level %d", p->level, g_level);
+				if (warned_level != p->level) log_msg("net: a joiner is on level %d, this is level %d", p->level, g_level);
+				warned_level = p->level;
 				continue;
 			}
-			if (!g_have_peer || g_state == S_WAIT) {
+			if (!g_have_peer || g_state == S_WAIT || (g_state == S_LOBBY && !g_peer_seen)) {
 				g_peer = from;
 				g_have_peer = 1;
 			}
 			g_last_recv = GetTickCount();
+			if (g_state == S_LOBBY) {
+				if (p->phase) continue;   /* it reloaded already; it says phase 0 again soon or waits */
+				if (!g_peer_seen) {
+					const u8 *ip = (const u8 *)&from.addr;
+					log_msg("net: %d.%d.%d.%d:%d joined the lobby", ip[0], ip[1], ip[2], ip[3], ntohs(from.port));
+					check_files("joiner", p->version, p->files);
+					g_peer_seen = 1;
+				}
+				if (g_peer_ready != (int)p->ready)
+					log_msg("net: the joiner is %s", p->ready ? "ready" : "not ready");
+				g_peer_ready = p->ready;
+				send_lobby(0);
+				continue;
+			}
+			if (!p->phase) {   /* still in the lobby: it missed "go" */
+				if (g_state == S_WAIT) send_lobby(1);
+				continue;
+			}
 			if (g_state == S_WAIT) {
 				const u8 *ip = (const u8 *)&from.addr;
 				log_msg("net: %d.%d.%d.%d:%d joined (input delay %d ticks there)", ip[0], ip[1], ip[2], ip[3], ntohs(from.port), p->delay);
@@ -560,6 +649,17 @@ static void receive(void)
 				begin_run();
 			}
 			send_start();   /* again for every HELLO: the first START may be lost */
+		} else if (h->type == PKT_LOBBY && g_mode == NET_JOIN && (u32)n >= sizeof(PktLobby)) {
+			const PktLobby *p = (const PktLobby *)buf;
+			g_last_recv = GetTickCount();
+			if (g_state != S_LOBBY || p->level != g_level) continue;
+			if (!g_host_heard) log_msg("net: in the host's lobby");
+			g_host_heard = 1;
+			g_lobby_players = p->players;
+			g_lobby_ready = p->ready;
+			g_lobby_countdown = p->countdown_ms;
+			g_lobby_rx = g_last_recv;
+			if (p->go) start_match();
 		} else if (h->type == PKT_START && g_mode == NET_JOIN && (u32)n >= sizeof(PktStart)) {
 			const PktStart *p = (const PktStart *)buf;
 			g_last_recv = GetTickCount();
@@ -592,7 +692,7 @@ static void session_begin(u32 level)
 	u32 n;
 
 	g_level = level;
-	g_state = S_WAIT;
+	g_state = g_match_pending ? S_WAIT : S_LOBBY;
 	g_ticks = g_remote = g_peer_ack = g_sent_gen = 0;
 	g_has_pending = 0;
 	memset(g_local_in, 0, sizeof g_local_in);
@@ -609,16 +709,28 @@ static void session_begin(u32 level)
 	g_start_tick = GS_TICK(ONgGameState);
 	g_start_fpu = fpu_control_word();
 	g_start_hash = summarize(c, &n);
-	if (g_mode == NET_HOST) g_have_peer = 0;
-	log_msg("net: level %d loaded (tick %d, state %08x, %d characters); %s", level, g_start_tick,
-	        g_start_hash, n, g_mode == NET_HOST ? "waiting for a player to join" : "joining the host");
+	g_ready = 0;
+	g_countdown_end = 0;
+	g_lobby_players = 1;
+	g_lobby_ready = 0;
+	g_lobby_countdown = 0xffffffffu;
+	g_host_heard = 0;
+	if (g_state == S_LOBBY) {
+		g_peer_seen = g_peer_ready = 0;
+		log_msg("net: level %d loaded: lobby (F3: ready)%s", level, g_mode == NET_HOST ? ", waiting for a player to join" : "");
+	} else {
+		log_msg("net: level %d reloaded for the match (tick %d, state %08x, %d characters); %s", level, g_start_tick,
+		        g_start_hash, n, g_mode == NET_HOST ? "waiting for the joiner" : "joining the host");
+	}
 }
 
 static void begin_run(void)
 {
 	g_state = S_RUN;
+	g_match_pending = 0;
 	g_gen = g_delay;   /* ticks 0..delay-1: no input from either PC */
 	g_last_recv = GetTickCount();
+	players_reset_scores();
 	log_msg("net: game on (%s), RNG %08x/%08x, input delay %d ticks", mode_name(), g_seed, g_local_seed, g_delay);
 }
 
@@ -630,8 +742,8 @@ static void session_end(const char *why)
 	if (g_state == S_RUN || g_state == S_LOST)
 		log_msg("net: level %d ended (%s) after %d ticks (%d s); state hashes: %d compared, %d differed%s",
 		        g_level, why, g_ticks, g_ticks / 60, g_checks, g_bad_checks, g_bad_checks ? ", see DESYNC above" : "");
-	else
-		log_msg("net: level %d ended (%s) before the game started", g_level, why);
+	else if (g_state == S_WAIT)
+		log_msg("net: level %d ended (%s) before the match started", g_level, why);
 	g_state = S_IDLE;
 }
 
@@ -694,6 +806,137 @@ static u32 run_update(u32 n, u32 *ticks_run)
 	return err;
 }
 
+/* ---- The lobby ------------------------------------------------------------------------- */
+
+/* F3, pressed while this Oni window has the focus (two Onis may share a PC) */
+static int f3_pressed(void)
+{
+	u32 pid = 0;
+	int down = (GetAsyncKeyState(VK_F3) & 0x8000) != 0, pressed;
+	void *w = GetForegroundWindow();
+
+	if (w) GetWindowThreadProcessId(w, &pid);
+	if (pid != GetCurrentProcessId()) down = 0;
+	pressed = down && !g_f3_down;
+	g_f3_down = down;
+	return pressed && !live_menu_open();
+}
+
+/* Reload the level for the match: both PCs do it, the host when its countdown ends, the joiner
+ * when "go" arrives. The next frame begins a synced session (S_WAIT, then the START handshake). */
+static void start_match(void)
+{
+	u32 level = g_level;
+
+	log_msg("net: the match starts: reloading level %d", level);
+	if (g_mode == NET_HOST)
+		for (int i = 0; i < 3; i++) send_lobby(1);   /* and again for each HELLO that still says lobby */
+	g_match_pending = 1;
+	session_end("match starting");
+	ONrGame_StartLevel(level);
+}
+
+static u32 lobby_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
+{
+	u8 *gs = ONgGameState;
+	u32 err, n, wanted;
+
+	if (f3_pressed()) {
+		g_ready = !g_ready;
+		log_msg("net: %s", g_ready ? "ready" : "not ready");
+		if (g_mode == NET_JOIN) send_hello();
+		else if (g_peer_seen) send_lobby(0);
+	}
+	if (g_mode == NET_JOIN) {
+		if (now - g_last_hello >= HELLO_MS) send_hello();
+		if (g_host_heard && (int)(now - g_last_recv) > LOST_MS) {
+			log_msg("net: nothing from the host for %d s", LOST_MS / 1000);
+			g_host_heard = 0;
+		}
+	} else {
+		if (g_peer_seen && (int)(now - g_last_recv) > LOST_MS) {
+			log_msg("net: the joiner left the lobby");
+			g_peer_seen = g_peer_ready = 0;
+		}
+		u32 players = lobby_players(), ready = lobby_ready();
+		int enough = players >= 2 && ready * 100 >= players * 51;
+		if (enough && !g_countdown_end) {
+			g_countdown_end = now + COUNTDOWN_MS;
+			if (!g_countdown_end) g_countdown_end = 1;
+			log_msg("net: %d of %d players ready: the match starts in %d s", ready, players, COUNTDOWN_MS / 1000);
+			send_lobby(0);
+		} else if (!enough && g_countdown_end) {
+			g_countdown_end = 0;
+			log_msg("net: countdown stopped (%d of %d players ready)", ready, players);
+			send_lobby(0);
+		}
+		if (g_countdown_end && (int)(now - g_countdown_end) >= 0) {
+			start_match();
+			if (ticks_run) *ticks_run = 0;
+			return 0;
+		}
+		if (g_peer_seen && now - g_last_lobby >= HELLO_MS) send_lobby(0);
+	}
+	if (g_state != S_LOBBY) {   /* "go" arrived in receive(): the level is being reloaded */
+		if (ticks_run) *ticks_run = 0;
+		return 0;
+	}
+
+	/* warm-up: this PC's player plays alone, the other one stands */
+	if (g_mode == NET_HOST) {
+		players_net_frame(0, 0);
+		err = ONrGameState_Update(count, actions, ticks_run);
+	} else {
+		wanted = GS_SERVER_TIME(gs) - GS_TICK(gs);
+		n = wanted > 6 ? 6 : wanted;
+		for (u32 k = 0; k < n; k++) {
+			if (k == 0 && (count & 0xffff) && actions) {
+				memcpy(g_frame_p2[0], actions, 0x30);
+				strip(g_frame_p2[0]);
+				memcpy(g_last_local, g_frame_p2[0], 0x30);
+			} else {
+				memcpy(g_frame_p2[k], g_last_local, 0x30);   /* the buttons stay held, no aim */
+				g_frame_p2[k][7] = g_frame_p2[k][8] = g_frame_p2[k][9] = g_frame_p2[k][10] = 0;
+			}
+			if (live_menu_open()) memset(g_frame_p2[k], 0, 0x30);
+		}
+		GS_SYNC_BEHIND(gs) = 0;
+		players_net_frame(g_frame_p2, n);
+		err = ONrGameState_Update(0, actions, ticks_run);   /* Konoko: no record */
+	}
+	g_last_tick = GS_TICK(gs);
+	return err;
+}
+
+/* What mp_hud.c shows */
+void net_hud(NetHud *h)
+{
+	u32 now = GetTickCount();
+
+	memset(h, 0, sizeof *h);
+	h->state = g_mode == NET_OFF ? NETHUD_OFF : g_state == S_LOBBY ? NETHUD_LOBBY :
+	           g_state == S_WAIT ? NETHUD_STARTING : g_state == S_RUN || g_state == S_LOST ? NETHUD_MATCH : NETHUD_OFF;
+	h->local_player = g_mode == NET_JOIN ? 1 : 0;
+	h->ready = g_ready;
+	h->countdown_ms = -1;
+	if (g_mode == NET_HOST) {
+		h->connected = 1;
+		h->players = lobby_players();
+		h->ready_count = lobby_ready();
+		if (g_countdown_end) h->countdown_ms = (int)(g_countdown_end - now) > 0 ? (int)(g_countdown_end - now) : 0;
+	} else {
+		h->connected = g_host_heard;
+		h->players = g_lobby_players;
+		h->ready_count = g_lobby_ready;
+		if (g_lobby_countdown != 0xffffffffu) {
+			int left = (int)g_lobby_countdown - (int)(now - g_lobby_rx);
+			h->countdown_ms = left > 0 ? left : 0;
+		}
+	}
+	h->needed = (h->players * 51 + 99) / 100;
+	if (h->needed < 2) h->needed = 2;
+}
+
 /* lockstep.c's update hook, in place of the update, while networking is on */
 u32 net_update(u32 count, void *actions, u32 *ticks_run)
 {
@@ -717,6 +960,12 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	now = GetTickCount();   /* after receive(), which stamps g_last_recv: now - g_last_recv mustn't wrap */
 	u32 wanted = GS_SERVER_TIME(gs) - GS_TICK(gs);
 	if (wanted > 6) wanted = 6;
+
+	if (g_state == S_IDLE) {   /* "go" arrived: the level is being reloaded for the match */
+		if (ticks_run) *ticks_run = 0;
+		return 0;
+	}
+	if (g_state == S_LOBBY) return lobby_frame(count, actions, ticks_run, now);
 
 	if (g_state == S_WAIT) {
 		if (g_mode == NET_JOIN && now - g_last_hello >= HELLO_MS) send_hello();
@@ -798,25 +1047,38 @@ static void ONI_FC camera_update(u32 ticks, u32 edx, u32 arg)
 	ONrCamera_Update(ticks, edx, arg);
 }
 
-/* The HUD reads the player from gs+0xac (0x4fc8a0) while it draws, once a frame and outside
- * the ticks, and keeps its own state in its globals (0x5ecfb8..0x5ed0dc): on the joiner it
- * draws with player 2 in the player slot (and its active data in gs+0xb0, as SetPlayer
- * 0x4fc8f0 sets it), and Konoko goes back right after. */
-static void (*g_hud_next)(void);   /* what the call ran before: hud_scale.c's wrapper */
+/* The game display (0x4fb480: the draw hook while a level is loaded, and the main loop's call
+ * at 0x4d47f3) runs once a frame outside the ticks and draws for "the player" in gs+0xac: the
+ * draw pass (0x4e1540) draws only the player's laser sight (0x4e1900, called with gs+0xac at
+ * 0x4e1836) and leaves its end in 0x5ecb58..0x5ecb64, the crosshair there (0x4f1fa0 from
+ * 0x4fbaa0) uses the player's weapon, and the HUD (0x4fff50) the player's health and weapon.
+ * On the joiner the display runs with player 2 in the player slot (gs+0xac, and its active
+ * data in gs+0xb0 as SetPlayer 0x4fc8f0 sets it); Konoko goes back right after. Its first 8
+ * bytes (sub esp,0x6c; mov eax,[0x5ece7c]) become a jump here and run in display_rest. */
+#define ONcDisplay              0x4fb480
 
-static void display_hud(void)
+__attribute__((naked)) static void display_rest(void)
+{
+	__asm__ volatile(
+		"subl $0x6c, %%esp\n\t"
+		"movl 0x5ece7c, %%eax\n\t"
+		"pushl $0x4fb488\n\t"
+		"ret\n" ::);
+}
+
+static void display(void)
 {
 	u8 *gs = ONgGameState, *p1 = gs ? GS_PLAYER(gs) : 0, *view = view_character(p1);
 	u32 b0;
 
 	if (!view || view == p1) {
-		g_hud_next();
+		display_rest();
 		return;
 	}
 	b0 = *(u32 *)(gs + 0xb0);
 	GS_PLAYER(gs) = view;
 	*(u8 **)(gs + 0xb0) = ONrCharacter_GetActive(view);
-	g_hud_next();
+	display_rest();
 	GS_PLAYER(gs) = p1;
 	*(u32 *)(gs + 0xb0) = b0;
 }
@@ -835,13 +1097,15 @@ static void view_install(void)
 	    patch_call(0x4fb20f, (u32)ONrListener_Facing, (u32)listener_facing))
 		log_msg("net: sound is heard from player 2");
 	{
-		const u8 *q = (const u8 *)ONcHUD_DisplayCall;
-		if (q[0] == 0xe8) {   /* hud_scale.c may already wrap it: chain to whatever it calls */
-			g_hud_next = (void (*)(void))(ONcHUD_DisplayCall + 5 + *(u32 *)(q + 1));
-			if (patch_call(ONcHUD_DisplayCall, (u32)g_hud_next, (u32)display_hud))
-				log_msg("net: the HUD shows player 2");
+		static const u8 entry[8] = { 0x83, 0xec, 0x6c, 0xa1, 0x7c, 0xce, 0x5e, 0x00 };
+		u8 b[8] = { 0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+		u32 rel = (u32)display - (ONcDisplay + 5);
+		if (code_matches(ONcDisplay, entry, sizeof entry)) {
+			memcpy(b + 1, &rel, 4);
+			patch_write(ONcDisplay, b, sizeof b);
+			log_msg("net: the HUD, laser sight and crosshair show player 2");
 		} else {
-			log_msg("net: HUD call 0x%x changed, the HUD shows Konoko", ONcHUD_DisplayCall);
+			log_msg("net: game display 0x%x changed, the HUD and crosshair show Konoko", ONcDisplay);
 		}
 	}
 }

@@ -234,10 +234,16 @@ On Windows, set the variables in `cmd` (not PowerShell's `set`) and start `Oni.e
 same window, or put `join=<host's IP>` under `[net]` in `AE\Arklite.ini` and start Oni as usual.
 The log's `net:` lines say whether networking is on.
 
-Use the host's IP. On one PC, join `127.0.0.1`; `-noswitch` keeps both in windows. Each game
-stands still at the start of the level until the other PC is there, then both run together.
+Use the host's IP. On one PC, join `127.0.0.1`; `-noswitch` keeps both in windows.
+
+The level starts as a **lobby**: everyone plays the map on their own (the other player stands
+still) while they wait. Press **F3** to be ready ("Press F3 to be ready" turns from red to green;
+F3 again to be unready). When at least two players are there and more than half of them are
+ready, a 7-second countdown starts (it stops if someone unreadies). At 0 the level reloads on
+every PC and the match begins, with everyone in step. The score (kills; dying on your own
+costs a point) is in the top right corner during the match.
 The host needs UDP port 27777 open (forwarded through the router for a game over the internet).
-The joiner's camera, sound and HUD follow player 2.
+The joiner's camera, sound, HUD, laser sight and crosshair follow player 2.
 
 Both logs (`Arklite.log` on the host, `Arklite-join.log` on the joiner) say whether the two
 games started the same, and once a second they compare the game state. `DESYNC` means the two

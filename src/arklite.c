@@ -35,7 +35,8 @@
  *   - Spawn points and respawning (players.c), item respawn (items.c): multiplayer maps.
  *   - Damage x1.25 and faster overhealing drain (mp_rules.c): multiplayer maps.
  *   - Input record and replay (lockstep.c): the determinism test for multiplayer.
- *   - Two PCs over UDP (net.c): multiplayer step 3, lockstep with input delay.
+ *   - Two PCs over UDP (net.c): multiplayer step 3, lockstep with input delay; a lobby where F3
+ *     readies up, a 7 s countdown, then the match. On-screen text and score (mp_hud.c).
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
 #include "arklite.h"
@@ -150,6 +151,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	items_install();
 	mp_rules_install();
 	net_install();
+	mp_hud_install();
 	lockstep_install();
 	live_menu_install();
 	return 1;

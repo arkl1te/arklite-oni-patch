@@ -132,6 +132,11 @@ static int g_nspawn;
 static u32 g_spawn_level;             /* for the spawn pick only: the level isn't current yet */
 static int g_p1_point = -1;            /* where Konoko just spawned, for player 2's pick */
 static u32 g_respawn_ticks = 90;       /* dead this long, an attack button brings a player back */
+/* Score (see "Score" below) */
+#define KILL_CREDIT     600     /* 10 s */
+static int g_score[2], g_was_dead[2];
+static int g_hit_by[2] = { -1, -1 };
+static u32 g_hit_tick[2];
 /* Attack buttons in the input state (record bits 29 punch, 30 kick; 38-40 fire1-3) */
 #define ATTACK_LO       0x60000000u
 #define ATTACK_HI       0x1c0u
@@ -229,6 +234,10 @@ static void new_level_check(void)
 {
 	u32 level = ONrLevel_GetCurrent();
 	if (level != g_level || (g_p2 >= 0 && !player2_valid())) {
+		if (level != g_level) {
+			g_score[0] = g_score[1] = 0;
+			g_hit_by[0] = g_hit_by[1] = -1;
+		}
 		g_level = level;
 		g_p2 = -1;
 		memset(g_input, 0, sizeof g_input);
@@ -345,12 +354,14 @@ static void player2_tick(void)
 }
 
 static void respawn_tick(const u32 *p1_input);
+static void score_tick(void);
 
 static void ONI_FC set_input(u8 *chr, u32 *input)
 {
 	ONrCharacter_SetInput(chr, input);   /* Konoko */
 	if (g_p2 >= 0) player2_tick();
 	if (multiplayer_active()) {
+		if (multiplayer_map()) score_tick();
 		respawn_tick(input);
 		items_tick();
 	}
@@ -510,6 +521,70 @@ static int respawn(u8 *c, u8 *other, int is_p2)
 	log_msg("players: %s respawned at spawn point %d (tick %u)", is_p2 ? "player 2" : "Konoko",
 	        point, GS_TICK(ONgGameState));
 	return (int)index;
+}
+
+/* ---- Score ---------------------------------------------------------------------------------- *
+ * Every hit goes through TakeDamage (0x4e65f0), whose 4th stack argument is the owner of the hit:
+ * a handle that 0x51cda0 turns into the attacking character (types 1 and 2), or 0. mp_rules.c
+ * reports each hit on a character here. A player who dies (the dead flag appears in a tick)
+ * within KILL_CREDIT ticks of a hit by the other player gives that player a kill; any other
+ * death (a fall, their own grenade) is a suicide and costs the dead player a point. All of it
+ * happens in ticks, so every PC counts the same. */
+
+static u8 *player_char(int who)
+{
+	u8 *gs = ONgGameState;
+	if (!gs) return 0;
+	if (who == 0) return GS_PLAYER(gs);
+	return player2_valid() ? character(g_p2) : 0;
+}
+
+static int player_of(u8 *c)
+{
+	if (!c) return -1;
+	for (int who = 0; who < 2; who++)
+		if (c == player_char(who)) return who;
+	return -1;
+}
+
+void players_note_hit(u8 *victim, u8 *attacker)
+{
+	int v = player_of(victim), a = player_of(attacker);
+	if (v < 0 || a < 0 || a == v || !ONgGameState) return;
+	g_hit_by[v] = a;
+	g_hit_tick[v] = GS_TICK(ONgGameState);
+}
+
+int players_score(int who) { return who == 0 || who == 1 ? g_score[who] : 0; }
+
+void players_reset_scores(void)
+{
+	for (int who = 0; who < 2; who++) {
+		g_score[who] = 0;
+		g_hit_by[who] = -1;
+		u8 *c = player_char(who);
+		g_was_dead[who] = c && (CHR_FLAGS(c) & CHR_DEAD);
+	}
+}
+
+static void score_tick(void)
+{
+	for (int who = 0; who < 2; who++) {
+		u8 *c = player_char(who);
+		int dead = c && (CHR_FLAGS(c) & CHR_INUSE) && (CHR_FLAGS(c) & CHR_DEAD);
+		if (dead && !g_was_dead[who]) {
+			int killer = g_hit_by[who];
+			if (killer >= 0 && GS_TICK(ONgGameState) - g_hit_tick[who] <= KILL_CREDIT) {
+				g_score[killer]++;
+				log_msg("players: player %d killed player %d (%d : %d)", killer + 1, who + 1, g_score[0], g_score[1]);
+			} else {
+				g_score[who]--;
+				log_msg("players: player %d died on their own (%d : %d)", who + 1, g_score[0], g_score[1]);
+			}
+			g_hit_by[who] = -1;
+		}
+		g_was_dead[who] = dead;
+	}
 }
 
 static void respawn_tick(const u32 *p1_input)

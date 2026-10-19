@@ -25,3 +25,4 @@ EXPORTS
   GetProcAddress@8
   GetTickCount@0
   GetPrivateProfileSectionA@16
+  GetCurrentProcessId@0
