@@ -48,7 +48,9 @@
  *
  * If no packet arrives for 10 s during the game, the peer is lost: the game goes on with the
  * peer's player standing still. Arklite.ini [net]: port (27777), delay (4 ticks; the host's is
- * used on both PCs), and host=1 or join=<ip>[:port] when the environment doesn't say. */
+ * used on both PCs), host=1 or join=<ip>[:port] when the environment doesn't say, and record
+ * (1: each PC records the game, every tick, to Arklite-net-host.akr / -join.akr, lockstep.c's
+ * format; tools/akr_diff.py compares the two and names the first tick and field that differ). */
 #include "arklite.h"
 
 typedef unsigned long long u64;
@@ -155,6 +157,7 @@ static SOCKADDR_IN g_peer;
 static int g_have_peer;
 static u16 g_port = DEFAULT_PORT;
 static u32 g_delay = 4;
+static int g_record = 1;               /* [net] record: Arklite-net-host.akr / -join.akr */
 
 static u32 g_level, g_last_tick;
 static u32 g_ticks;                    /* ticks run this session */
@@ -339,6 +342,7 @@ static void send_to_peer(const void *p, u32 n)
 {
 	if (!g_have_peer) return;
 	if (sendto(g_sock, p, n, 0, &g_peer, sizeof g_peer) < 0) {
+		if (WSAGetLastError() == 10093) return;   /* WSANOTINITIALISED: the process is exiting */
 		if (g_send_errors++ < 5) log_msg("net: send failed (error %d)", WSAGetLastError());
 	} else {
 		g_npackets_sent++;
@@ -563,6 +567,7 @@ static void session_end(const char *why)
 {
 	if (g_state == S_IDLE) return;
 	if (g_state == S_RUN) send_bye();
+	lockstep_net_record_end(why);
 	if (g_state == S_RUN || g_state == S_LOST)
 		log_msg("net: level %d ended (%s) after %d ticks (%d s); state hashes: %d compared, %d differed%s",
 		        g_level, why, g_ticks, g_ticks / 60, g_checks, g_bad_checks, g_bad_checks ? ", see DESYNC above" : "");
@@ -697,9 +702,18 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 		memcpy(g_frame_p1[k], g_mode == NET_HOST ? mine : theirs, 0x30);
 		memcpy(g_frame_p2[k], g_mode == NET_HOST ? theirs : mine, 0x30);
 	}
-	if (n && !g_ticks) lockstep_set_seeds(g_seed, g_local_seed);
+	if (n && !g_ticks) {
+		lockstep_set_seeds(g_seed, g_local_seed);
+		if (g_record) {
+			const char *path = g_mode == NET_HOST ? "Arklite-net-host.akr" : "Arklite-net-join.akr";
+			if (lockstep_net_record_begin(g_level, path)) log_msg("net: recording this game to %s", path);
+		}
+	}
 	players_net_frame(g_frame_p2, n);
-	return run_update(n, ticks_run);
+	lockstep_net_record_frame(n, g_frame_p1, g_frame_p2);
+	u32 err = run_update(n, ticks_run);
+	lockstep_net_record_frame_end();
+	return err;
 }
 
 /* ---- Each PC's own view ------------------------------------------------------------------- */
@@ -863,6 +877,7 @@ void net_install(void)
 
 	port = GetPrivateProfileIntA("net", "port", DEFAULT_PORT, ini_path());
 	g_delay = GetPrivateProfileIntA("net", "delay", 4, ini_path());
+	g_record = GetPrivateProfileIntA("net", "record", 1, ini_path()) != 0;
 	if (g_delay < 1) g_delay = 1;
 	if (g_delay > 30) g_delay = 30;
 	if (g_mode == NET_HOST) {   /* ARKLITE_HOST=1, or a port number */

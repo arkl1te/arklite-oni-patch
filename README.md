@@ -103,6 +103,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | `[net]` | `host` | 0 | 1: host a network game, as `ARKLITE_HOST=1` does. Set it back to 0 for single player |
 | | `join` | (empty) | `<ip>[:port]`: join that host, as `ARKLITE_JOIN` does. Empty it for single player |
 | | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one |
+| | `record` | 1 | 0: don't record network games to `Arklite-net-host.akr` / `-join.akr` |
 | | `delay` | 4 | Input delay in ticks (1/60 s each). The host's value is used on both PCs; raise it if the game stutters over a slow connection |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never |
@@ -242,7 +243,10 @@ Both logs (`Arklite.log` on the host, `Arklite-join.log` on the joiner) say whet
 games started the same, and once a second they compare the game state. `DESYNC` means the two
 games came apart; the log lists this PC's characters at that tick, and each PC writes
 `AE/Arklite-desync-host.bin` or `AE/Arklite-desync-join.bin`. `tools/desync_diff.py` compares
-the two and prints every value that differs. If the
+the two and prints every value that differs. Each PC also records the whole game to
+`AE/Arklite-net-host.akr` or `AE/Arklite-net-join.akr` (a few MB a minute with two players;
+`record=0` under `[net]` turns it off), and `tools/akr_diff.py` compares the two recordings
+tick by tick and names the first tick, value and random-number calls that differ. If the
 other PC goes quiet for 10 seconds, its player stands still and the game goes on.
 
 Joining shows your IP address to the host, and hosting shows yours to whoever joins.
