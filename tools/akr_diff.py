@@ -5,7 +5,8 @@
     tools/akr_diff.py Arklite-net-host.akr Arklite-net-join.akr [ticks to show, default 3]
 
 Frames don't matter (each PC splits ticks into frames its own way); ticks are compared in
-order. For each tick: the inputs it ran with (network recordings), both RNG streams, the RNG
+order. For each tick: the inputs it ran with (network recordings), both RNG streams, the
+collision world (format 8: level quad flags and dead-body boxes), the RNG
 callers (code addresses; bit 31 = outside a tick, bit 30 = the tick-local stream), and every
 4-byte value of every character and its active data. Values that already differ at the level's
 start (pointers, which differ between PCs) and the fields drawing writes (flag 0x4000, +0x163c,
@@ -15,7 +16,7 @@ that differ."""
 import struct
 import sys
 
-MAGIC, VERSION = 0x50524B41, 7
+MAGIC, VERSIONS = 0x50524B41, (7, 8)
 TAG_TICK, TAG_END = 0x4B434954, 0x46444E45
 CHR_SIZE, ACTIVE_SIZE = 0x16A0, 0x2838
 IMG_DWORDS = (CHR_SIZE + ACTIVE_SIZE) // 4
@@ -35,8 +36,9 @@ class Rec:
         self.data = open(path, "rb").read()
         self.pos = 0
         h = self.take("<8I")
-        if h[0] != MAGIC or h[1] != VERSION:
-            sys.exit(f"{path}: not an Arklite recording of format {VERSION}")
+        if h[0] != MAGIC or h[1] not in VERSIONS:
+            sys.exit(f"{path}: not an Arklite recording of format {VERSIONS}")
+        self.version = h[1]
         self.level, self.start_tick, self.seed = h[2], h[3], h[4]
         self.images = {}
         self.names = {}
@@ -50,7 +52,10 @@ class Rec:
     def read_tick(self):
         (tag,) = self.take("<I")
         assert tag == TAG_TICK, hex(tag)
-        tick, seed, n_chars, n_calls, fpu, local = self.take("<6I")
+        if self.version >= 8:
+            tick, seed, n_chars, n_calls, fpu, local, world = self.take("<7I")
+        else:
+            (tick, seed, n_chars, n_calls, fpu, local), world = self.take("<6I"), None
         chars = [self.take("<IIi7f") for _ in range(n_chars)]
         for c in chars:
             img = self.images.setdefault(c[0], [0] * IMG_DWORDS)
@@ -60,7 +65,7 @@ class Rec:
                 img[k] = v
         calls = list(self.take(f"<{n_calls}I")) if n_calls else []
         present = {c[0]: list(self.images[c[0]]) for c in chars}
-        return dict(tick=tick, seed=seed, local=local, fpu=fpu, calls=calls, chars=present)
+        return dict(tick=tick, seed=seed, local=local, fpu=fpu, world=world, calls=calls, chars=present)
 
     def ticks(self):
         """(inputs, tick) for every tick, inputs = (p1 record, p2 record or None)"""
@@ -137,6 +142,8 @@ def main():
                     out.append(f"  {' ' * len(who)}                   {rb.hex() if rb else None}")
         if ta["seed"] != tb["seed"] or ta["local"] != tb["local"]:
             out.append(f"  RNG {ta['seed']:08x}/{ta['local']:08x} vs {tb['seed']:08x}/{tb['local']:08x}")
+        if ta["world"] != tb["world"]:
+            out.append(f"  collision world (quad flags, dead bodies): {ta['world']:08x} vs {tb['world']:08x}")
         if ta["calls"] != tb["calls"]:
             ca, cb = callers(ta["calls"]), callers(tb["calls"])
             out.append(f"  RNG callers ({len(ca)} vs {len(cb)}):")
