@@ -122,6 +122,8 @@ static u32 g_level;
 static u32 g_input[12];                /* player 2's input state, like gs+0xb8 */
 static u32 g_record[12];               /* this frame's record */
 static int g_has_record, g_tick_index;
+static const u32 (*g_net_records)[12];  /* networked game: one record per tick (net.c) */
+static u32 g_net_count;
 
 #define MAX_SPAWN       64
 #define SPAWN_CLEAR     60.0f   /* no other living player this near: a free spawn point */
@@ -244,6 +246,7 @@ const u32 *players_begin_frame(void)
 {
 	g_tick_index = 0;
 	g_has_record = 0;
+	g_net_records = 0;
 	if (!g_enabled || !ONgGameState) return 0;
 	new_level_check();
 	if (g_p2 < 0) return 0;
@@ -256,10 +259,25 @@ const u32 *players_begin_frame(void)
 	return g_record;
 }
 
+void players_net_frame(const u32 (*records)[12], u32 n)
+{
+	g_tick_index = 0;
+	g_has_record = 0;
+	g_net_records = records;
+	g_net_count = records ? n : 0;
+	if (g_enabled && ONgGameState) new_level_check();
+}
+
+u8 *players_p2(void)
+{
+	return g_enabled && ONgGameState && player2_valid() ? character(g_p2) : 0;
+}
+
 void players_replay_frame(const u32 *rec)
 {
 	g_tick_index = 0;
 	g_has_record = 0;
+	g_net_records = 0;
 	if (!g_enabled || !ONgGameState) return;
 	new_level_check();
 	if (rec) {
@@ -278,7 +296,12 @@ static void player2_tick(void)
 
 	if (!player2_valid()) return;
 	p2 = character(g_p2);
-	if (g_has_record && g_tick_index == 0) {
+	if (g_net_records) {
+		if ((u32)g_tick_index < g_net_count) {
+			memcpy(rec, g_net_records[g_tick_index], sizeof rec);
+			src = rec;
+		}
+	} else if (g_has_record && g_tick_index == 0) {
 		memcpy(rec, g_record, sizeof rec);
 		src = rec;
 	}

@@ -35,6 +35,7 @@
  *   - Spawn points and respawning (players.c), item respawn (items.c): multiplayer maps.
  *   - Damage x1.25 and faster overhealing drain (mp_rules.c): multiplayer maps.
  *   - Input record and replay (lockstep.c): the determinism test for multiplayer.
+ *   - Two PCs over UDP (net.c): multiplayer step 3, lockstep with input delay.
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
 #include "arklite.h"
@@ -116,12 +117,21 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 {
 	if (reason == 0 && reserved) {   /* DLL_PROCESS_DETACH, process exiting */
 		lockstep_exit();
+		net_exit();
 		crash_log_exit();
 		return 1;
 	}
 	if (reason != 1) return 1;   /* DLL_PROCESS_ATTACH */
 
-	log_open("Arklite.log");
+	{
+		/* a second Oni on this PC (ARKLITE_JOIN) can't share the first one's log */
+		char log_name[MAX_PATH], v[4];
+		if (!GetEnvironmentVariableA("ARKLITE_LOG", log_name, sizeof log_name) ||
+		    str_len(log_name) >= sizeof log_name)
+			str_cpy(log_name, sizeof log_name,
+			        GetEnvironmentVariableA("ARKLITE_JOIN", v, sizeof v) ? "Arklite-join.log" : "Arklite.log");
+		log_open(log_name);
+	}
 	log_msg("Arklite %s loaded", ARKLITE_VERSION);
 	crash_log_install(instance);
 	more_options_install();
@@ -139,6 +149,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	players_install();
 	items_install();
 	mp_rules_install();
+	net_install();
 	lockstep_install();
 	live_menu_install();
 	return 1;
