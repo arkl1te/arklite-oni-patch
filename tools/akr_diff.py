@@ -9,7 +9,9 @@ order. For each tick: the inputs it ran with (network recordings), both RNG stre
 callers (code addresses; bit 31 = outside a tick, bit 30 = the tick-local stream), and every
 4-byte value of every character and its active data. Values that already differ at the level's
 start (pointers, which differ between PCs) and the fields drawing writes (flag 0x4000, +0x163c,
-+0x1660, active +0x221c..+0x2224) are skipped. Prints the first ticks that differ."""
++0x1660, active +0x2218..+0x2224, +0x27e8, +0x27fc) are skipped, and so are pairs of values
+that both look like memory addresses (pointers set during the game). Prints the first ticks
+that differ."""
 import struct
 import sys
 
@@ -21,7 +23,7 @@ ACTION = 0x30
 FRAME_P2, FRAME_P2N = 1, 2
 
 RENDER = {0x163C // 4, 0x1640 // 4, 0x1660 // 4}
-RENDER |= {(CHR_SIZE + o) // 4 for o in (0x221C, 0x2220, 0x2224)}
+RENDER |= {(CHR_SIZE + o) // 4 for o in (0x2218, 0x221C, 0x2220, 0x2224, 0x27E8, 0x27FC)}
 MASKS = {1: ~0x4000 & 0xFFFFFFFF}   # flags: drawn this frame
 
 
@@ -91,6 +93,12 @@ def where(k):
     return f"chr+0x{o:x}" if o < CHR_SIZE else f"act+0x{o - CHR_SIZE:x}"
 
 
+def pointer(v):
+    """Looks like a heap or image address (pointers differ between PCs); as a float it would
+    be a meaningless tiny number. 0: none."""
+    return v == 0 or (0x00100000 <= v < 0x20000000 and not v & 3)
+
+
 def as_float(v):
     return struct.unpack("<f", struct.pack("<I", v))[0]
 
@@ -140,7 +148,7 @@ def main():
                 if k in skip or k in RENDER:
                     continue
                 m = MASKS.get(k, 0xFFFFFFFF)
-                if (x[k] & m) != (y[k] & m):
+                if (x[k] & m) != (y[k] & m) and not (pointer(x[k]) and pointer(y[k])):
                     diffs.append(k)
             if diffs:
                 out.append(f"  #{idx} {name(x)}: {len(diffs)} values differ")
