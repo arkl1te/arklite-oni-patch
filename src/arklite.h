@@ -108,12 +108,24 @@ u32  char_limit_gs_offset(u32 offset);   /* a stock game state offset, where it 
 
 void lockstep_install(void);   /* ARKLITE_RECORD / ARKLITE_REPLAY: input record and replay */
 void lockstep_exit(void);      /* finish the recording or the replay report */
+void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
+void lockstep_set_seeds(u32 game, u32 tick_local);
+
+/* ---- net.c ------------------------------------------------------------------------------- */
+
+void net_install(void);        /* ARKLITE_HOST / ARKLITE_JOIN: two PCs in lockstep over UDP */
+void net_exit(void);
+int  net_active(void);
+u32  net_update(u32 count, void *actions, u32 *ticks_run);   /* the game update while it's on */
+void net_tick_done(void);      /* after every tick */
 
 /* ---- players.c --------------------------------------------------------------------------- */
 
 void players_install(void);
 const u32 *players_begin_frame(void);         /* player 2's record for this frame, or 0 */
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
+void players_net_frame(const u32 (*records)[12], u32 n);   /* networked: tick i gets records[i] */
+u8  *players_p2(void);                        /* player 2's character, or 0 */
 int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
 int  multiplayer_map(void);                   /* two or more Player-flagged characters (spawn points) */
 

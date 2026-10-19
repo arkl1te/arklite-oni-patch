@@ -711,6 +711,7 @@ static void ONI_FC tick_hook(void *action)
 	g_in_tick = 1;
 	ONrGameState_Tick(action);
 	g_in_tick = 0;
+	net_tick_done();
 	if (g_session != SESSION_RUN) return;
 	if (g_mode == MODE_RECORD) record_tick();
 	else replay_check_tick();
@@ -725,6 +726,7 @@ static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 
 	const u32 *p2;
 
+	if (net_active()) return net_update(count, actions, ticks_run);
 	if (g_mode != MODE_OFF) {
 		if (g_session == SESSION_RUN && (level != g_level || GS_TICK(gs) < g_last_tick))
 			session_end(level != g_level ? "level left" : "level restarted");
@@ -809,6 +811,10 @@ void lockstep_install(void)
 	if (update_ok) patch_call(ONcGameState_UpdateCall, (u32)ONrGameState_Update, (u32)update_hook);
 	else log_msg("lockstep: game update call changed, no player 2 and no record/replay");
 
+	if (net_active()) {
+		if (!tick_ok || !update_ok) log_msg("net: game loop changed, the game can't run networked");
+		return;   /* no record/replay in a networked game */
+	}
 	if (GetEnvironmentVariableA("ARKLITE_RECORD", g_path, sizeof g_path)) g_mode = MODE_RECORD;
 	else if (GetEnvironmentVariableA("ARKLITE_REPLAY", g_path, sizeof g_path)) g_mode = MODE_REPLAY;
 	if (g_mode == MODE_OFF) return;
@@ -820,6 +826,18 @@ void lockstep_install(void)
 	if (!rng_trace_install()) log_msg("lockstep: UUrRandom changed, RNG callers not traced");
 	g_trace = 1;
 	log_msg("lockstep: %s %s; starts with the next level", g_mode == MODE_RECORD ? "recording to" : "replaying", g_path);
+}
+
+void lockstep_get_seeds(u32 *game, u32 *tick_local)
+{
+	*game = UUgRandomSeed;
+	*tick_local = g_tick_local_seed;
+}
+
+void lockstep_set_seeds(u32 game, u32 tick_local)
+{
+	UUgRandomSeed = game;
+	g_tick_local_seed = tick_local;
 }
 
 void lockstep_exit(void)

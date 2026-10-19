@@ -24,10 +24,11 @@ Interactive or Rockstar, and it contains no Oni code or data: you need your own 
 | Player 2 on a gamepad | A second character with the IsPlayer flag in a level is played on an XInput gamepad, next to Konoko on keyboard and mouse. See [Player 2](#player-2). |
 | Determinism fixes | Ambient sounds, particles and speech no longer depend on the frame rate, the sound card or what is drawn, so the same input always gives the same game. Multiplayer needs this; in normal play you won't notice a difference. |
 | Input record and replay | For testing: records a level's input and replays it, checking every tick that the game came out the same. Off unless `ARKLITE_RECORD` or `ARKLITE_REPLAY` is set. See [Record and replay](#record-and-replay). |
+| Network test (two PCs) | For testing: one PC hosts, another joins by IP, and both play the same map in lockstep, Konoko on the host and player 2 on the joiner. Off unless `ARKLITE_HOST` or `ARKLITE_JOIN` is set. See [Network test](#network-test). |
 | Crash log | If Oni crashes, `AE/Arklite.log` gets the registers and the stack values that point into Oni, Daodan or Arklite. |
 
-Multiplayer over the network isn't in yet; the player 2 and record/replay features are the
-first steps toward it.
+Multiplayer over the network is at its first test: two players, started by hand with
+environment variables. There's no server list or in-game join yet.
 
 ## Requirements
 
@@ -99,6 +100,8 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `p2_pad` | 0 | Which gamepad plays player 2, 0–3 |
 | | `p2_aim_speed` | 8 | Aim per tick at full right stick |
 | | `p2_invert_y` | 0 | 1: invert the right stick's up/down |
+| `[net]` | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one |
+| | `delay` | 4 | Input delay in ticks (1/60 s each). The host's value is used on both PCs; raise it if the game stutters over a slow connection |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never |
 
@@ -110,6 +113,9 @@ Environment variables, for testing (set them before starting `Oni.exe`):
 | `ARKLITE_SAVEPOINT=<n>` | With `ARKLITE_AUTOSTART`, starts at save point n (1–9) |
 | `ARKLITE_RECORD=<file>` | Records the first level played into `AE/<file>` |
 | `ARKLITE_REPLAY=<file>` | Replays `AE/<file>` and writes `MATCHED` or `DESYNCED` to `AE/Arklite.log` |
+| `ARKLITE_HOST=1` | Hosts a network game on UDP port 27777 (or `ARKLITE_HOST=<port>`) |
+| `ARKLITE_JOIN=<ip>[:port]` | Joins the host at that address |
+| `ARKLITE_LOG=<file>` | Writes the log to `AE/<file>` (the joiner's default is `Arklite-join.log`) |
 
 On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`, `Oni.exe`.
 
@@ -206,6 +212,30 @@ for a desync it gives the first tick that differs and, for the first 3 ticks tha
 fields that differ (up to 16 per character) with their exact bits.
 
 Recordings are large (roughly 10–80 MB a minute with a few characters fighting).
+
+## Network test
+
+Two PCs (or two Oni windows on one PC) play the same multiplayer map. The host plays Konoko,
+the joiner plays player 2 (the second IsPlayer character), and only inputs travel between them.
+Both need the same Arklite, the same AE and the same map, and must start it the same way:
+
+```sh
+cd "/path/to/Oni/AE"
+ARKLITE_HOST=1 ARKLITE_AUTOSTART=NewLevel-Versus wine Oni.exe -noswitch               # PC 1
+ARKLITE_JOIN=192.168.1.10 ARKLITE_AUTOSTART=NewLevel-Versus wine Oni.exe -noswitch    # PC 2
+```
+
+Use the host's IP. On one PC, join `127.0.0.1`; `-noswitch` keeps both in windows. Each game
+stands still at the start of the level until the other PC is there, then both run together.
+The host needs UDP port 27777 open (forwarded through the router for a game over the internet).
+The joiner's camera and sound follow player 2; the HUD still shows Konoko's health.
+
+Both logs (`Arklite.log` on the host, `Arklite-join.log` on the joiner) say whether the two
+games started the same, and once a second they compare the game state. `DESYNC` means the two
+games came apart; the log lists this PC's characters at that tick, so compare both logs. If the
+other PC goes quiet for 10 seconds, its player stands still and the game goes on.
+
+Joining shows your IP address to the host, and hosting shows yours to whoever joins.
 
 ## Troubleshooting
 
