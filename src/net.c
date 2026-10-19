@@ -30,13 +30,18 @@
  *
  * Desync check: every 60 ticks each PC hashes the game state (both RNG streams and, for every
  * character in use, its flags, health, position, facing and velocity: no pointers, which differ
- * between PCs) and sends it with its inputs. A different hash logs DESYNC with this PC's
- * character summary for that tick, so the two logs side by side show which one differs.
+ * between PCs) and sends it with its inputs. Flag 0x4000 isn't hashed: the draw pass (0x4e1540)
+ * sets it on the characters this PC drew. A different hash logs DESYNC with this PC's
+ * character summary for that tick and writes every character's full image for that tick
+ * (Arklite-desync-host.bin / -join.bin; tools/desync_diff.py compares the two), without the
+ * fields each PC's drawing writes (flag 0x4000, +0x163c frames off screen, +0x1660 distance to
+ * the camera, active +0x221c..+0x2225 detail level).
  *
  * Each PC sees its own player: on the joiner the camera (gs+0x80, mode +0 == 1 follows the
  * character at +0x54; updated by 0x4d5ca0, called at 0x4fb141 per tick and 0x4fb170 per frame)
  * and the sound listener (0x4e33e0/0x4e3460 position, 0x4e3640 facing, called with gs+0xac at
- * 0x4fb1f4, 0x4fb1fb, 0x4fb20f) follow player 2. The HUD still shows Konoko.
+ * 0x4fb1f4, 0x4fb1fb, 0x4fb20f) follow player 2, and the HUD (0x4fff50, called at 0x4fbbc4)
+ * draws with player 2 in the player slot.
  *
  * Testing on one PC: Oni refuses a second instance (FindWindowA at 0x50f687, je at 0x50f68f),
  * so with networking on that check is skipped. The joiner's log is Arklite-join.log.
@@ -66,9 +71,16 @@ typedef unsigned long long u64;
 #define ONrListener_PositionAlt ((void (ONI_FC *)(u8 *, void *))0x4e33e0)
 #define ONrListener_Facing      ((void (ONI_FC *)(u8 *, void *))0x4e3640)
 #define ONcSingleInstanceJe     0x50f68f
+#define ONcHUD_DisplayCall      0x4fbbc4
+#define ONrCharacter_GetActive  ((u8 *(ONI_FC *)(u8 *))0x4f1180)
 
 #define CHR_SIZE        0x16a0
 #define CHR_INUSE       0x8000
+#define CHR_DRAWN       0x4000   /* flags: drawn this frame (draw pass 0x4e1540), per PC */
+#define ACTIVE_SIZE     0x2838
+#define GS_ACTIVE_STOCK 0xb6268
+#define IMG_SIZE        (CHR_SIZE + ACTIVE_SIZE)
+#define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    27777
 #define PROTO           1
@@ -104,6 +116,8 @@ __declspec(dllimport) u16  WINAPI htons(u16);
 __declspec(dllimport) u16  WINAPI ntohs(u16);
 __declspec(dllimport) HOSTENT * WINAPI gethostbyname(const char *);
 __declspec(dllimport) u32  WINAPI GetTickCount(void);
+__declspec(dllimport) int  WINAPI CloseHandle(HANDLE);
+__declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
 
 #define INVALID_SOCKET  0xffffffffu
 #define FIONBIO         0x8004667e
@@ -164,6 +178,11 @@ static struct { u32 tick, hash; } g_theirs[HASH_SLOTS];
 static u32 g_checked[HASH_SLOTS];        /* the tick each slot was last compared at */
 static u32 g_last_hash_tick, g_last_hash;
 static u32 g_checks, g_bad_checks, g_first_bad;
+/* Per hash slot, the full image of each character in use (character, then active data), for
+ * the dump written at the first desync: Arklite-desync-host.bin / -join.bin */
+typedef struct { u32 index, pad; u8 img[IMG_SIZE]; } CharImage;
+static CharImage (*g_images)[IMG_CHARS];
+static u32 g_nimages[HASH_SLOTS];
 static u8 *g_cam_set;
 static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_send_errors;                  /* the character the joiner's camera was pointed at */
 
@@ -201,7 +220,7 @@ static u32 summarize(CharSum *c, u32 *count)
 		if (!(flags & CHR_INUSE)) continue;
 		CharSum *s = &c[n++];
 		s->index = i;
-		s->flags = flags;
+		s->flags = flags & ~CHR_DRAWN;
 		s->health = *(int *)(chr + 0x38);
 		memcpy(s->pos, chr + 0x148, 12);
 		s->facing = *(float *)(chr + 0x16c);
@@ -210,6 +229,57 @@ static u32 summarize(CharSum *c, u32 *count)
 	}
 	*count = n;
 	return h;
+}
+
+/* The character's state, without what each PC's own drawing writes into it */
+static void image_of(u32 index, u8 *img)
+{
+	u8 *chr = GS_CHARACTERS(ONgGameState) + index * CHR_SIZE;
+	u16 a = *(u16 *)(chr + 2);
+
+	memcpy(img, chr, CHR_SIZE);
+	if (a && a < ONgCharacterSlots)
+		memcpy(img + CHR_SIZE, ONgGameState + char_limit_gs_offset(GS_ACTIVE_STOCK) + a * ACTIVE_SIZE, ACTIVE_SIZE);
+	else
+		memset(img + CHR_SIZE, 0, ACTIVE_SIZE);
+	*(u32 *)(img + 4) &= ~CHR_DRAWN;
+	*(u32 *)(img + 0x163c) = *(u32 *)(img + 0x163c) != 0;   /* frames off screen */
+	*(u32 *)(img + 0x1660) = 0;                             /* distance to the camera */
+	memset(img + CHR_SIZE + 0x221c, 0, 10);                 /* detail level the drawing chose */
+}
+
+static void capture_images(u32 slot)
+{
+	u8 *chr = GS_CHARACTERS(ONgGameState);
+	u32 slots = ONgCharacterSlots, n = 0;
+
+	if (!g_images) return;
+	if (slots > MAX_CHARS) slots = MAX_CHARS;
+	for (u32 i = 0; i < slots && n < IMG_CHARS; i++, chr += CHR_SIZE) {
+		if (!(*(u32 *)(chr + 4) & CHR_INUSE)) continue;
+		g_images[slot][n].index = i;
+		image_of(i, g_images[slot][n].img);
+		n++;
+	}
+	g_nimages[slot] = n;
+}
+
+static void dump_images(u32 slot, u32 tick)
+{
+	const char *name = g_mode == NET_HOST ? "Arklite-desync-host.bin" : "Arklite-desync-join.bin";
+	u32 head[4] = { 0x53444b41 /* "AKDS" */, 1, tick, g_nimages[slot] }, w;
+	HANDLE f;
+
+	if (!g_images) return;
+	f = CreateFileA(name, 0x40000000, 1, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+	if (f == INVALID_HANDLE_VALUE) {
+		log_msg("net: can't write %s", name);
+		return;
+	}
+	WriteFile(f, head, sizeof head, &w, 0);
+	WriteFile(f, g_images[slot], g_nimages[slot] * sizeof(CharImage), &w, 0);
+	CloseHandle(f);
+	log_msg("net: wrote %s (%d characters at tick %d): send it with the other PC's", name, g_nimages[slot], tick);
 }
 
 static void log_summary(u32 slot)
@@ -235,6 +305,7 @@ static void compare_hash(u32 slot)
 			log_msg("net: DESYNC at tick %d: state hash %08x here, %08x on the %s; this PC's characters:",
 			        tick, g_mine[slot].hash, g_theirs[slot].hash, g_mode == NET_HOST ? "joiner" : "host");
 			log_summary(slot);
+			dump_images(slot, tick);
 		}
 	}
 }
@@ -247,6 +318,7 @@ void net_tick_done(void)
 	if (g_ticks % HASH_EVERY) return;
 	u32 slot = (g_ticks / HASH_EVERY) % HASH_SLOTS;
 	g_mine[slot].hash = summarize(g_mine[slot].chars, &g_mine[slot].n);
+	capture_images(slot);
 	g_mine[slot].tick = g_ticks;
 	g_last_hash_tick = g_ticks;
 	g_last_hash = g_mine[slot].hash;
@@ -653,6 +725,29 @@ static void ONI_FC camera_update(u32 ticks, u32 edx, u32 arg)
 	ONrCamera_Update(ticks, edx, arg);
 }
 
+/* The HUD reads the player from gs+0xac (0x4fc8a0) while it draws, once a frame and outside
+ * the ticks, and keeps its own state in its globals (0x5ecfb8..0x5ed0dc): on the joiner it
+ * draws with player 2 in the player slot (and its active data in gs+0xb0, as SetPlayer
+ * 0x4fc8f0 sets it), and Konoko goes back right after. */
+static void (*g_hud_next)(void);   /* what the call ran before: hud_scale.c's wrapper */
+
+static void display_hud(void)
+{
+	u8 *gs = ONgGameState, *p1 = gs ? GS_PLAYER(gs) : 0, *view = view_character(p1);
+	u32 b0;
+
+	if (!view || view == p1) {
+		g_hud_next();
+		return;
+	}
+	b0 = *(u32 *)(gs + 0xb0);
+	GS_PLAYER(gs) = view;
+	*(u8 **)(gs + 0xb0) = ONrCharacter_GetActive(view);
+	g_hud_next();
+	GS_PLAYER(gs) = p1;
+	*(u32 *)(gs + 0xb0) = b0;
+}
+
 static void ONI_FC listener_position(u8 *chr, void *out) { ONrListener_Position(view_character(chr), out); }
 static void ONI_FC listener_position_alt(u8 *chr, void *out) { ONrListener_PositionAlt(view_character(chr), out); }
 static void ONI_FC listener_facing(u8 *chr, void *out) { ONrListener_Facing(view_character(chr), out); }
@@ -666,6 +761,16 @@ static void view_install(void)
 	    patch_call(0x4fb1fb, (u32)ONrListener_Position, (u32)listener_position) &&
 	    patch_call(0x4fb20f, (u32)ONrListener_Facing, (u32)listener_facing))
 		log_msg("net: sound is heard from player 2");
+	{
+		const u8 *q = (const u8 *)ONcHUD_DisplayCall;
+		if (q[0] == 0xe8) {   /* hud_scale.c may already wrap it: chain to whatever it calls */
+			g_hud_next = (void (*)(void))(ONcHUD_DisplayCall + 5 + *(u32 *)(q + 1));
+			if (patch_call(ONcHUD_DisplayCall, (u32)g_hud_next, (u32)display_hud))
+				log_msg("net: the HUD shows player 2");
+		} else {
+			log_msg("net: HUD call 0x%x changed, the HUD shows Konoko", ONcHUD_DisplayCall);
+		}
+	}
 }
 
 /* ---- Install ------------------------------------------------------------------------------ */
@@ -721,6 +826,7 @@ static int net_open(void)
 		return 0;
 	}
 	ioctlsocket(g_sock, FIONBIO, &on);
+	g_images = VirtualAlloc(0, HASH_SLOTS * IMG_CHARS * sizeof(CharImage), 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
 	if (g_mode == NET_JOIN) {
 		if (!resolve(g_join, &g_peer)) {
 			log_msg("net: can't find host %s, networking off", g_join);
