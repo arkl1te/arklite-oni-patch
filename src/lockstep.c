@@ -81,7 +81,7 @@
 #define MAX_CALLS    16384                     /* RNG callers kept per tick */
 
 #define REC_MAGIC    0x50524b41                /* "AKRP" */
-#define REC_VERSION  7
+#define REC_VERSION  8
 #define FRAME_P2     1                         /* RecFrame.flags: player 2's record follows the actions */
 #define FRAME_P2N    2                         /* network recording: player 2's record for every tick */
 #define TAG_TICK     0x4b434954                /* "TICK" */
@@ -106,7 +106,7 @@ __declspec(dllimport) int    WINAPI VirtualFree(void *, u32, u32);
  * (0x2838, zeros when not active); each one that changed since the character's last record. */
 typedef struct { u32 magic, version, level, start_tick, seed, fpu_cw, tick_local_seed, reserved; } RecHeader;
 typedef struct { u16 n_actions, flags; } RecFrame;
-typedef struct { u32 tick, seed, n_chars, n_calls, fpu_cw, tick_local_seed; } RecTick;
+typedef struct { u32 tick, seed, n_chars, n_calls, fpu_cw, tick_local_seed, world; } RecTick;
 typedef struct {
 	u32 index, flags;
 	int health;
@@ -320,6 +320,34 @@ static void image_of(u32 index, u32 *img)
 	img[CHR_OFFSCREEN_FRAMES / 4] = img[CHR_OFFSCREEN_FRAMES / 4] != 0;
 }
 
+/* What character collision reads besides the characters (format 8): the level's quad flags
+ * (environment [[gs+0x150]+0x40], quads at +0xc: an instance array, count +0x14, 0x38-byte
+ * entries from +0x18 with the flags at +0x30) and the dead-body collision ring
+ * ([0x5ece80]+0x2f8: +0xc/+0x10/+0x14 indexes, 0x44c-byte entries from +0x18 with a box of 6
+ * floats at +0x434; 0x4ebb60 fills one when a character dies) */
+static u32 world_hash(void)
+{
+	u8 *gs = ONgGameState, *level, *env, *quads, *ring;
+	u32 h = 0x811c9dc5u;
+
+	level = gs ? *(u8 **)(gs + 0x150) : 0;
+	env = level ? *(u8 **)(level + 0x40) : 0;
+	quads = env ? *(u8 **)(env + 0xc) : 0;
+	if (quads) {
+		u32 n = *(u32 *)(quads + 0x14);
+		for (u32 i = 0; i < n; i++) h = (h ^ *(u32 *)(quads + 0x18 + i * 0x38 + 0x30)) * 0x01000193u;
+	}
+	ring = *(u8 **)0x5ece80 ? *(u8 **)(*(u8 **)0x5ece80 + 0x2f8) : 0;
+	if (ring) {
+		u32 n = *(u32 *)(ring + 0x14);
+		h = (h ^ *(u32 *)(ring + 0x10)) * 0x01000193u;
+		for (u32 i = 0; i < n && i < 256; i++)
+			for (u32 k = 0; k < 6; k++)
+				h = (h ^ *(u32 *)(ring + 0x18 + i * 0x44c + 0x434 + k * 4)) * 0x01000193u;
+	}
+	return h;
+}
+
 static u32 capture(RecTick *t, RecChar *c)
 {
 	u8 *chr = GS_CHARACTERS(ONgGameState);
@@ -343,6 +371,7 @@ static u32 capture(RecTick *t, RecChar *c)
 	t->n_calls = g_ncalls < MAX_CALLS ? g_ncalls : MAX_CALLS;
 	t->fpu_cw = g_fpu_cw;
 	t->tick_local_seed = g_tick_local_seed;
+	t->world = world_hash();
 	return n;
 }
 
@@ -540,7 +569,7 @@ static int compare_state(const RecRead *r, const RecTick *t, const RecChar *now,
 	u32 n = t->n_chars, i = 0, j = 0, shown = 0;
 	int chars_differ = rt->n_chars != n;
 	int other_differ = rt->tick != t->tick || rt->seed != t->seed || rt->fpu_cw != t->fpu_cw ||
-	                   rt->tick_local_seed != t->tick_local_seed;
+	                   rt->tick_local_seed != t->tick_local_seed || rt->world != t->world;
 
 	if (log) {
 		if (rt->tick != t->tick) log_msg("  game tick: recorded %d, now %d", rt->tick, t->tick);
@@ -549,6 +578,7 @@ static int compare_state(const RecRead *r, const RecTick *t, const RecChar *now,
 		if (rt->tick_local_seed != t->tick_local_seed)
 			log_msg("  tick local RNG: recorded %08x, now %08x", rt->tick_local_seed, t->tick_local_seed);
 		if (rt->seed != t->seed || rt->tick_local_seed != t->tick_local_seed) log_callers(r, t);
+		if (rt->world != t->world) log_msg("  collision world (quad flags, dead bodies): recorded %08x, now %08x", rt->world, t->world);
 		if (chars_differ) log_msg("  characters: recorded %d, now %d", rt->n_chars, n);
 	}
 	while (i < rt->n_chars || j < n) {
