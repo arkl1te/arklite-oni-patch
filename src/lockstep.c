@@ -81,6 +81,7 @@
 #define REC_MAGIC    0x50524b41                /* "AKRP" */
 #define REC_VERSION  7
 #define FRAME_P2     1                         /* RecFrame.flags: player 2's record follows the actions */
+#define FRAME_P2N    2                         /* network recording: player 2's record for every tick */
 #define TAG_TICK     0x4b434954                /* "TICK" */
 #define TAG_END      0x46444e45                /* "ENDF": end of a frame */
 
@@ -826,6 +827,46 @@ void lockstep_install(void)
 	if (!rng_trace_install()) log_msg("lockstep: UUrRandom changed, RNG callers not traced");
 	g_trace = 1;
 	log_msg("lockstep: %s %s; starts with the next level", g_mode == MODE_RECORD ? "recording to" : "replaying", g_path);
+}
+
+/* ---- Network recording (net.c) ------------------------------------------------------- *
+ * Each PC records the networked game in the same format, so tools/akr_diff.py can compare the
+ * two tick by tick. Frames carry FRAME_P2N: player 2's record for each of the frame's ticks.
+ * Started right before the first tick, once the seeds are in place. */
+
+int lockstep_net_record_begin(u32 level, const char *path)
+{
+	if (g_session == SESSION_RUN) return 1;
+	if (!g_trace) {
+		if (!rng_trace_install()) log_msg("lockstep: UUrRandom changed, RNG callers not traced");
+		g_trace = 1;
+	}
+	str_cpy(g_path, sizeof g_path, path);
+	g_mode = MODE_RECORD;
+	session_begin(level);
+	return g_session == SESSION_RUN;
+}
+
+void lockstep_net_record_frame(u32 n, const u32 (*p1)[12], const u32 (*p2)[12])
+{
+	RecFrame f = { (u16)n, FRAME_P2N };
+	if (g_session != SESSION_RUN || g_mode != MODE_RECORD) return;
+	out_write(&f, sizeof f);
+	out_write(p1, n * ACTION_SIZE);
+	out_write(p2, n * ACTION_SIZE);
+	g_tick_in_frame = 0;
+}
+
+void lockstep_net_record_frame_end(void)
+{
+	if (g_session != SESSION_RUN || g_mode != MODE_RECORD) return;
+	out_u32(TAG_END);
+	g_frames++;
+}
+
+void lockstep_net_record_end(const char *why)
+{
+	if (g_mode == MODE_RECORD) session_end(why);
 }
 
 void lockstep_get_seeds(u32 *game, u32 *tick_local)

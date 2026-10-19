@@ -110,6 +110,11 @@ void lockstep_install(void);   /* ARKLITE_RECORD / ARKLITE_REPLAY: input record 
 void lockstep_exit(void);      /* finish the recording or the replay report */
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
+/* net.c's recording of a networked game (same format, player 2's record per tick) */
+int  lockstep_net_record_begin(u32 level, const char *path);
+void lockstep_net_record_frame(u32 n, const u32 (*p1)[12], const u32 (*p2)[12]);
+void lockstep_net_record_frame_end(void);
+void lockstep_net_record_end(const char *why);
 
 /* ---- net.c ------------------------------------------------------------------------------- */
 
