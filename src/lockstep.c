@@ -65,7 +65,9 @@
 
 #define CHR_SIZE     0x16a0
 #define CHR_INUSE    0x8000                    /* Flags (+4) */
-#define CHR_ACTIVE_INDEX(c) (*(u16 *)((c) + 2))     /* 0xffff: not active */
+/* Active data: 0 none, else the slot is the low byte (the high byte holds flags, e.g. 0x8201
+ * is slot 1; 0x4f1180 does the same) */
+#define CHR_ACTIVE_INDEX(c) (*(u16 *)((c) + 2))
 /* Drawn frames off screen (0x4e27d0, from the character draw pass 0x4e1540), 0 when on
  * screen. Auto-aim (0x4efad0, in the tick) only aims at characters with 0. The count depends on
  * the frame rate and on frames drawn behind a pause menu, so only "on screen" is compared. */
@@ -311,8 +313,8 @@ static void image_of(u32 index, u32 *img)
 	u16 a = CHR_ACTIVE_INDEX(chr);
 
 	memcpy(img, chr, CHR_SIZE);
-	if (a < ONgCharacterSlots)
-		memcpy((u8 *)img + CHR_SIZE, ONgGameState + char_limit_gs_offset(GS_ACTIVE_STOCK) + a * ACTIVE_SIZE, ACTIVE_SIZE);
+	if (a && (a & 0xff) < ONgCharacterSlots)
+		memcpy((u8 *)img + CHR_SIZE, ONgGameState + char_limit_gs_offset(GS_ACTIVE_STOCK) + (a & 0xff) * ACTIVE_SIZE, ACTIVE_SIZE);
 	else
 		memset((u8 *)img + CHR_SIZE, 0, ACTIVE_SIZE);
 	img[CHR_OFFSCREEN_FRAMES / 4] = img[CHR_OFFSCREEN_FRAMES / 4] != 0;

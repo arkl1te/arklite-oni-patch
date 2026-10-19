@@ -24,3 +24,4 @@ EXPORTS
   VirtualFree@12
   GetProcAddress@8
   GetTickCount@0
+  GetPrivateProfileSectionA@16

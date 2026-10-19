@@ -85,7 +85,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    27777
-#define PROTO           1
+#define PROTO           2
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -119,6 +119,8 @@ __declspec(dllimport) u16  WINAPI ntohs(u16);
 __declspec(dllimport) HOSTENT * WINAPI gethostbyname(const char *);
 __declspec(dllimport) u32  WINAPI GetTickCount(void);
 __declspec(dllimport) int  WINAPI CloseHandle(HANDLE);
+__declspec(dllimport) int  WINAPI ReadFile(HANDLE, void *, u32, u32 *, void *);
+__declspec(dllimport) u32  WINAPI GetPrivateProfileSectionA(const char *, char *, u32, const char *);
 __declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
 
 #define INVALID_SOCKET  0xffffffffu
@@ -129,15 +131,18 @@ __declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
 enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE };
 
 typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
+#define NFILES 4
 typedef struct {
 	PktHead h;
 	u32 level, start_tick, state_hash, fpu_cw, delay;
 	char version[16];
+	u32 files[NFILES];
 } PktHello;
 typedef struct {
 	PktHead h;
 	u32 level, start_tick, state_hash, fpu_cw, seed, local_seed, delay;
 	char version[16];
+	u32 files[NFILES];
 } PktStart;
 typedef struct {
 	PktHead h;
@@ -188,6 +193,53 @@ static CharImage (*g_images)[IMG_CHARS];
 static u32 g_nimages[HASH_SLOTS];
 static u8 *g_cam_set;
 static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_send_errors;                  /* the character the joiner's camera was pointed at */
+
+/* What both PCs must have the same of besides Oni.exe: Daodan patches Oni's code and has
+ * gameplay settings, and level0 holds the characters and animations */
+static const char *const g_file_names[NFILES] = {
+	"binkw32.dll (Daodan)", "daodan.ini [gameplay] and [devmode]",
+	"GameDataFolder\\level0_Final.dat", "GameDataFolder\\level0_Final.raw",
+};
+static u32 g_files[NFILES];
+
+static u32 hash_words(u32 h, const u8 *p, u32 n)
+{
+	u32 i = 0;
+	for (; i + 4 <= n; i += 4) h = (h ^ *(const u32 *)(p + i)) * 0x01000193u;
+	for (; i < n; i++) h = (h ^ p[i]) * 0x01000193u;
+	return h;
+}
+
+static u32 hash_file(const char *path)
+{
+	static u8 *buf;
+	HANDLE f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 1, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+	u32 h = 0x811c9dc5u, got;
+
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	if (!buf) buf = VirtualAlloc(0, 1 << 20, 0x3000, 4);
+	while (buf && ReadFile(f, buf, 1 << 20, &got, 0) && got) h = hash_words(h, buf, got);
+	CloseHandle(f);
+	return h;
+}
+
+static void hash_files(void)
+{
+	static char section[8192];
+	char ini[MAX_PATH];
+	u32 n;
+
+	g_files[0] = hash_file("binkw32.dll");
+	if (!GetFullPathNameA("daodan.ini", sizeof ini, ini, 0)) str_cpy(ini, sizeof ini, "daodan.ini");
+	g_files[1] = 0x811c9dc5u;
+	n = GetPrivateProfileSectionA("gameplay", section, sizeof section, ini);
+	g_files[1] = hash_words(g_files[1], (const u8 *)section, n);
+	n = GetPrivateProfileSectionA("devmode", section, sizeof section, ini);
+	g_files[1] = hash_words(g_files[1] ^ 1, (const u8 *)section, n);
+	g_files[2] = hash_file("GameDataFolder\\level0_Final.dat");
+	g_files[3] = hash_file("GameDataFolder\\level0_Final.raw");
+	log_msg("net: Daodan %08x, its settings %08x, level0 %08x %08x", g_files[0], g_files[1], g_files[2], g_files[3]);
+}
 
 static const char *mode_name(void) { return g_mode == NET_HOST ? "host" : "join"; }
 
@@ -241,8 +293,8 @@ static void image_of(u32 index, u8 *img)
 	u16 a = *(u16 *)(chr + 2);
 
 	memcpy(img, chr, CHR_SIZE);
-	if (a && a < ONgCharacterSlots)
-		memcpy(img + CHR_SIZE, ONgGameState + char_limit_gs_offset(GS_ACTIVE_STOCK) + a * ACTIVE_SIZE, ACTIVE_SIZE);
+	if (a && (a & 0xff) < ONgCharacterSlots)   /* the high byte holds flags (0x8201: slot 1) */
+		memcpy(img + CHR_SIZE, ONgGameState + char_limit_gs_offset(GS_ACTIVE_STOCK) + (a & 0xff) * ACTIVE_SIZE, ACTIVE_SIZE);
 	else
 		memset(img + CHR_SIZE, 0, ACTIVE_SIZE);
 	*(u32 *)(img + 4) &= ~CHR_DRAWN;
@@ -361,6 +413,7 @@ static void send_hello(void)
 	p.fpu_cw = g_start_fpu;
 	p.delay = g_delay;
 	str_cpy(p.version, sizeof p.version, ARKLITE_VERSION);
+	memcpy(p.files, g_files, sizeof p.files);
 	send_to_peer(&p, sizeof p);
 	g_last_hello = GetTickCount();
 }
@@ -378,6 +431,7 @@ static void send_start(void)
 	p.local_seed = g_local_seed;
 	p.delay = g_delay;
 	str_cpy(p.version, sizeof p.version, ARKLITE_VERSION);
+	memcpy(p.files, g_files, sizeof p.files);
 	send_to_peer(&p, sizeof p);
 }
 
@@ -408,8 +462,13 @@ static void send_bye(void)
 	send_to_peer(&h, sizeof h);
 }
 
-static void check_start(const char *who, u32 level, u32 start_tick, u32 state_hash, u32 fpu_cw, const char *version)
+static void check_start(const char *who, u32 level, u32 start_tick, u32 state_hash, u32 fpu_cw, const char *version,
+                        const u32 *files)
 {
+	for (u32 i = 0; i < NFILES; i++)
+		if (files[i] != g_files[i])
+			log_msg("net: %s differs on the %s (%08x there, %08x here): the games will come apart; use the same AE install on both PCs",
+			        g_file_names[i], who, files[i], g_files[i]);
 	char v[17];
 	memcpy(v, version, 16);
 	v[16] = 0;
@@ -496,7 +555,7 @@ static void receive(void)
 			if (g_state == S_WAIT) {
 				const u8 *ip = (const u8 *)&from.addr;
 				log_msg("net: %d.%d.%d.%d:%d joined (input delay %d ticks there)", ip[0], ip[1], ip[2], ip[3], ntohs(from.port), p->delay);
-				check_start("joiner", p->level, p->start_tick, p->state_hash, p->fpu_cw, p->version);
+				check_start("joiner", p->level, p->start_tick, p->state_hash, p->fpu_cw, p->version, p->files);
 				lockstep_get_seeds(&g_seed, &g_local_seed);
 				begin_run();
 			}
@@ -509,7 +568,7 @@ static void receive(void)
 				log_msg("net: the host is on level %d, this is level %d", p->level, g_level);
 				continue;
 			}
-			check_start("host", p->level, p->start_tick, p->state_hash, p->fpu_cw, p->version);
+			check_start("host", p->level, p->start_tick, p->state_hash, p->fpu_cw, p->version, p->files);
 			g_seed = p->seed;
 			g_local_seed = p->local_seed;
 			if (p->delay >= 1 && p->delay <= 30) g_delay = p->delay;   /* the host's, on both PCs */
@@ -889,6 +948,7 @@ void net_install(void)
 	g_port = (u16)port;
 	log_msg("net: %s, input delay %d ticks; the game waits at the level's start for the %s",
 	        g_mode == NET_HOST ? "hosting" : "joining", g_delay, g_mode == NET_HOST ? "joiner" : "host");
+	hash_files();
 	if (g_mode == NET_JOIN) view_install();
 	/* a second Oni on the same PC, for testing: skip "There is already an instance" */
 	if (patch_byte(ONcSingleInstanceJe, 0x74, 0xeb)) log_msg("net: more than one Oni may run on this PC");

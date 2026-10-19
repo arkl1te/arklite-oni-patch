@@ -20,7 +20,7 @@ IMG_DWORDS = (CHR_SIZE + ACTIVE_SIZE) // 4
 ACTION = 0x30
 FRAME_P2, FRAME_P2N = 1, 2
 
-RENDER = {0x163C // 4, 0x1660 // 4}
+RENDER = {0x163C // 4, 0x1640 // 4, 0x1660 // 4}
 RENDER |= {(CHR_SIZE + o) // 4 for o in (0x221C, 0x2220, 0x2224)}
 MASKS = {1: ~0x4000 & 0xFFFFFFFF}   # flags: drawn this frame
 
