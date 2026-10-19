@@ -1,4 +1,5 @@
-/* Multiplayer map rules: damage x1.25 and overhealing drains a quarter faster.
+/* Multiplayer map rules: players can hurt each other (free for all), damage x1.25 and
+ * overhealing drains a quarter faster.
  *
  * Only on a multiplayer map (two or more Player-flagged characters, multiplayer_map in
  * players.c), which every PC and every replay agrees on.
@@ -14,7 +15,21 @@
  * point and sets the cooldown to 10 (0x51bb98..0x51bbae): 1 point every 11 ticks. We replace
  * 0x51bb98..0x51bba5 with a call to a stub that does the same with cooldowns of 8, 8, 8, 8, 7
  * (by health mod 5): 5 points every 44 ticks, 1.25x stock's 4. The cooldown write at 0x51bba6
- * stays, for the hypo heal finishing (jmp at 0x51bb33). */
+ * stays, for the hypo heal finishing (jmp at 0x51bb33).
+ *
+ * Free for all: every player is a copy of Konoko's placement, so all are on her team (character
+ * +0x12, u16; chr_changeteam 0x4b8b10 sets it), and Oni never lets a character hurt one it's
+ * friendly with. The relationship of two teams comes from 0x48b2c0 (CX, DX the teams; EAX 0
+ * friendly, 1 neutral, 2 hostile; same team always friendly unless 0x5eb848, which would make
+ * the AIs fight each other too). Four callers decide hits and targets:
+ *   0x4e7779  melee hit (0x4e7740: ESI attacker, EBP target), friendly: no hit
+ *   0x4639fd  particle/bullet collision (owner character [0x5e962c], ESI the character hit),
+ *             friendly: passes through, for particle classes with flag 0x100000
+ *   0x4ea314  the character search behind melee targeting and throws (EBX self, ESI other)
+ *   0x4e9afa  its caller's hostile check on the character found (EBX self, EAX other)
+ * On a multiplayer map each call goes through a stub that answers hostile (2) when both
+ * characters are players (charType +0x1e8 == 0) and asks 0x48b2c0 otherwise, so the AIs keep
+ * their teams. */
 #include "arklite.h"
 
 void *memset(void *, int, unsigned);
@@ -40,6 +55,60 @@ static void ONI_FC overheal_drain(u8 *c)
 	if (CHR_HEALTH(c) <= CHR_MAX_HEALTH(c)) return;
 	CHR_HEALTH(c)--;
 	CHR_HYPO_COOLDOWN(c) = !multiplayer_map() ? 10 : CHR_HEALTH(c) % 5 ? 8 : 7;
+}
+
+#define TEAM_RELATION   0x48b2c0
+#define CHR_TYPE(c)     (*(u32 *)((u8 *)(c) + 0x1e8))   /* 0 player, 2 AI */
+
+/* Two different players on a multiplayer map: hostile, whatever their teams */
+static u32 ONI_FC players_hostile(u8 *a, u8 *b)
+{
+	return a && b && a != b && CHR_TYPE(a) == 0 && CHR_TYPE(b) == 0 && multiplayer_map();
+}
+
+/* A call to 0x48b2c0 where the characters are in registers A and B (or memory) */
+#define RELATION_STUB(name, A, B) \
+	__attribute__((naked)) static void name(void) \
+	{ \
+		__asm__ volatile( \
+			"pushl %%ecx\n\t" \
+			"pushl %%edx\n\t" \
+			"movl " A ", %%ecx\n\t" \
+			"movl " B ", %%edx\n\t" \
+			"call %c0\n\t" \
+			"popl %%edx\n\t" \
+			"popl %%ecx\n\t" \
+			"testl %%eax, %%eax\n\t" \
+			"jz 1f\n\t" \
+			"movl $2, %%eax\n\t" \
+			"ret\n" \
+			"1:\n\t" \
+			"pushl $0x48b2c0\n\t" \
+			"ret\n" :: "i"(players_hostile)); \
+	}
+
+RELATION_STUB(relation_melee,    "%%esi", "%%ebp")
+RELATION_STUB(relation_particle, "0x5e962c", "%%esi")
+RELATION_STUB(relation_search,   "%%ebx", "%%esi")
+RELATION_STUB(relation_found,    "%%ebx", "%%eax")
+
+static void free_for_all_install(void)
+{
+	static const struct { u32 site; void (*stub)(void); } sites[] = {
+		{ 0x4e7779, relation_melee }, { 0x4639fd, relation_particle },
+		{ 0x4ea314, relation_search }, { 0x4e9afa, relation_found },
+	};
+	const u32 n = sizeof sites / sizeof sites[0];
+
+	for (u32 i = 0; i < n; i++) {
+		const u8 *q = (const u8 *)sites[i].site;
+		if (q[0] != 0xe8 || sites[i].site + 5 + *(u32 *)(q + 1) != TEAM_RELATION) {
+			log_msg("mp rules: team check 0x%x changed, players can't hurt each other", sites[i].site);
+			return;
+		}
+	}
+	for (u32 i = 0; i < n; i++) patch_call(sites[i].site, TEAM_RELATION, (u32)sites[i].stub);
+	log_msg("mp rules: players can hurt each other on multiplayer maps (free for all)");
 }
 
 __attribute__((naked)) static void take_damage_entry(void)
@@ -87,6 +156,8 @@ void mp_rules_install(void)
 	} else {
 		log_msg("mp rules: 0x%x changed, damage not scaled", ONrCharacter_TakeDamage);
 	}
+
+	free_for_all_install();
 
 	if (code_matches(ONcHypoTick_Drain, drain, sizeof drain)) {
 		memset(b, 0x90, sizeof b);

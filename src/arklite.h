@@ -131,7 +131,7 @@ int  multiplayer_map(void);                   /* two or more Player-flagged char
 
 /* ---- mp_rules.c -------------------------------------------------------------------------- */
 
-void mp_rules_install(void);   /* multiplayer maps: damage x1.25, overhealing drains 1.25x faster */
+void mp_rules_install(void);   /* multiplayer maps: free for all, damage x1.25, overhealing drains 1.25x faster */
 
 /* ---- items.c ----------------------------------------------------------------------------- */
 

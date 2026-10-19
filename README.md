@@ -179,6 +179,8 @@ A game with player 2 is a **multiplayer game**, and in one:
 
 On a **multiplayer map** (two or more IsPlayer characters, see below), also:
 
+- **Free for all**: players can hit, shoot and throw each other, though they're all on Konoko's
+  team. AI characters keep their usual teams.
 - **Damage is x1.25**: every hit on a character does a quarter more (rounded).
 - **Overhealing drains a quarter faster**: health above the maximum (from a hypo) goes down
   1 point every 8.8 ticks instead of every 11.
@@ -234,11 +236,13 @@ The log's `net:` lines say whether networking is on.
 Use the host's IP. On one PC, join `127.0.0.1`; `-noswitch` keeps both in windows. Each game
 stands still at the start of the level until the other PC is there, then both run together.
 The host needs UDP port 27777 open (forwarded through the router for a game over the internet).
-The joiner's camera and sound follow player 2; the HUD still shows Konoko's health.
+The joiner's camera, sound and HUD follow player 2.
 
 Both logs (`Arklite.log` on the host, `Arklite-join.log` on the joiner) say whether the two
 games started the same, and once a second they compare the game state. `DESYNC` means the two
-games came apart; the log lists this PC's characters at that tick, so compare both logs. If the
+games came apart; the log lists this PC's characters at that tick, and each PC writes
+`AE/Arklite-desync-host.bin` or `AE/Arklite-desync-join.bin`. `tools/desync_diff.py` compares
+the two and prints every value that differs. If the
 other PC goes quiet for 10 seconds, its player stands still and the game goes on.
 
 Joining shows your IP address to the host, and hosting shows yours to whoever joins.
