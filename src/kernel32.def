@@ -26,4 +26,3 @@ EXPORTS
   GetTickCount@0
   GetPrivateProfileSectionA@16
   GetCurrentProcessId@0
-  GetModuleFileNameA@12
