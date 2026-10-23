@@ -73,6 +73,7 @@ int  parse_float(const char **s, float *out);  /* "-12.5": advances *s; 0 if no 
 
 void custom_game_install(void);
 const char *custom_game_level_ini(u32 level);   /* level.ini of the custom level in that slot, or 0 */
+const char *custom_game_level_dir(u32 level);   /* that level's folder (ends with '\'), or 0 */
 
 /* ---- volume.c ----------------------------------------------------------------------------- */
 
@@ -130,12 +131,36 @@ typedef struct {
 	int ready, connected;      /* this PC pressed F3; the host is / is heard */
 	u32 players, ready_count, needed;
 	int countdown_ms;          /* -1: none */
+	u32 problem;               /* NETBAD_*: what keeps the joiner out (joiner: of the host's game; host: a joiner) */
+	int desynced;              /* a state hash differed in this match */
 } NetHud;
+/* What differs between the two PCs, so the host doesn't let the joiner in */
+enum {
+	NETBAD_PROTO = 1, NETBAD_DLL = 2, NETBAD_DAODAN = 4, NETBAD_DAODAN_INI = 8, NETBAD_LEVEL0 = 16,
+	NETBAD_MAP = 32, NETBAD_PLAYERS = 64,
+};
 void net_hud(NetHud *h);
+const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
 
 /* ---- mp_hud.c ---------------------------------------------------------------------------- */
 
 void mp_hud_install(void);     /* lobby text ("Press F3 to be ready"), countdown and score on screen */
+enum { MP_LEFT, MP_CENTER, MP_RIGHT };
+void mp_hud_text(const char *s, int x, int y, int align, u32 color);   /* only while the HUD draws */
+int  mp_hud_line_height(void);
+
+/* ---- char_menu.c ------------------------------------------------------------------------- */
+
+/* Word 11 of an action record (never read by the tick): PLAYERS_CHOICE_TAG | (ONCC instance
+ * number + 1) is the class that record's player comes back as, the tag alone the map's class */
+#define PLAYERS_CHOICE_TAG 0x7fac0000u
+#define PLAYERS_CHOICE_MASK 0xffff0000u
+void char_menu_install(void);
+int  char_menu_open(void);     /* the F2 menu is up: this PC's player gets no input */
+void char_menu_frame(void);    /* every frame, after the update: keys and mouse */
+void char_menu_draw(int width, int height);   /* from the HUD */
+u32  char_menu_record_word(void);             /* this PC's choice, for word 11 of its records */
+void char_menu_tag(u32 count, void *actions); /* writes it into this PC's records of the frame */
 
 /* ---- players.c --------------------------------------------------------------------------- */
 
@@ -145,8 +170,13 @@ void players_replay_frame(const u32 *record); /* replay: this frame's recorded o
 void players_net_frame(const u32 (*records)[12], u32 n);   /* networked: tick i gets records[i] */
 u8  *players_p2(void);                        /* player 2's character, or 0 */
 void players_note_hit(u8 *victim, u8 *attacker);   /* from TakeDamage, in a tick */
+int  players_can_change(int who);            /* alive: an F2 choice applies at once */
 int  players_score(int who);                  /* 0: Konoko (player 1), 1: player 2 */
-void players_reset_scores(void);
+int  players_enabled(void);                   /* Arklite.ini [players] p2 isn't 0 */
+u32  players_respawn_ticks(void);             /* [multiplayer] respawn_delay, in ticks */
+void players_set_respawn_ticks(u32 ticks);    /* the network host's, on the joiner */
+void players_reset_scores(void);              /* and the class choices: the match starts */
+void players_tick_record(const u32 *record);  /* in the tick: Konoko's record (its choice word) */
 int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
 int  multiplayer_map(void);                   /* two or more Player-flagged characters (spawn points) */
 
@@ -158,11 +188,14 @@ void mp_rules_install(void);   /* multiplayer maps: free for all, damage x1.25, 
 
 void items_install(void);
 void items_tick(void);   /* in a multiplayer game's tick: taken items come back after a while */
+u32  items_default_ticks(void);             /* [multiplayer] item_respawn, in ticks */
+void items_set_default_ticks(u32 ticks);    /* the network host's, on the joiner */
 
 /* ---- live_menu.c ------------------------------------------------------------------------- */
 
 void live_menu_install(void);
 int  live_menu_open(void);     /* the pause menu is open and the game runs behind it */
+void live_menu_request(void);  /* open it after this frame's update */
 /* WMrDialog_ModalBegin for every dialog (lockstep.c wraps the calls): in a multiplayer game a
  * dialog outside a tick runs with the game going on behind it, one inside a tick isn't shown */
 u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick);

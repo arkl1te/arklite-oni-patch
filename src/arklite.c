@@ -154,5 +154,6 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	mp_hud_install();
 	lockstep_install();
 	live_menu_install();
+	char_menu_install();
 	return 1;
 }

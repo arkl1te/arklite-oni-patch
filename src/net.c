@@ -20,6 +20,13 @@
  * the x87 control word and the game files; a difference is logged. The score (players.c) starts
  * at 0 with the match.
  *
+ * Both PCs must run the same game: every HELLO and START carries a Compat record (hashes of
+ * Arklite.dll itself, Daodan, its gameplay settings, level0, and every file in the map's folder,
+ * and whether player 2 is on). The host keeps a joiner whose record differs out of the lobby and
+ * tells it why in LOBBY (refused); both PCs say on screen what differs. A packet of another
+ * protocol (another Arklite) gets the same. The host's LOBBY also carries its gameplay settings
+ * from Arklite.ini (respawn_delay, item_respawn), which the joiner uses.
+ *
  * Ticks are numbered from the session's start. Each frame, for every tick the clock wants
  * (server time - game tick, what Daodan's DDrActionBuffer_Get computes before it hands over the
  * frame's record), this PC makes its input for tick (ticks run + delay): the frame's record for
@@ -34,7 +41,8 @@
  *
  * Records are cleaned the same way on both PCs: action bits 0-2 (escape, console, pausescreen;
  * 0x4faec0 opens the pause menu from bit 0 inside the tick, which would open it on every PC)
- * are cleared. Esc still opens the menu through utility input, which reads this PC's keys. The
+ * are cleared. Word 11 carries this PC's F2 character choice (char_menu.c, read by players.c).
+ * Esc still opens the menu through utility input, which reads this PC's keys. The
  * invert-look setting (0x5ec70f) is per PC, so it's applied to this PC's aim before sending and
  * is off while the ticks run.
  *
@@ -94,7 +102,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    27777
-#define PROTO           3
+#define PROTO           4
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -106,6 +114,7 @@ typedef unsigned long long u64;
 #define HELLO_MS        200
 #define RESEND_MS       30
 #define COUNTDOWN_MS    7000
+#define PROBLEM_MS      2000         /* a refusal stays on screen this long after the last one */
 #define VK_F3           0x72
 
 void *memcpy(void *, const void *, unsigned);
@@ -137,6 +146,8 @@ __declspec(dllimport) short WINAPI GetAsyncKeyState(int);
 __declspec(dllimport) void * WINAPI GetForegroundWindow(void);
 __declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
 __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
+__declspec(dllimport) u32  WINAPI GetModuleFileNameA(HANDLE, char *, u32);
+extern char __ImageBase;   /* this DLL's own module (lld-link) */
 
 #define INVALID_SOCKET  0xffffffffu
 #define FIONBIO         0x8004667e
@@ -147,11 +158,18 @@ enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY };
 
 typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
 #define NFILES 4
+/* What both PCs must have the same of (see g_file_names) */
+typedef struct {
+	char version[16];
+	u32 files[NFILES];
+	u32 dll;               /* Arklite.dll */
+	u32 map;               /* the level's files: the custom level's whole folder */
+	u32 players;           /* [players] p2 isn't 0 */
+} Compat;
 typedef struct {
 	PktHead h;
 	u32 level, start_tick, state_hash, fpu_cw, delay;
-	char version[16];
-	u32 files[NFILES];
+	Compat c;
 	u32 phase;             /* 0: in the lobby, 1: waiting for the match to start */
 	u32 ready;             /* the joiner pressed F3 */
 } PktHello;
@@ -161,12 +179,13 @@ typedef struct {
 	u32 go;                /* the match starts: reload the level */
 	u32 joiner_ready;      /* what the host knows of the joiner's ready flag */
 	u32 seed, local_seed;  /* with go: both RNG streams, set on both PCs before the reload */
+	u32 refused;           /* NETBAD_*: the joiner can't play here, and why (then nothing else counts) */
+	u32 respawn_ticks, item_ticks;   /* the host's Arklite.ini, used on both PCs */
 } PktLobby;
 typedef struct {
 	PktHead h;
 	u32 level, start_tick, state_hash, fpu_cw, seed, local_seed, delay;
-	char version[16];
-	u32 files[NFILES];
+	Compat c;
 } PktStart;
 typedef struct {
 	PktHead h;
@@ -227,6 +246,7 @@ static u32 g_lobby_players = 1, g_lobby_ready, g_lobby_countdown = 0xffffffffu, 
 static int g_host_heard;               /* joiner: a LOBBY arrived in this lobby */
 static u32 g_last_lobby;
 static u32 g_match_seed, g_match_local_seed;   /* the RNGs the match's level loads with */
+static u32 g_problem, g_problem_at;    /* NETBAD_* last seen (refused / refusing), and when */
 
 /* What both PCs must have the same of besides Oni.exe: Daodan patches Oni's code and has
  * gameplay settings, and level0 holds the characters and animations */
@@ -235,6 +255,7 @@ static const char *const g_file_names[NFILES] = {
 	"GameDataFolder\\level0_Final.dat", "GameDataFolder\\level0_Final.raw",
 };
 static u32 g_files[NFILES];
+static u32 g_dll_hash, g_map_hash;
 
 static u32 hash_words(u32 h, const u8 *p, u32 n)
 {
@@ -247,7 +268,8 @@ static u32 hash_words(u32 h, const u8 *p, u32 n)
 static u32 hash_file(const char *path)
 {
 	static u8 *buf;
-	HANDLE f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 1, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+	/* shared for writing too: another Oni on this PC has these files open */
+	HANDLE f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 3, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
 	u32 h = 0x811c9dc5u, got;
 
 	if (f == INVALID_HANDLE_VALUE) return 0;
@@ -272,7 +294,95 @@ static void hash_files(void)
 	g_files[1] = hash_words(g_files[1] ^ 1, (const u8 *)section, n);
 	g_files[2] = hash_file("GameDataFolder\\level0_Final.dat");
 	g_files[3] = hash_file("GameDataFolder\\level0_Final.raw");
-	log_msg("net: Daodan %08x, its settings %08x, level0 %08x %08x", g_files[0], g_files[1], g_files[2], g_files[3]);
+	if (GetModuleFileNameA(&__ImageBase, ini, sizeof ini)) g_dll_hash = hash_file(ini);
+	log_msg("net: Arklite.dll %08x, Daodan %08x, its settings %08x, level0 %08x %08x", g_dll_hash, g_files[0], g_files[1],
+	        g_files[2], g_files[3]);
+}
+
+/* Every file below dir (which ends with '\\'), in whatever order the file system lists them
+ * (Windows sorts, Wine on Linux doesn't): each file's hash, of its path below dir in upper case
+ * and then its bytes, is added up */
+static u32 hash_tree(const char *dir, const char *rel, int depth)
+{
+	WIN32_FIND_DATAA fd;
+	char path[1024], sub[1024];
+	u32 sum = 0;
+	HANDLE f;
+
+	if (depth > 8 || str_len(dir) + str_len(rel) + 2 >= MAX_PATH) return 0;
+	fmt(path, "%s%s*", dir, rel);
+	f = FindFirstFileA(path, &fd);
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	do {
+		if (fd.cFileName[0] == '.' && (!fd.cFileName[1] || (fd.cFileName[1] == '.' && !fd.cFileName[2]))) continue;
+		fmt(sub, "%s%s", rel, fd.cFileName);
+		if (str_len(dir) + str_len(sub) + 2 >= MAX_PATH) continue;
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			fmt(path, "%s\\", sub);
+			sum += hash_tree(dir, path, depth + 1);
+			continue;
+		}
+		u32 h = 0x811c9dc5u;
+		for (const char *s = sub; *s; s++) h = (h ^ (u8)to_upper(*s)) * 0x01000193u;
+		fmt(path, "%s%s", dir, sub);
+		sum += hash_words(h ^ hash_file(path), (const u8 *)&fd.nFileSizeLow, 4);
+	} while (FindNextFileA(f, &fd));
+	FindClose(f);
+	return sum;
+}
+
+/* The files the level is made of: a custom level's whole folder (its .dat/.raw/.sep, level.ini
+ * with the item respawn times, IGMD scripts), or an original level's files */
+static u32 hash_map(u32 level)
+{
+	static const char *const ext[] = { "dat", "raw", "sep" };
+	const char *dir = custom_game_level_dir(level);
+	char path[64];
+	u32 h = 0x811c9dc5u;
+
+	if (dir) return hash_tree(dir, "", 0);
+	for (u32 i = 0; i < 3; i++) {
+		fmt(path, "GameDataFolder\\level%d_Final.%s", level, ext[i]);
+		h = (h ^ hash_file(path)) * 0x01000193u;
+	}
+	return h;
+}
+
+static void compat_mine(Compat *c)
+{
+	memset(c, 0, sizeof *c);
+	str_cpy(c->version, sizeof c->version, ARKLITE_VERSION);
+	memcpy(c->files, g_files, sizeof c->files);
+	c->dll = g_dll_hash;
+	c->map = g_map_hash;
+	c->players = players_enabled() != 0;
+}
+
+/* NETBAD_*: what differs between the peer's game and this PC's */
+static u32 compat_problems(const Compat *c)
+{
+	u32 bad = 0;
+	if (c->dll != g_dll_hash) bad |= NETBAD_DLL;
+	if (c->files[0] != g_files[0]) bad |= NETBAD_DAODAN;
+	if (c->files[1] != g_files[1]) bad |= NETBAD_DAODAN_INI;
+	if (c->files[2] != g_files[2] || c->files[3] != g_files[3]) bad |= NETBAD_LEVEL0;
+	if (c->map != g_map_hash) bad |= NETBAD_MAP;
+	if (!c->players || !players_enabled()) bad |= NETBAD_PLAYERS;
+	return bad;
+}
+
+const char *net_problem_text(u32 bit)
+{
+	switch (bit) {
+	case NETBAD_PROTO:      return "Arklite's version";
+	case NETBAD_DLL:        return "Arklite.dll";
+	case NETBAD_DAODAN:     return "Daodan (binkw32.dll)";
+	case NETBAD_DAODAN_INI: return "daodan.ini [gameplay] or [devmode]";
+	case NETBAD_LEVEL0:     return "GameDataFolder\\level0_Final.dat or .raw";
+	case NETBAD_MAP:        return "the map's files (its CustomLevels folder)";
+	case NETBAD_PLAYERS:    return "Arklite.ini [players] p2 (0 turns multiplayer off)";
+	}
+	return "?";
 }
 
 static const char *mode_name(void) { return g_mode == NET_HOST ? "host" : "join"; }
@@ -451,8 +561,7 @@ static void send_hello(void)
 	p.state_hash = g_start_hash;
 	p.fpu_cw = g_start_fpu;
 	p.delay = g_delay;
-	str_cpy(p.version, sizeof p.version, ARKLITE_VERSION);
-	memcpy(p.files, g_files, sizeof p.files);
+	compat_mine(&p.c);
 	p.phase = g_state != S_LOBBY;
 	p.ready = g_ready;
 	send_to_peer(&p, sizeof p);
@@ -471,15 +580,15 @@ static void send_start(void)
 	p.seed = g_seed;
 	p.local_seed = g_local_seed;
 	p.delay = g_delay;
-	str_cpy(p.version, sizeof p.version, ARKLITE_VERSION);
-	memcpy(p.files, g_files, sizeof p.files);
+	compat_mine(&p.c);
 	send_to_peer(&p, sizeof p);
 }
 
 static u32 lobby_players(void) { return 1 + (g_peer_seen != 0); }
 static u32 lobby_ready(void) { return (g_ready != 0) + (g_peer_seen && g_peer_ready); }
 
-static void send_lobby(int go)
+/* refused: NETBAD_*, the joiner this goes to can't play here */
+static void send_lobby_to(int go, u32 refused)
 {
 	PktLobby p;
 	u32 now = GetTickCount();
@@ -493,9 +602,14 @@ static void send_lobby(int go)
 	p.joiner_ready = g_peer_ready;
 	p.seed = g_match_seed;
 	p.local_seed = g_match_local_seed;
+	p.refused = refused;
+	p.respawn_ticks = players_respawn_ticks();
+	p.item_ticks = items_default_ticks();
 	send_to_peer(&p, sizeof p);
 	g_last_lobby = now;
 }
+
+static void send_lobby(int go) { send_lobby_to(go, 0); }
 
 static void send_inputs(void)
 {
@@ -524,18 +638,34 @@ static void send_bye(void)
 	send_to_peer(&h, sizeof h);
 }
 
-static void check_start(const char *who, u32 level, u32 start_tick, u32 state_hash, u32 fpu_cw, const char *version,
-                        const u32 *files)
+/* Logs what differs on the peer; returns it (NETBAD_*) */
+static u32 check_files(const char *who, const Compat *c)
 {
-	for (u32 i = 0; i < NFILES; i++)
-		if (files[i] != g_files[i])
-			log_msg("net: %s differs on the %s (%08x there, %08x here): the games will come apart; use the same AE install on both PCs",
-			        g_file_names[i], who, files[i], g_files[i]);
+	u32 bad = compat_problems(c);
 	char v[17];
-	memcpy(v, version, 16);
+
+	for (u32 i = 0; i < NFILES; i++)
+		if (c->files[i] != g_files[i])
+			log_msg("net: %s differs on the %s (%08x there, %08x here): the games will come apart; use the same AE install on both PCs",
+			        g_file_names[i], who, c->files[i], g_files[i]);
+	memcpy(v, c->version, 16);
 	v[16] = 0;
 	if (!str_ieq_n(v, ARKLITE_VERSION, 17))
 		log_msg("net: the %s runs Arklite %s, this PC %s", who, v, ARKLITE_VERSION);
+	if (bad & NETBAD_DLL)
+		log_msg("net: Arklite.dll differs on the %s (%08x there, %08x here): use the same Arklite.dll on both PCs",
+		        who, c->dll, g_dll_hash);
+	if (bad & NETBAD_MAP)
+		log_msg("net: the map's files differ on the %s (%08x there, %08x here): copy the map's CustomLevels folder from one PC to the other",
+		        who, c->map, g_map_hash);
+	if (bad & NETBAD_PLAYERS)
+		log_msg("net: player 2 is off on %s (Arklite.ini [players] p2=0)", players_enabled() ? who : "this PC");
+	return bad;
+}
+
+static u32 check_start(const char *who, u32 start_tick, u32 state_hash, u32 fpu_cw, const Compat *c)
+{
+	u32 bad = check_files(who, c);
 	if (start_tick != g_start_tick)
 		log_msg("net: the level started at tick %d on the %s, %d here (start both the same way)", start_tick, who, g_start_tick);
 	if (fpu_cw != g_start_fpu)
@@ -544,19 +674,23 @@ static void check_start(const char *who, u32 level, u32 start_tick, u32 state_ha
 		log_msg("net: the level-start state differs from the %s's (%08x here, %08x there): not the same map, or started differently", who, g_start_hash, state_hash);
 	else
 		log_msg("net: level-start state matches the %s's (%08x)", who, state_hash);
+	return bad;
 }
 
-static void check_files(const char *who, const char *version, const u32 *files)
+/* The peer's game isn't this one (NETBAD_*): keep it out, and say why in the log (once while
+ * it keeps trying) and on screen (net_hud) */
+static void refuse(const char *who, u32 bad, const Compat *c)
 {
-	char v[17];
-	for (u32 i = 0; i < NFILES; i++)
-		if (files[i] != g_files[i])
-			log_msg("net: %s differs on the %s (%08x there, %08x here): the games will come apart; use the same AE install on both PCs",
-			        g_file_names[i], who, files[i], g_files[i]);
-	memcpy(v, version, 16);
-	v[16] = 0;
-	if (!str_ieq_n(v, ARKLITE_VERSION, 17))
-		log_msg("net: the %s runs Arklite %s, this PC %s", who, v, ARKLITE_VERSION);
+	u32 now = GetTickCount();
+
+	if (bad != g_problem || !g_problem_at || now - g_problem_at > LOST_MS) {
+		log_msg("net: the %s's game isn't the same as this PC's, so they can't play together:", who);
+		if (c) check_files(who, c);
+		for (u32 bit = 1; bit <= NETBAD_PLAYERS; bit <<= 1)
+			if (bad & bit) log_msg("net:   differs: %s", net_problem_text(bit));
+	}
+	g_problem = bad;
+	g_problem_at = now ? now : 1;
 }
 
 static void start_match(void);
@@ -609,15 +743,18 @@ static void receive(void)
 		const PktHead *h = (const PktHead *)buf;
 		if ((u32)n < sizeof *h || h->magic != MAGIC) continue;
 		g_npackets_recv++;
-		if (h->proto != PROTO) {
-			log_msg("net: packet of protocol %d from the peer, this is %d: update Arklite on both PCs", h->proto, PROTO);
-			continue;
-		}
 		if (g_have_peer && (from.addr != g_peer.addr || from.port != g_peer.port)) {
 			/* one joiner at a time: another only takes an empty lobby's place */
 			if (g_mode == NET_JOIN || g_state != S_LOBBY || g_peer_seen) continue;
 		}
 		if (g_state == S_IDLE) continue;   /* not in a level yet: the peer will resend */
+		if (h->proto != PROTO) {   /* another Arklite: its packets can't be read */
+			if (!(g_problem & NETBAD_PROTO) || GetTickCount() - g_problem_at > LOST_MS)
+				log_msg("net: packet of protocol %d from the %s, this is %d: use the same Arklite.dll on both PCs", h->proto,
+				        g_mode == NET_HOST ? "joiner" : "host", PROTO);
+			refuse(g_mode == NET_HOST ? "joiner" : "host", NETBAD_PROTO, 0);
+			continue;
+		}
 
 		if (h->type == PKT_HELLO && g_mode == NET_HOST && (u32)n >= sizeof(PktHello)) {
 			const PktHello *p = (const PktHello *)buf;
@@ -634,11 +771,18 @@ static void receive(void)
 			g_last_recv = GetTickCount();
 			if (g_state == S_LOBBY) {
 				if (p->phase) continue;   /* it reloaded already; it says phase 0 again soon or waits */
+				u32 bad = compat_problems(&p->c);
+				if (bad) {   /* not the same game: it stays out of the lobby, and hears why */
+					refuse("joiner", bad, &p->c);
+					send_lobby_to(0, bad);
+					continue;
+				}
 				if (!g_peer_seen) {
 					const u8 *ip = (const u8 *)&from.addr;
 					log_msg("net: %d.%d.%d.%d:%d joined the lobby", ip[0], ip[1], ip[2], ip[3], ntohs(from.port));
-					check_files("joiner", p->version, p->files);
+					check_files("joiner", &p->c);
 					g_peer_seen = 1;
+					g_problem = 0;
 				}
 				if (g_peer_ready != (int)p->ready)
 					log_msg("net: the joiner is %s", p->ready ? "ready" : "not ready");
@@ -651,9 +795,14 @@ static void receive(void)
 				continue;
 			}
 			if (g_state == S_WAIT) {
+				u32 bad = compat_problems(&p->c);
+				if (bad) {   /* changed since the lobby: no START, the match doesn't begin */
+					refuse("joiner", bad, &p->c);
+					continue;
+				}
 				const u8 *ip = (const u8 *)&from.addr;
 				log_msg("net: %d.%d.%d.%d:%d joined (input delay %d ticks there)", ip[0], ip[1], ip[2], ip[3], ntohs(from.port), p->delay);
-				check_start("joiner", p->level, p->start_tick, p->state_hash, p->fpu_cw, p->version, p->files);
+				check_start("joiner", p->start_tick, p->state_hash, p->fpu_cw, &p->c);
 				lockstep_get_seeds(&g_seed, &g_local_seed);
 				begin_run();
 			}
@@ -662,8 +811,16 @@ static void receive(void)
 			const PktLobby *p = (const PktLobby *)buf;
 			g_last_recv = GetTickCount();
 			if (g_state != S_LOBBY || p->level != g_level) continue;
+			if (p->refused) {   /* the host keeps this PC out: nothing else in it counts */
+				refuse("host", p->refused, 0);
+				continue;
+			}
 			if (!g_host_heard) log_msg("net: in the host's lobby");
 			g_host_heard = 1;
+			g_problem = 0;
+			/* the host's gameplay settings: for the warm-up, and the match's level reload */
+			players_set_respawn_ticks(p->respawn_ticks);
+			items_set_default_ticks(p->item_ticks);
 			g_lobby_players = p->players;
 			g_lobby_ready = p->ready;
 			g_lobby_countdown = p->countdown_ms;
@@ -681,7 +838,12 @@ static void receive(void)
 				log_msg("net: the host is on level %d, this is level %d", p->level, g_level);
 				continue;
 			}
-			check_start("host", p->level, p->start_tick, p->state_hash, p->fpu_cw, p->version, p->files);
+			u32 bad = compat_problems(&p->c);
+			if (bad) {   /* changed since the lobby: the match doesn't begin */
+				refuse("host", bad, &p->c);
+				continue;
+			}
+			check_start("host", p->start_tick, p->state_hash, p->fpu_cw, &p->c);
 			g_seed = p->seed;
 			g_local_seed = p->local_seed;
 			if (p->delay >= 1 && p->delay <= 30) g_delay = p->delay;   /* the host's, on both PCs */
@@ -706,6 +868,11 @@ static void session_begin(u32 level)
 
 	g_level = level;
 	g_state = g_match_pending ? S_WAIT : S_LOBBY;
+	{
+		u32 map = hash_map(level);
+		if (map != g_map_hash) log_msg("net: level %d's files: %08x", level, map);
+		g_map_hash = map;
+	}
 	g_ticks = g_remote = g_peer_ack = g_sent_gen = 0;
 	g_has_pending = 0;
 	memset(g_local_in, 0, sizeof g_local_in);
@@ -787,8 +954,8 @@ static void make_input(void)
 {
 	u32 *in = g_local_in[g_gen % RING];
 
-	if (live_menu_open()) {
-		memset(in, 0, 0x30);                 /* the menu is up: our player stands */
+	if (live_menu_open() || char_menu_open()) {
+		memset(in, 0, 0x30);                 /* a menu is up: our player stands */
 		g_has_pending = 0;
 	} else if (g_has_pending) {
 		memcpy(in, g_pending, 0x30);
@@ -797,6 +964,7 @@ static void make_input(void)
 		memcpy(in, g_last_local, 0x30);      /* the buttons stay held, no aim */
 		in[7] = in[8] = in[9] = in[10] = 0;
 	}
+	in[11] = char_menu_record_word();    /* the F2 choice (players.c) */
 	memcpy(g_last_local, in, 0x30);
 	g_gen++;
 }
@@ -917,7 +1085,8 @@ static u32 lobby_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
 				memcpy(g_frame_p2[k], g_last_local, 0x30);   /* the buttons stay held, no aim */
 				g_frame_p2[k][7] = g_frame_p2[k][8] = g_frame_p2[k][9] = g_frame_p2[k][10] = 0;
 			}
-			if (live_menu_open()) memset(g_frame_p2[k], 0, 0x30);
+			if (live_menu_open() || char_menu_open()) memset(g_frame_p2[k], 0, 0x30);
+			g_frame_p2[k][11] = char_menu_record_word();
 		}
 		GS_SYNC_BEHIND(gs) = 0;
 		players_net_frame(g_frame_p2, n);
@@ -954,6 +1123,8 @@ void net_hud(NetHud *h)
 	}
 	h->needed = (h->players * 51 + 99) / 100;
 	if (h->needed < 2) h->needed = 2;
+	if (g_problem && g_problem_at && now - g_problem_at < PROBLEM_MS) h->problem = g_problem;
+	h->desynced = (g_state == S_RUN || g_state == S_LOST) && g_bad_checks;
 }
 
 /* lockstep.c's update hook, in place of the update, while networking is on */
@@ -973,6 +1144,15 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	if (g_state == S_IDLE) {
 		players_net_frame(0, 0);
 		return ONrGameState_Update(count, actions, ticks_run);
+	}
+
+	/* Esc: action bit 0 opens the pause menu inside the tick (0x4faec0), but it's kept out of the
+	 * shared input (strip), so this PC opens its own menu when its record has Esc down */
+	if ((count & 0xffff) && actions) {
+		static int esc_down;
+		int esc = (*(const u32 *)actions & 1) != 0;
+		if (esc && !esc_down && !live_menu_open()) live_menu_request();
+		esc_down = esc;
 	}
 
 	receive();
@@ -1126,6 +1306,127 @@ static void display(void)
 	*(u32 *)(gs + 0xb0) = b0;
 }
 
+/* ---- Sounds for "the player" ---------------------------------------------------------- *
+ * Oni plays some sounds unpositioned (0x4fdac0: sound #id from the table at 0x631140) and only
+ * for the player in gs+0xac, and keeps looping ones (0x4fdae0) for the player's low health,
+ * overhealing and +0x1ba; all decided inside ticks, where gs+0xac is Konoko on every PC, so the
+ * joiner heard the host's and never its own. On the joiner these spots look at player 2:
+ *   0x51ca39  item pickup (sound 0xa), ItemAdd 0x51ca30: the player lookup there only decides
+ *             the sound and the "new item" hint (0x50f560/0x50f580/0x5050a0, display only)
+ *   0x4ddea9  "can't" sound 6 when reloading fails (character update 0x4ddba0), lookup + cmp
+ *   0x4f755b  sound 6 in 0x4f6ad0: mov edx,[gs]; cmp esi,[edx+0xac] (12 bytes), only the sound
+ *   0x4faa09  the tick's health sounds block: mov edi,[esi+0xac]; edi isn't used after it
+ * And the hypo sound (4, at 0x4edb9c in item use 0x4eda40) played for every character that used
+ * one: in a network game only this PC's own player's (and the AIs', as stock). */
+#define ONrPlayer_Get           0x4fc8a0
+#define ONrUISound_Play         0x4fdac0
+
+static u8 *ONI_FC this_pc_player(void)
+{
+	u8 *gs = ONgGameState;
+	return gs ? view_character(GS_PLAYER(gs)) : 0;
+}
+
+/* in place of 0x4fc8a0 (which only touches EAX) */
+__attribute__((naked)) static void get_player_here(void)
+{
+	__asm__ volatile(
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"call %c0\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
+		"ret\n" :: "i"(this_pc_player));
+}
+
+/* in place of mov edx,[0x5ece7c]; cmp esi,[edx+0xac]: flags from cmp esi, this PC's player */
+__attribute__((naked)) static void cmp_esi_player_here(void)
+{
+	__asm__ volatile(
+		"pushl %%eax\n\t"
+		"pushl %%ecx\n\t"
+		"call %c0\n\t"
+		"popl %%ecx\n\t"
+		"movl 0x5ece7c, %%edx\n\t"
+		"cmpl %%eax, %%esi\n\t"
+		"popl %%eax\n\t"
+		"ret\n" :: "i"(this_pc_player));
+}
+
+static u8 *ONI_FC health_sounds_player(u8 *konoko) { return view_character(konoko); }
+
+/* in place of mov edi,[esi+0xac] */
+__attribute__((naked)) static void load_edi_player_here(void)
+{
+	__asm__ volatile(
+		"movl 0xac(%%esi), %%edi\n\t"
+		"pushl %%eax\n\t"
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"movl %%edi, %%ecx\n\t"
+		"call %c0\n\t"
+		"movl %%eax, %%edi\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
+		"popl %%eax\n\t"
+		"ret\n" :: "i"(health_sounds_player));
+}
+
+#define CHR_TYPE(c)             (*(u32 *)((c) + 0x1e8))   /* 0 player */
+
+static u32 ONI_FC hypo_sound_wanted(u8 *c)
+{
+	return !c || CHR_TYPE(c) != 0 || c == this_pc_player();
+}
+
+/* in place of call 0x4fdac0 with the character in EBP (ECX sound, EDX 0) */
+__attribute__((naked)) static void hypo_sound(void)
+{
+	__asm__ volatile(
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"movl %%ebp, %%ecx\n\t"
+		"call %c0\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
+		"testl %%eax, %%eax\n\t"
+		"jz 1f\n\t"
+		"pushl $0x4fdac0\n\t"
+		"ret\n"
+		"1:\n\t"
+		"ret\n" :: "i"(hypo_sound_wanted));
+}
+
+static void sounds_install(void)
+{
+	static const u8 cmp_bytes[12] = { 0x8b, 0x15, 0x7c, 0xce, 0x5e, 0x00, 0x3b, 0xb2, 0xac, 0x00, 0x00, 0x00 };
+	static const u8 edi_bytes[6] = { 0x8b, 0xbe, 0xac, 0x00, 0x00, 0x00 };
+	u8 b[12];
+	u32 rel;
+	int ok = 1;
+
+	if (patch_call(0x4edb9c, ONrUISound_Play, (u32)hypo_sound)) log_msg("net: hypo sounds only for this PC's player");
+	if (g_mode != NET_JOIN) return;
+	ok &= patch_call(0x51ca39, ONrPlayer_Get, (u32)get_player_here);
+	ok &= patch_call(0x4ddea9, ONrPlayer_Get, (u32)get_player_here);
+	if (code_matches(0x4f755b, cmp_bytes, sizeof cmp_bytes)) {
+		memset(b, 0x90, sizeof b);
+		b[0] = 0xe8;
+		rel = (u32)cmp_esi_player_here - (0x4f755b + 5);
+		memcpy(b + 1, &rel, 4);
+		patch_write(0x4f755b, b, sizeof b);
+	} else ok = 0;
+	if (code_matches(0x4faa09, edi_bytes, sizeof edi_bytes)) {
+		b[0] = 0xe8;
+		rel = (u32)load_edi_player_here - (0x4faa09 + 5);
+		memcpy(b + 1, &rel, 4);
+		b[5] = 0x90;
+		patch_write(0x4faa09, b, 6);
+	} else ok = 0;
+	log_msg(ok ? "net: pickup, overheal and error sounds follow player 2"
+	           : "net: some player sounds couldn't be moved to player 2 (game code changed)");
+}
+
 static void ONI_FC listener_position(u8 *chr, void *out) { ONrListener_Position(view_character(chr), out); }
 static void ONI_FC listener_position_alt(u8 *chr, void *out) { ONrListener_PositionAlt(view_character(chr), out); }
 static void ONI_FC listener_facing(u8 *chr, void *out) { ONrListener_Facing(view_character(chr), out); }
@@ -1259,8 +1560,24 @@ void net_install(void)
 	        g_mode == NET_HOST ? "hosting" : "joining", g_delay, g_mode == NET_HOST ? "joiner" : "host");
 	hash_files();
 	if (g_mode == NET_JOIN) view_install();
-	/* a second Oni on the same PC, for testing: skip "There is already an instance" */
-	if (patch_byte(ONcSingleInstanceJe, 0x74, 0xeb)) log_msg("net: more than one Oni may run on this PC");
+	sounds_install();
+	/* a second Oni on the same PC, for testing: skip "There is already an instance". Daodan
+	 * replaces Oni's platform setup (0x50f670) with DD_ONrPlatform_Initialize, which checks
+	 * the same way (FindWindowA for class "ONI ", call eax; sub esp,8; test eax,eax; je at
+	 * Daodan +0xc2c3); Oni's own je is patched too, for an Oni without Daodan. */
+	{
+		static const u8 daodan_check[] = { 0xff, 0xd0, 0x83, 0xec, 0x08, 0x85, 0xc0, 0x74, 0x22 };
+		u32 daodan = (u32)GetModuleHandleA("binkw32.dll");
+		int ok = patch_byte(ONcSingleInstanceJe, 0x74, 0xeb);
+		if (daodan && code_matches(daodan + 0xc2bc, daodan_check, sizeof daodan_check)) {
+			u8 jmp = 0xeb;
+			patch_write(daodan + 0xc2c3, &jmp, 1);
+		} else {
+			ok = 0;
+			log_msg("net: Daodan's instance check not found: a second Oni on this PC will refuse to start");
+		}
+		if (ok) log_msg("net: more than one Oni may run on this PC");
+	}
 }
 
 void net_exit(void)

@@ -39,6 +39,18 @@
  *     also moves the 3D sound) or failed to start for want of a channel (0x516b5a), both up to
  *     the sound card. Now it ends at its end tick: start tick + the sound's length in ticks
  *     (0x5125c0, from the sound data). The sound handle isn't compared.
+ *   - Collision queries mark what they visited in a bit vector with an undo list (0x437d60:
+ *     test-and-set, recording the index; 0x437d20 clears only the recorded bits; two of them,
+ *     *0x5ccebc for the level octree with room for 4096 and *0x5ccec4 for quads with room for
+ *     765, made at level load by 0x440f30). The bit was set before checking the room, so a query
+ *     visiting more than that left bits set for good, and every later query skipped those
+ *     quads: characters stopped colliding with them. The camera and the laser sight query the
+ *     level too, differently on each PC, so each PC lost different walls (the network games'
+ *     desyncs: a different number of wall contacts, active +0xb0, from identical state). Now
+ *     a query that overflows the undo list gets the whole vector cleared at its clear (sizes
+ *     noted where the vectors are made: 0x440f48, 0x440fa0, 0x440ff8). Marking itself is as
+ *     before: an earlier fix that just stopped marking past the room made long queries (the
+ *     beam weapon's) test the same entries over and over.
  *
  * While recording or replaying, both RNGs keep their callers: each tick stores the return
  * addresses of the calls since the last tick (bit 31: outside a tick, bit 30: tick local
@@ -239,6 +251,96 @@ static u16 ONI_FC modal_begin(u32 id, WMtWindow *parent, WMtDialogProc proc, u32
 	return r;
 }
 
+/* ---- Collision visited bits ------------------------------------------------------------- */
+
+#define ONcVisited_TestSet  0x437d60
+#define ONcVisited_Clear    0x437d20
+#define ONrVisited_New      ((u32 *(ONI_FC *)(u32, u32))0x437ce0)   /* room, bits */
+
+/* The vectors made at level load (*0x5ccebc, *0x5ccec4, *0x5ccec0), their sizes in bits, and
+ * whether a query overflowed the undo list since the last clear */
+static struct { u32 *v; u32 bits; int overflowed; } g_visited[8];
+
+static u32 *ONI_FC visited_new(u32 room, u32 bits)
+{
+	static u32 next;
+	u32 *v = ONrVisited_New(room, bits);
+	int k;
+
+	if (!v) return v;
+	for (k = 0; k < 8 && g_visited[k].v != v; k++) {}
+	if (k == 8) k = next++ % 8;   /* each level load makes new ones: reuse the oldest slots */
+	g_visited[k].v = v;
+	g_visited[k].bits = bits;
+	g_visited[k].overflowed = 0;
+	return v;
+}
+
+/* ECX: { u8 *bits; int room; int count; u32 undo[room]; }, EDX: the index; 1 if already
+ * visited. As Oni's, plus a note when the undo list is full. */
+static u32 ONI_FC visited_test_set(u32 *v, u32 i)
+{
+	u8 *bits = (u8 *)v[0], m = (u8)(1u << (i & 7));
+	if (bits[i >> 3] & m) return 1;
+	bits[i >> 3] |= m;
+	if ((int)v[2] < (int)v[1]) {
+		v[3 + v[2]] = i;
+		v[2]++;
+	} else {
+		for (int k = 0; k < 8; k++)
+			if (g_visited[k].v == v) g_visited[k].overflowed = 1;
+	}
+	return 0;
+}
+
+/* The original keeps EDX (its callers may still use the index), so keep it here too */
+__attribute__((naked)) static void visited_entry(void)
+{
+	__asm__ volatile(
+		"pushl %%edx\n\t"
+		"call %c0\n\t"
+		"popl %%edx\n\t"
+		"ret\n" :: "i"(visited_test_set));
+}
+
+/* Undo the recorded bits, as Oni does; after an overflow, clear the whole vector */
+static void ONI_FC visited_clear(u32 *v)
+{
+	u8 *bits = (u8 *)v[0];
+	for (int k = 0; k < 8; k++)
+		if (g_visited[k].v == v && g_visited[k].overflowed) {
+			memset(bits, 0, (g_visited[k].bits + 7) / 8);
+			g_visited[k].overflowed = 0;
+			v[2] = 0;
+			return;
+		}
+	for (u32 n = 0; n < v[2]; n++) {
+		u32 i = v[3 + n];
+		bits[i >> 3] &= (u8)~(1u << (i & 7));
+	}
+	v[2] = 0;
+}
+
+static void visited_install(void)
+{
+	static const u8 test_entry[] = { 0x56, 0x8b, 0xf1, 0x8b, 0x0e };    /* push esi; mov esi,ecx; mov ecx,[esi] */
+	static const u8 clear_entry[] = { 0x56, 0x8b, 0xf1, 0x57, 0x33 };   /* push esi; mov esi,ecx; push edi; xor.. */
+	static const u32 new_sites[] = { 0x440f48, 0x440fa0, 0x440ff8 };
+
+	for (u32 k = 0; k < 3; k++) {
+		const u8 *q = (const u8 *)new_sites[k];
+		if (q[0] != 0xe8 || new_sites[k] + 5 + *(u32 *)(q + 1) != (u32)ONrVisited_New ||
+		    !code_matches(ONcVisited_TestSet, test_entry, 5) || !code_matches(ONcVisited_Clear, clear_entry, 5)) {
+			log_msg("collision: visited marks code changed, skipped");
+			return;
+		}
+	}
+	for (u32 k = 0; k < 3; k++) patch_call(new_sites[k], (u32)ONrVisited_New, (u32)visited_new);
+	jump_to(ONcVisited_TestSet, test_entry, visited_entry);
+	jump_to(ONcVisited_Clear, clear_entry, visited_clear);
+	log_msg("collision: visited marks are always undone (walls no longer go missing)");
+}
+
 static void local_rng_install(void)
 {
 	static const u8 entry[] = { 0xa1, 0xd8, 0x26, 0x53, 0x00 };   /* mov eax, [0x5326d8] */
@@ -335,7 +437,8 @@ static u32 world_hash(void)
 	quads = env ? *(u8 **)(env + 0xc) : 0;
 	if (quads) {
 		u32 n = *(u32 *)(quads + 0x14);
-		for (u32 i = 0; i < n; i++) h = (h ^ *(u32 *)(quads + 0x18 + i * 0x38 + 0x30)) * 0x01000193u;
+		/* without 0x20, which the camera sets on quads in its way (cleared by 0x41aab0) */
+		for (u32 i = 0; i < n; i++) h = (h ^ (*(u32 *)(quads + 0x18 + i * 0x38 + 0x30) & ~0x20u)) * 0x01000193u;
 	}
 	ring = *(u8 **)0x5ece80 ? *(u8 **)(*(u8 **)0x5ece80 + 0x2f8) : 0;
 	if (ring) {
@@ -742,6 +845,7 @@ static void ONI_FC tick_hook(void *action)
 {
 	g_fpu_cw = fpu_control_word();
 	g_in_tick = 1;
+	players_tick_record(action);   /* Konoko's F2 choice */
 	ONrGameState_Tick(action);
 	g_in_tick = 0;
 	net_tick_done();
@@ -759,6 +863,7 @@ static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 
 	const u32 *p2;
 
+	char_menu_tag(count, actions);   /* this PC's F2 choice, in every record (a replay uses its own) */
 	if (net_active()) return net_update(count, actions, ticks_run);
 	if (g_mode != MODE_OFF) {
 		if (g_session == SESSION_RUN && (level != g_level || GS_TICK(gs) < g_last_tick))
@@ -832,6 +937,7 @@ void lockstep_install(void)
 
 	sound_rng_install();
 	speech_install();
+	visited_install();
 	/* the tick hook tells the local RNG when a tick is running, so it's always in */
 	if (tick_ok) {
 		patch_call(ONcGameState_TickCall, (u32)ONrGameState_Tick, (u32)tick_hook);

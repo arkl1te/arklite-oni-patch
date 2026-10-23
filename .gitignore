@@ -1,3 +1,4 @@
 build/
 backup/
 dist/
+__pycache__/

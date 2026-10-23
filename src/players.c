@@ -51,6 +51,26 @@
  * farthest one if none), from a hash of the level, the tick and the player, so every PC and
  * every replay picks the same. Respawning runs in the tick, right after both players' input.
  *
+ * Character choice (F2, char_menu.c): word 11 of each player's action record carries the class
+ * that player comes back as (PLAYERS_CHOICE_TAG | ONCC instance number + 1, or the tag alone
+ * for the placement's own class). The tick notes it for Konoko from the tick's action
+ * (players_tick_record, from lockstep.c's tick hook) and for player 2 from player 2's record, so
+ * every PC and every replay knows it at the same tick. A respawn with a class noted puts that
+ * class's name in the placement (+0x30, char[64], what NewCharacter looks up) and clears its
+ * RandomCostume and UpgradeDifficulty flags (0x802, which would pick another class of the same
+ * variant) while the character is made, then puts both back. The first spawn always uses the
+ * placement's class. The choices start over with the level and with a network match.
+ *
+ * A living player doesn't have to die: a new choice changes their class at once, wherever they
+ * are, as the shapeshifter cheat does (0x4d7c30: ECX the character, EDX the ONCC; called from
+ * utility input at 0x4f62fb). It swaps the class (char +0xc) and its animations in place, so
+ * position, health, weapons and inventory stay. Choosing the map's class goes back to the class
+ * the player was spawned as. Every PC does it in the tick from the shared input, like
+ * respawning. A player
+ * who comes back as another class gets the health the map gives its own player (the maximum,
+ * +0x3c, Konoko or player 2 had when spawned with the placement's class; current health +0x38
+ * set to it too), so every character is as tough as the map's Konoko.
+ *
  * Arklite.ini [players]: p2=0 turns it off, p2_pad (0..3), p2_aim_speed (8: aim per tick at
  * full right stick), p2_invert_y. [multiplayer] respawn_delay (1.5 seconds). The camera follows
  * Konoko. */
@@ -80,16 +100,22 @@ typedef unsigned long long u64;
 #define OBJ_FLAGS(o)            (*(u32 *)((o) + 0x2c))
 #define OBJ_ISPLAYER            0x1
 #define OBJ_SPAWNED             0x20
+#define OBJ_CLASS(o)            ((char *)(o) + 0x30)      /* char[64], the ONCC's name */
 #define OBJ_NAME(o)             ((const char *)(o) + 0x70)
+#define OBJ_RANDOM_CLASS        0x802   /* RandomCostume, UpgradeDifficulty */
+#define TAG_ONCC                0x4f4e4343
+
 #define OBJ_POS(o)              ((u32 *)((o) + 0xc))      /* x, y, z */
 #define OBJ_FACING(o)           (*(u32 *)((o) + 0x228))
 #define ONrGameState_DeleteCharacter ((void (ONI_FC *)(u8 *))0x4dc480)
 #define ONrCharacter_MakeCorpse ((void (ONI_FC *)(u8 *))0x4ef340)
+#define ONrCharacter_SetClass   ((void (ONI_FC *)(u8 *, u8 *))0x4d7c30)
 
 #define ONrCharacter_AutoAim    ((u8 (ONI_FC *)(u8 *, u8 *, u8 *))0x4efad0)
 
 #define CHR_SIZE        0x16a0
 #define CHR_FLAGS(c)    (*(u32 *)((c) + 4))
+#define CHR_CLASS(c)    (*(u8 **)((c) + 0xc))     /* the ONCC */
 #define CHR_INUSE       0x8000
 #define CHR_NOINPUT     0x400000   /* the tick drops the player's record */
 #define CHR_TYPE(c)     (*(u32 *)((c) + 0x1e8))   /* 0 player, 2 AI */
@@ -98,6 +124,8 @@ typedef unsigned long long u64;
 #define CHR_NOCORPSE    0x80000   /* the character update makes no corpse for it either */
 #define CHR_ACTIVE(c)   (*(u16 *)((c) + 2))       /* active data index, 0: none */
 #define CHR_POS(c)      ((float *)((c) + 0x148))
+#define CHR_HEALTH(c)   (*(int *)((c) + 0x38))
+#define CHR_MAX_HEALTH(c) (*(int *)((c) + 0x3c))
 #define CHR_DEATH_TICK(c) (*(u32 *)((c) + 0x1638))
 
 __declspec(dllimport) HANDLE WINAPI LoadLibraryA(const char *);
@@ -135,6 +163,10 @@ static u32 g_respawn_ticks = 90;       /* dead this long, an attack button bring
 /* Score (see "Score" below) */
 #define KILL_CREDIT     600     /* 10 s */
 static int g_score[2], g_was_dead[2];
+static int g_class[2] = { -1, -1 };    /* ONCC instance number chosen with F2, -1: the placement's */
+static int g_base_health[2];           /* each player's maximum health with the map's class */
+static int g_as[2] = { -1, -1 };       /* the class each player's character is, -1: the map's */
+static u8 *g_map_class[2];             /* the ONCC each player was last spawned as with the map's class */
 static int g_hit_by[2] = { -1, -1 };
 static u32 g_hit_tick[2];
 /* Attack buttons in the input state (record bits 29 punch, 30 kick; 38-40 fire1-3) */
@@ -237,6 +269,7 @@ static void new_level_check(void)
 		if (level != g_level) {
 			g_score[0] = g_score[1] = 0;
 			g_hit_by[0] = g_hit_by[1] = -1;
+			g_class[0] = g_class[1] = -1;
 		}
 		g_level = level;
 		g_p2 = -1;
@@ -295,6 +328,16 @@ void players_replay_frame(const u32 *rec)
 	}
 }
 
+static void note_choice(int who, const u32 *rec)
+{
+	if ((rec[11] & PLAYERS_CHOICE_MASK) == PLAYERS_CHOICE_TAG) g_class[who] = (int)(rec[11] & 0xffff) - 1;
+}
+
+void players_tick_record(const u32 *rec)
+{
+	if (g_enabled && rec) note_choice(0, rec);
+}
+
 /* Player 2's tick input, as the tick builds Konoko's */
 static void player2_tick(void)
 {
@@ -315,6 +358,7 @@ static void player2_tick(void)
 		src = rec;
 	}
 	g_tick_index++;
+	if (src) note_choice(1, rec);
 	if (src && (!*gs_field(GS_INPUT_ON) || *gs_field(GS_INPUT_OFF) || (CHR_FLAGS(p2) & CHR_NOINPUT))) {
 		rec[7] = rec[8] = rec[9] = rec[10] = 0;
 		rec[0] &= 0x10003;
@@ -452,8 +496,12 @@ static u8 ONI_FC spawn_player(u8 *obj, u32 *seen)
 	if (multiplayer_map()) {
 		const float *avoid = g_p1_point >= 0 ? (const float *)OBJ_POS(g_spawn[g_p1_point]) : 0;
 		int point = choose_spawn(&avoid, avoid ? 1 : 0, 2);
-		if (spawn_at(obj, point, 1, &index))
+		if (spawn_at(obj, point, 1, &index)) {
+			g_base_health[1] = CHR_MAX_HEALTH(character(index));
+			g_map_class[1] = CHR_CLASS(character(index));
+			g_as[1] = -1;
 			log_msg("players: spawned %s at spawn point %d", OBJ_NAME(obj), point);
+		}
 	} else {
 		u8 *gs = ONgGameState;
 		u32 player = *(u32 *)(gs + 0xac), player_b0 = *(u32 *)(gs + 0xb0);
@@ -492,6 +540,13 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 	} else {
 		r = OBJrEnumerate(type, callback, param);
 	}
+	g_base_health[0] = g_base_health[1] = 0;
+	g_map_class[0] = g_map_class[1] = 0;
+	g_as[0] = g_as[1] = -1;
+	if (GS_PLAYER(ONgGameState)) {
+		g_base_health[0] = CHR_MAX_HEALTH(GS_PLAYER(ONgGameState));
+		g_map_class[0] = CHR_CLASS(GS_PLAYER(ONgGameState));
+	}
 	OBJrEnumerate(OBJcType_CHAR, spawn_player, (u32)&seen);
 	return r;
 }
@@ -506,21 +561,72 @@ static int wants_respawn(u8 *c, const u32 *input)
 	       ((input[8] & ATTACK_LO) || (input[9] & ATTACK_HI));
 }
 
+/* Makes player who's character again from its placement at spawn point `point`, as the class
+ * chosen with F2. Returns the character's index, or -1. The old character must be gone already. */
+static int make_player(int who, int point)
+{
+	u8 *obj = g_spawn[who], *oncc = 0, *c;
+	const char *cls = 0;
+	char saved[64];
+	u32 flags = OBJ_FLAGS(obj), index;
+	int ok;
+
+	if (g_class[who] >= 0 && !TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, (u32)g_class[who], (void **)&oncc) && oncc &&
+	    (cls = TMrInstance_GetInstanceName(oncc)) && str_len(cls) < sizeof saved) {
+		memcpy(saved, OBJ_CLASS(obj), sizeof saved);
+		str_cpy(OBJ_CLASS(obj), sizeof saved, cls);
+		OBJ_FLAGS(obj) = flags & ~OBJ_RANDOM_CLASS;
+	} else {
+		cls = 0;
+	}
+	/* Konoko comes back as the player (NewCharacter sets gs+0xac); player 2 doesn't */
+	ok = spawn_at(obj, point, who, &index);
+	if (cls) {
+		memcpy(OBJ_CLASS(obj), saved, sizeof saved);
+		OBJ_FLAGS(obj) = (OBJ_FLAGS(obj) & ~OBJ_RANDOM_CLASS) | (flags & OBJ_RANDOM_CLASS);
+	}
+	if (!ok) return -1;
+	c = character(index);
+	if (!cls) {
+		g_base_health[who] = CHR_MAX_HEALTH(c);
+		g_map_class[who] = CHR_CLASS(c);
+	} else if (g_base_health[who] > 0) CHR_HEALTH(c) = CHR_MAX_HEALTH(c) = g_base_health[who];
+	g_as[who] = cls ? g_class[who] : -1;
+	log_msg("players: %s respawned at spawn point %d as %s, health %d/%d (tick %u)", who ? "player 2" : "Konoko",
+	        point, cls ? cls : "the map's class", CHR_HEALTH(c), CHR_MAX_HEALTH(c), GS_TICK(ONgGameState));
+	return (int)index;
+}
+
 static int respawn(u8 *c, u8 *other, int is_p2)
 {
 	const float *avoid = 0;
-	u32 index;
 
 	if (other && (CHR_FLAGS(other) & CHR_INUSE) && !(CHR_FLAGS(other) & CHR_DEAD))
 		avoid = CHR_POS(other);
 	int point = choose_spawn(&avoid, avoid ? 1 : 0, is_p2 ? 2 : 1);
 	if (CHR_ACTIVE(c) && !(CHR_FLAGS(c) & CHR_NOCORPSE)) ONrCharacter_MakeCorpse(c);
 	ONrGameState_DeleteCharacter(c);
-	/* Konoko comes back as the player (NewCharacter sets gs+0xac); player 2 doesn't */
-	if (!spawn_at(g_spawn[is_p2], point, is_p2, &index)) return -1;
-	log_msg("players: %s respawned at spawn point %d (tick %u)", is_p2 ? "player 2" : "Konoko",
-	        point, GS_TICK(ONgGameState));
-	return (int)index;
+	return make_player(is_p2, point);
+}
+
+static int alive(u8 *c)
+{
+	return c && (CHR_FLAGS(c) & CHR_INUSE) && !(CHR_FLAGS(c) & CHR_DEAD);
+}
+
+/* A new choice while alive: the class changes in place, as the shapeshifter cheat does it */
+static void change_class(int who, u8 *c)
+{
+	u8 *oncc = 0;
+
+	if (!alive(c) || g_class[who] == g_as[who]) return;
+	if (g_class[who] < 0) oncc = g_map_class[who];
+	else if (TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, (u32)g_class[who], (void **)&oncc)) oncc = 0;
+	g_as[who] = g_class[who];
+	if (!oncc || oncc == CHR_CLASS(c)) return;
+	ONrCharacter_SetClass(c, oncc);
+	log_msg("players: %s changed to %s, health %d/%d (tick %u)", who ? "player 2" : "Konoko",
+	        TMrInstance_GetInstanceName(oncc), CHR_HEALTH(c), CHR_MAX_HEALTH(c), GS_TICK(ONgGameState));
 }
 
 /* ---- Score ---------------------------------------------------------------------------------- *
@@ -555,13 +661,21 @@ void players_note_hit(u8 *victim, u8 *attacker)
 	g_hit_tick[v] = GS_TICK(ONgGameState);
 }
 
+int players_can_change(int who) { return (who == 0 || who == 1) && multiplayer_map() && alive(player_char(who)); }
+
 int players_score(int who) { return who == 0 || who == 1 ? g_score[who] : 0; }
+
+int players_enabled(void) { return g_enabled; }
+u32 players_respawn_ticks(void) { return g_respawn_ticks; }
+void players_set_respawn_ticks(u32 ticks) { g_respawn_ticks = ticks; }
 
 void players_reset_scores(void)
 {
 	for (int who = 0; who < 2; who++) {
 		g_score[who] = 0;
 		g_hit_by[who] = -1;
+		g_class[who] = -1;
+		g_as[who] = -1;
 		u8 *c = player_char(who);
 		g_was_dead[who] = c && (CHR_FLAGS(c) & CHR_DEAD);
 	}
@@ -593,11 +707,13 @@ static void respawn_tick(const u32 *p1_input)
 
 	if (!multiplayer_map()) return;
 	if (p1 && wants_respawn(p1, p1_input)) respawn(p1, p2, 0);
+	else change_class(0, p1);
 	p1 = GS_PLAYER(gs);
 	if (p2 && wants_respawn(p2, g_input)) {
-		int index = respawn(p2, p1, 1);
-		g_p2 = index;
+		g_p2 = respawn(p2, p1, 1);
 		memset(g_input, 0, sizeof g_input);
+	} else {
+		change_class(1, p2);
 	}
 }
 

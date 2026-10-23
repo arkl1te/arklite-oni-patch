@@ -198,6 +198,11 @@ static int present(const Item *it)
 	return 0;
 }
 
+u32 items_default_ticks(void) { return g_default_ticks; }
+
+/* the network host's, on the joiner: read again at the next level start (read_delays) */
+void items_set_default_ticks(u32 ticks) { g_default_ticks = ticks; }
+
 void items_tick(void)
 {
 	u32 tick = GS_TICK(ONgGameState);
