@@ -29,9 +29,19 @@
  *   - any other dialog opened outside a tick in a level runs live the same way (the help and
  *     objectives screen, dialog 0x46, from the main loop through 0x5018c0);
  *   - a dialog opened inside a tick isn't shown, since a game frame can't run in the middle of
- *     a tick (the text console screen, dialog 0x47 from 0x504cc5);
+ *     a tick. The exception is the text console page (dialog 0x47, the BSL text_console command,
+ *     0x504c40), which consoles use to show text: it waits for the end of the tick and then opens
+ *     live, set up as 0x504c40 does it (the psui_oniUI part set, game input off). Its param
+ *     points at {TxtC, page 0} on that function's stack, so the request keeps a copy;
  *   - the game's own pause flag (gs+0x1679ac, read by the main loop through 0x4fc960) is
- *     cleared every frame. */
+ *     cleared every frame;
+ *   - the help screen doesn't turn the sound down: 0x5018c0 halves the master volume
+ *     (SSrSetMasterVolume 0x483e00, [volume], returns the current one in ST0, ret 4; call at
+ *     0x501922, the value from 0x483df0 times 0.5) while it's open and puts it back at 0x501943,
+ *     which then sets what it already is.
+ *
+ * The F2 character menu (char_menu.c) is handled here too: its keys after every frame's update,
+ * and utility input is skipped while it's open, so Esc closes it rather than pausing. */
 #include "arklite.h"
 
 #define ONrPauseMenu_Run        0x4bec00                   /* the whole Esc sequence, replaced */
@@ -46,6 +56,10 @@
 #define ONrLevel_GetCurrent     ((u16 (ONI_FC *)(void))0x5054c0)
 #define ONgGameState            (*(u8 **)0x5ece7c)
 #define WMgDrawHook             (*(void (**)(void))0x5e96cc)
+#define LIrMode_GetGameInput    ((u32 (*)(void))0x403f60)
+#define UIrPartSpec_Find        ((void *(ONI_FC *)(const char *))0x46aa80)
+#define UIgPartSpec             (*(void **)0x5e9758)
+#define WMcDialog_TextConsole   0x47
 #define GS_PAUSED               0x1679ac                   /* u8, stock offset */
 #define GS_LEVEL_END            0x1679bc                   /* u32, stock offset: 1 won, 2 lost */
 
@@ -55,8 +69,12 @@
 #define ONcTick_UtilityInputCall    0x4fa91c               /* call 0x4f6200, or Daodan's */
 #define ONcPauseMenu_SoundPauseCall 0x4d2d4a               /* init: call SSrSetPaused(1) */
 #define SSrSetPaused            ((void (ONI_FC *)(u32))0x514e60)
+#define ONcHelp_VolumeDownCall  0x501922
+#define SSrSetMasterVolume      ((float (__stdcall *)(float))0x483e00)
+#define SSgMasterVolumeNow      (*(float *)0x5eb744)
 
 static int g_open, g_pending;
+static struct { int pending; WMtDialogProc proc; u32 param[2]; } g_console;   /* text console page after the tick */
 static u32 g_menu_level;
 static void (ONI_FC *g_utility_input)(void *);
 
@@ -135,15 +153,43 @@ static void pause_request(void)
 	if (!g_open) g_pending = 1;
 }
 
+/* net.c: Esc on this PC in a network game (the action bit is kept out of the shared input) */
+void live_menu_request(void)
+{
+	if (!g_open) g_pending = 1;
+}
+
+/* The text console page a script asked for inside the tick, as 0x504c40 opens it */
+static void run_console(void)
+{
+	void *parts = UIgPartSpec, *ui = UIrPartSpec_Find("psui_oniUI");
+	u32 input = LIrMode_GetGameInput();
+	u32 param[2] = { g_console.param[0], g_console.param[1] };
+
+	if (ui) UIgPartSpec = ui;
+	LIrMode_SetGameInput(0);
+	WMrUIMode_Enter();
+	live_menu_modal(WMcDialog_TextConsole, 0, g_console.proc, (u32)param, 0, 0);
+	WMrUIMode_Leave();
+	LIrMode_SetGameInput(input);
+	UIgPartSpec = parts;
+}
+
 /* After the main loop's update: open a requested menu outside the tick */
 static void main_loop_sound(void)
 {
 	SSrUpdate();
 	if (multiplayer_active()) *gs_field(GS_PAUSED) = 0;
+	char_menu_frame();
 	if (g_pending) {
 		g_pending = 0;
 		g_menu_level = ONrLevel_GetCurrent();
 		if (level_running()) run_menu();
+	}
+	if (g_console.pending) {
+		g_console.pending = 0;
+		g_menu_level = ONrLevel_GetCurrent();
+		if (level_running() && !g_open) run_console();
 	}
 }
 
@@ -159,6 +205,14 @@ u16 live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u3
 
 	if (g_open || !multiplayer_active() || !ONrLevel_GetCurrent())
 		return WMrDialog_ModalBegin(id, parent, proc, param, result);
+	if (in_tick && id == WMcDialog_TextConsole && param) {
+		g_console.proc = proc;
+		g_console.param[0] = ((u32 *)param)[0];
+		g_console.param[1] = ((u32 *)param)[1];
+		g_console.pending = 1;
+		if (result) *result = 0;
+		return 0;
+	}
 	if (in_tick) {
 		if (!told++) log_msg("live menu: dialog 0x%x opened inside a tick, not shown in a multiplayer game", id);
 		if (result) *result = 0;
@@ -176,7 +230,13 @@ u16 live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u3
 
 static void ONI_FC utility_input(void *action)
 {
-	if (!g_open) g_utility_input(action);
+	if (!g_open && !char_menu_open()) g_utility_input(action);
+}
+
+/* The help screen's volume down: kept in multiplayer games */
+static float __stdcall help_volume_down(float volume)
+{
+	return multiplayer_active() ? SSgMasterVolumeNow : SSrSetMasterVolume(volume);
 }
 
 void live_menu_install(void)
@@ -197,5 +257,7 @@ void live_menu_install(void)
 	patch_call(ONcMainLoop_SoundCall, (u32)SSrUpdate, (u32)main_loop_sound);
 	patch_call(ONcTick_UtilityInputCall, (u32)g_utility_input, (u32)utility_input);
 	patch_call(ONcPauseMenu_SoundPauseCall, (u32)SSrSetPaused, (u32)pause_menu_sound_pause);
+	if (!patch_call(ONcHelp_VolumeDownCall, (u32)SSrSetMasterVolume, (u32)help_volume_down))
+		log_msg("live menu: help screen code changed, it turns the sound down in multiplayer too");
 	log_msg("live menu: in multiplayer games the game keeps running behind the pause menu");
 }

@@ -16,8 +16,10 @@
  * size (the user asked for double).
  *
  * Lobby: "Press F3 to be ready" in red, or "Press F3 to be unready" in green, and under it who
- * is ready or the countdown, until the match starts. Match (or a two-player game on one PC):
- * the score in the top right corner, this PC's player in yellow. */
+ * is ready or the countdown, until the match starts; in red under that, what keeps a joiner out
+ * (the two PCs' files differ, net.c). Match (or a two-player game on one PC): the score in the
+ * top right corner, this PC's player in yellow, and "Out of sync" when a state check failed. The F2 character menu
+ * (char_menu.c) is drawn last, over all of it. */
 #include "arklite.h"
 
 #define ONgTextContext      (*(void **)0x5ece70)
@@ -61,7 +63,9 @@ static u32 ONI_FC text_sprite(const float *pts, const void *uv)
 	return M3rDraw_Sprite(p, uv);
 }
 
-enum { LEFT, CENTER, RIGHT };
+#define LEFT   MP_LEFT
+#define CENTER MP_CENTER
+#define RIGHT  MP_RIGHT
 
 /* One line of text; x is its left, center or right edge, y the top of the line */
 static void text(const char *s, int x, int y, int align, u32 color)
@@ -89,6 +93,10 @@ static void text(const char *s, int x, int y, int align, u32 color)
 	g_scaling = 0;
 }
 
+/* For char_menu.c, while it draws from the HUD below */
+void mp_hud_text(const char *s, int x, int y, int align, u32 color) { text(s, x, y, align, color); }
+int  mp_hud_line_height(void) { return g_line_height; }
+
 static void draw_lobby(const NetHud *h, int width, int height)
 {
 	char line[128];
@@ -105,6 +113,23 @@ static void draw_lobby(const NetHud *h, int width, int height)
 	else
 		fmt(line, "%d of %d players ready (%d needed)", h->ready_count, h->players, h->needed);
 	text(line, x, y, CENTER, WHITE);
+}
+
+/* What keeps the joiner out, under the lobby text */
+static void draw_problem(const NetHud *h, int width, int height)
+{
+	int x = width / 2, y = height / 5 + 2 * (g_line_height + 4);
+
+	if (!h->problem) return;
+	text(h->local_player ? "Can't join: not the same on both PCs:" : "A player can't join: not the same on both PCs:",
+	     x, y, CENTER, RED);
+	for (u32 bit = 1; bit <= NETBAD_PLAYERS; bit <<= 1) {
+		if (!(h->problem & bit)) continue;
+		y += g_line_height + 2;
+		text(net_problem_text(bit), x, y, CENTER, RED);
+	}
+	y += g_line_height + 2;
+	text("Copy it from one PC to the other (see Arklite.log)", x, y, CENTER, WHITE);
 }
 
 static void draw_score(int local, int width)
@@ -139,6 +164,9 @@ static void ONI_FC timer_display(void *timer)
 	if (h.state == NETHUD_LOBBY) draw_lobby(&h, width, height);
 	else if (h.state == NETHUD_STARTING) text("Starting the match...", width / 2, height / 5, CENTER, WHITE);
 	else draw_score(h.state == NETHUD_MATCH ? h.local_player : -1, width);
+	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) draw_problem(&h, width, height);
+	if (h.desynced) text("Out of sync with the other PC (see Arklite.log)", width / 2, 24, CENTER, RED);
+	char_menu_draw(width, height);
 
 	TSrContext_SetColor(ctx, color);
 }

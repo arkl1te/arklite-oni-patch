@@ -105,8 +105,9 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one |
 | | `record` | 1 | 0: don't record network games to `Arklite-net-host.akr` / `-join.akr` |
 | | `delay` | 4 | Input delay in ticks (1/60 s each). The host's value is used on both PCs; raise it if the game stutters over a slow connection |
-| `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point |
-| | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never |
+| `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
+| | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
+| | `characters` | 16 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24) |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 
@@ -170,7 +171,7 @@ A game with player 2 is a **multiplayer game**, and in one:
 - **Auto-aim is off**, as it will have to be over the network, where each player sees
   different characters.
 - **Nothing pauses**: the game keeps running behind the pause menu and behind the help and
-  objectives screen.
+  objectives screen (F1), and F1 doesn't turn the sound down.
 - **Players respawn**: 1.5 seconds after dying (`respawn_delay`), a dead player presses an
   attack button (punch, kick or any fire) to come back at a spawn point, with the starting
   health and weapon of their placement. The body stays as a corpse.
@@ -180,6 +181,12 @@ A game with player 2 is a **multiplayer game**, and in one:
 
 On a **multiplayer map** (two or more IsPlayer characters, see below), also:
 
+- **F2 picks your character**: a menu over the running game shows a picture of every character
+  you can play. Pick one with the arrow keys or the mouse and choose it with Enter or a click
+  (F2 or Esc closes the menu). You change at once, wherever you are, keeping your health,
+  weapons and items; if you're dead, you come back as that character when you respawn. Every character gets the health the map gives
+  Konoko, so a Thug is as tough as a Muro. Your player stands still while the menu is open. The list can be changed
+  with `characters` in `[multiplayer]`.
 - **Free for all**: players can hit, shoot and throw each other, though they're all on Konoko's
   team. AI characters keep their usual teams.
 - **Damage is x1.25**: every hit on a character does a quarter more (rounded).
@@ -222,7 +229,12 @@ Recordings are large (roughly 10–80 MB a minute with a few characters fighting
 
 Two PCs (or two Oni windows on one PC) play the same multiplayer map. The host plays Konoko,
 the joiner plays player 2 (the second IsPlayer character), and only inputs travel between them.
-Both need the same Arklite, the same AE and the same map, and must start it the same way:
+Both need the same Arklite, the same AE and the same map, and must start it the same way.
+The host checks this when someone joins: if the two PCs' `Arklite.dll`, Daodan, `daodan.ini`
+gameplay settings, `level0_Final` files or map folder (`GameDataFolder/CustomLevels/<map>`) aren't
+identical, the joiner stays out of the lobby and both screens say in red what differs. Copy
+that file or folder from one PC to the other and join again. The joiner uses the host's
+`respawn_delay` and `item_respawn`.
 
 ```sh
 cd "/path/to/Oni/AE"

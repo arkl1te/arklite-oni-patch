@@ -106,7 +106,7 @@ def pointer(v):
     be a meaningless tiny number. 0: none."""
     if v == 0 or (0x00100000 <= v < 0x20000000 and not v & 3):
         return True
-    return v >> 24 == 0x80   # a particle handle (bit 31 + pool, slot, serial); as a float, about -1e-38
+    return 0x80 <= v >> 24 <= 0x87   # a particle/sound handle (bit 31 + pool, slot, serial); as a float, about -1e-37
 
 
 def as_float(v):

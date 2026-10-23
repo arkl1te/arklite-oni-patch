@@ -4,3 +4,6 @@ EXPORTS
   GetAsyncKeyState@4
   GetForegroundWindow@0
   GetWindowThreadProcessId@8
+  GetCursorPos@4
+  ScreenToClient@8
+  GetClientRect@8
