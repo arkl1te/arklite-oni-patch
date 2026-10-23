@@ -230,10 +230,12 @@ Recordings are large (roughly 10–80 MB a minute with a few characters fighting
 Two PCs (or two Oni windows on one PC) play the same multiplayer map. The host plays Konoko,
 the joiner plays player 2 (the second IsPlayer character), and only inputs travel between them.
 Both need the same Arklite, the same AE and the same map, and must start it the same way.
-The host checks this when someone joins: if the two PCs' `Arklite.dll`, Daodan, `daodan.ini`
+The host checks this when someone joins: if the two PCs' Arklite, Daodan, `daodan.ini`
 gameplay settings, `level0_Final` files or map folder (`GameDataFolder/CustomLevels/<map>`) aren't
 identical, the joiner stays out of the lobby and both screens say in red what differs. Copy
-that file or folder from one PC to the other and join again. The joiner uses the host's
+that file or folder from one PC to the other and join again. Arklite counts as the same when it
+was built from the same source: a release download and your own build of that release's commit
+can play together. The joiner uses the host's
 `respawn_delay` and `item_respawn`.
 
 ```sh

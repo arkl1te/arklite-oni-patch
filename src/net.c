@@ -21,7 +21,7 @@
  * at 0 with the match.
  *
  * Both PCs must run the same game: every HELLO and START carries a Compat record (hashes of
- * Arklite.dll itself, Daodan, its gameplay settings, level0, and every file in the map's folder,
+ * Arklite's source (build.sh: a local build and GitHub's of the same source match), Daodan, its gameplay settings, level0, and every file in the map's folder,
  * and whether player 2 is on). The host keeps a joiner whose record differs out of the lobby and
  * tells it why in LOBBY (refused); both PCs say on screen what differs. A packet of another
  * protocol (another Arklite) gets the same. The host's LOBBY also carries its gameplay settings
@@ -146,8 +146,9 @@ __declspec(dllimport) short WINAPI GetAsyncKeyState(int);
 __declspec(dllimport) void * WINAPI GetForegroundWindow(void);
 __declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
 __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
-__declspec(dllimport) u32  WINAPI GetModuleFileNameA(HANDLE, char *, u32);
-extern char __ImageBase;   /* this DLL's own module (lld-link) */
+#ifndef ARKLITE_SRC_HASH
+#define ARKLITE_SRC_HASH 0   /* build.sh: a hash of the source, the same for every build of it */
+#endif
 
 #define INVALID_SOCKET  0xffffffffu
 #define FIONBIO         0x8004667e
@@ -162,7 +163,7 @@ typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
 typedef struct {
 	char version[16];
 	u32 files[NFILES];
-	u32 dll;               /* Arklite.dll */
+	u32 dll;               /* Arklite's source (ARKLITE_SRC_HASH), not the DLL's bytes */
 	u32 map;               /* the level's files: the custom level's whole folder */
 	u32 players;           /* [players] p2 isn't 0 */
 } Compat;
@@ -294,8 +295,8 @@ static void hash_files(void)
 	g_files[1] = hash_words(g_files[1] ^ 1, (const u8 *)section, n);
 	g_files[2] = hash_file("GameDataFolder\\level0_Final.dat");
 	g_files[3] = hash_file("GameDataFolder\\level0_Final.raw");
-	if (GetModuleFileNameA(&__ImageBase, ini, sizeof ini)) g_dll_hash = hash_file(ini);
-	log_msg("net: Arklite.dll %08x, Daodan %08x, its settings %08x, level0 %08x %08x", g_dll_hash, g_files[0], g_files[1],
+	g_dll_hash = ARKLITE_SRC_HASH;
+	log_msg("net: Arklite source %08x, Daodan %08x, its settings %08x, level0 %08x %08x", g_dll_hash, g_files[0], g_files[1],
 	        g_files[2], g_files[3]);
 }
 
@@ -375,7 +376,7 @@ const char *net_problem_text(u32 bit)
 {
 	switch (bit) {
 	case NETBAD_PROTO:      return "Arklite's version";
-	case NETBAD_DLL:        return "Arklite.dll";
+	case NETBAD_DLL:        return "Arklite (not the same release or commit)";
 	case NETBAD_DAODAN:     return "Daodan (binkw32.dll)";
 	case NETBAD_DAODAN_INI: return "daodan.ini [gameplay] or [devmode]";
 	case NETBAD_LEVEL0:     return "GameDataFolder\\level0_Final.dat or .raw";
@@ -653,7 +654,7 @@ static u32 check_files(const char *who, const Compat *c)
 	if (!str_ieq_n(v, ARKLITE_VERSION, 17))
 		log_msg("net: the %s runs Arklite %s, this PC %s", who, v, ARKLITE_VERSION);
 	if (bad & NETBAD_DLL)
-		log_msg("net: Arklite.dll differs on the %s (%08x there, %08x here): use the same Arklite.dll on both PCs",
+		log_msg("net: Arklite differs on the %s (source %08x there, %08x here): use the same Arklite release or commit on both PCs",
 		        who, c->dll, g_dll_hash);
 	if (bad & NETBAD_MAP)
 		log_msg("net: the map's files differ on the %s (%08x there, %08x here): copy the map's CustomLevels folder from one PC to the other",
