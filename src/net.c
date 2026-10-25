@@ -102,7 +102,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    27777
-#define PROTO           4
+#define PROTO           6
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -112,6 +112,7 @@ typedef unsigned long long u64;
 #define MAX_CHARS       255
 #define LOST_MS         10000
 #define HELLO_MS        200
+#define NAME_MS         1000         /* the player's name goes out this often (and at once on a change) */
 #define RESEND_MS       30
 #define COUNTDOWN_MS    7000
 #define PROBLEM_MS      2000         /* a refusal stays on screen this long after the last one */
@@ -146,6 +147,17 @@ __declspec(dllimport) short WINAPI GetAsyncKeyState(int);
 __declspec(dllimport) void * WINAPI GetForegroundWindow(void);
 __declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
 __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
+__declspec(dllimport) int  WINAPI VirtualFree(void *, u32, u32);
+__declspec(dllimport) int  WINAPI CreateDirectoryA(const char *, void *);
+__declspec(dllimport) int  WINAPI MoveFileExA(const char *, const char *, u32);
+__declspec(dllimport) int  WINAPI DeleteFileA(const char *);
+__declspec(dllimport) u32  WINAPI SetFilePointer(HANDLE, int, int *, u32);
+__declspec(dllimport) void WINAPI Sleep(u32);
+__declspec(dllimport) int  WINAPI PeekMessageA(void *, void *, u32, u32, u32);
+__declspec(dllimport) int  WINAPI TranslateMessage(const void *);
+__declspec(dllimport) int  WINAPI DispatchMessageA(const void *);
+__declspec(dllimport) void WINAPI PostQuitMessage(int);
+__declspec(dllimport) int  WINAPI setsockopt(u32, int, int, const void *, int);
 #ifndef ARKLITE_SRC_HASH
 #define ARKLITE_SRC_HASH 0   /* build.sh: a hash of the source, the same for every build of it */
 #endif
@@ -155,7 +167,8 @@ __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
 
 /* ---- Packets ------------------------------------------------------------------------------ */
 
-enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY };
+enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY, PKT_NAME,
+       PKT_MAP_LIST_REQ, PKT_MAP_LIST, PKT_MAP_REQ, PKT_MAP_DATA };
 
 typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
 #define NFILES 4
@@ -182,6 +195,7 @@ typedef struct {
 	u32 seed, local_seed;  /* with go: both RNG streams, set on both PCs before the reload */
 	u32 refused;           /* NETBAD_*: the joiner can't play here, and why (then nothing else counts) */
 	u32 respawn_ticks, item_ticks;   /* the host's Arklite.ini, used on both PCs */
+	u32 map_offer;         /* with refused NETBAD_MAP: the host sends its map's files on request */
 } PktLobby;
 typedef struct {
 	PktHead h;
@@ -194,6 +208,10 @@ typedef struct {
 	u32 ack;               /* every input of ours before this tick arrived */
 	u32 hash_tick, hash;   /* our latest state hash (hash_tick 0: none yet) */
 } PktInput;
+typedef struct {
+	PktHead h;
+	char name[MP_NAME_MAX];   /* this PC's player's (mp_names.c); only shown, not game state */
+} PktName;
 
 /* ---- State -------------------------------------------------------------------------------- */
 
@@ -246,6 +264,7 @@ static u32 g_countdown_end;            /* host: GetTickCount at 0, 0: no countdo
 static u32 g_lobby_players = 1, g_lobby_ready, g_lobby_countdown = 0xffffffffu, g_lobby_rx;   /* joiner: the host's view */
 static int g_host_heard;               /* joiner: a LOBBY arrived in this lobby */
 static u32 g_last_lobby;
+static u32 g_last_name, g_name_sent;   /* when our name last went out, and mp_name_serial() then */
 static u32 g_match_seed, g_match_local_seed;   /* the RNGs the match's level loads with */
 static u32 g_problem, g_problem_at;    /* NETBAD_* last seen (refused / refusing), and when */
 
@@ -588,6 +607,8 @@ static void send_start(void)
 static u32 lobby_players(void) { return 1 + (g_peer_seen != 0); }
 static u32 lobby_ready(void) { return (g_ready != 0) + (g_peer_seen && g_peer_ready); }
 
+static int map_can_serve(void);
+
 /* refused: NETBAD_*, the joiner this goes to can't play here */
 static void send_lobby_to(int go, u32 refused)
 {
@@ -604,6 +625,7 @@ static void send_lobby_to(int go, u32 refused)
 	p.seed = g_match_seed;
 	p.local_seed = g_match_local_seed;
 	p.refused = refused;
+	p.map_offer = (refused & NETBAD_MAP) && map_can_serve();
 	p.respawn_ticks = players_respawn_ticks();
 	p.item_ticks = items_default_ticks();
 	send_to_peer(&p, sizeof p);
@@ -630,6 +652,17 @@ static void send_inputs(void)
 	for (u32 i = 0; i < n; i++) memcpy(buf + sizeof *p + i * 0x30, g_local_in[(from + i) % RING], 0x30);
 	send_to_peer(buf, sizeof *p + n * 0x30);
 	g_sent_gen = g_gen;
+}
+
+static void send_name(void)
+{
+	PktName p;
+	memset(&p, 0, sizeof p);
+	head(&p.h, PKT_NAME);
+	str_cpy(p.name, sizeof p.name, mp_name_local());
+	send_to_peer(&p, sizeof p);
+	g_last_name = GetTickCount();
+	g_name_sent = mp_name_serial();
 }
 
 static void send_bye(void)
@@ -725,6 +758,578 @@ static void on_input(const PktInput *p, u32 size)
 	}
 }
 
+/* ---- Map download ------------------------------------------------------------------------- *
+ * A joiner whose map's files differ from the host's (only NETBAD_MAP, on a custom level) gets
+ * them from the host. The host's LOBBY refusal says it can send them (map_offer); the joiner
+ * reloads the level (ONrGame_StartLevel), and its level load (0x5059d0) shows Oni's loading
+ * popup (dialog 0x9b "Progress", window *0x5ed2f4: "Loading..." label, progress bar 100 at
+ * 30,65 290x15, in a 350x150 box) and then opens the level's files (TMrLevel_Load 0x4217d0,
+ * called at 0x505a7c with ECX the level). Arklite's call there first downloads the files:
+ *   1. MAP_LIST_REQ / MAP_LIST: the host's list of the folder's files (path below the folder,
+ *      size, hash of the bytes), MAP_LIST_PAGE at a time.
+ *   2. The files missing here or with another size or hash are fetched in MAP_CHUNK pieces:
+ *      MAP_REQ asks for up to MAP_REQ_MAX pieces, the host answers each with MAP_DATA. The joiner
+ *      keeps `win` pieces asked for at once, asks again for one not here after DL_RTO_MS, halves
+ *      the window when that happens and widens it while pieces keep coming.
+ *   3. Each file goes to GameDataFolder\CustomLevels.download\<folder>\ and is checked against
+ *      the host's hash; when all are here, the files they replace and the files the host doesn't
+ *      have are moved to GameDataFolder\CustomLevels.backup\<folder>\ (outside CustomLevels, so
+ *      Custom Game doesn't list them), the new ones into the folder, and the level is mounted
+ *      again (its .dat names may have changed) before the engine opens it.
+ * Under the progress bar two lines say "Downloading (left/total)", left = files still to
+ * download, total = the files the map has, and "1.2MB of 3.4MB (1.23 MB/s)" for the file
+ * coming in (B, KB or MB by that file's size; the speed's unit by the speed); the bar shows that
+ * file. Esc cancels. A cancelled or failed download isn't tried again for that level until Oni
+ * restarts: the lobby says the map differs, as before. Windows messages are handled meanwhile,
+ * so the window doesn't hang. The host serves files only from the level it's on. */
+#define MAP_PATH        112
+#define MAP_LIST_PAGE   12
+#define MAP_MAX_FILES   512
+#define MAP_CHUNK       1400
+#define MAP_REQ_MAX     32           /* pieces per request */
+#define DL_SLOTS        1024         /* request times, by piece */
+#define DL_WINDOW_MIN   16
+#define DL_WINDOW_MAX   768
+#define DL_RTO_MS       400
+#define DL_DRAW_MS      33
+#define VK_ESCAPE       0x1b
+
+typedef struct { char path[MAP_PATH]; u32 size, hash; } MapFile;
+typedef struct { PktHead h; u32 level, first; } PktMapListReq;
+typedef struct { PktHead h; u32 level, map, total, first, count; MapFile f[MAP_LIST_PAGE]; } PktMapList;
+typedef struct { PktHead h; u32 level, file, chunk, count; } PktMapReq;
+typedef struct { PktHead h; u32 level, file, chunk, size; } PktMapData;   /* size bytes follow */
+
+#define ONgLoadingDialog        (*(WMtWindow **)0x5ed2f4)
+#define LDcMessage_Progress     0x2e         /* the dialog passes it to the bar: p1 = percent */
+#define M3rFrame_Begin          ((void (ONI_FC *)(u32))0x41ab00)
+#define WMrDisplay              ((void (*)(void))0x476140)
+#define M3rFrame_End            ((void (*)(void))0x41ad00)
+#define TMrLevel_Load           ((u16 (ONI_FC *)(u32, u32))0x4217d0)
+#define ONcLevelLoad_TMCall     0x505a7c
+
+/* Every file below dir, walked as hash_tree does: its path below dir, size and hash. 0 when there
+ * are too many or a path is too long to send */
+static int list_tree(const char *dir, const char *rel, int depth, MapFile *out, u32 *n)
+{
+	WIN32_FIND_DATAA fd;
+	char path[1024], sub[1024];
+	HANDLE f;
+	int ok = 1;
+
+	if (depth > 8 || str_len(dir) + str_len(rel) + 2 >= MAX_PATH) return 0;
+	fmt(path, "%s%s*", dir, rel);
+	f = FindFirstFileA(path, &fd);
+	if (f == INVALID_HANDLE_VALUE) return 1;
+	do {
+		if (fd.cFileName[0] == '.' && (!fd.cFileName[1] || (fd.cFileName[1] == '.' && !fd.cFileName[2]))) continue;
+		fmt(sub, "%s%s", rel, fd.cFileName);
+		if (str_len(dir) + str_len(sub) + 2 >= MAX_PATH) { ok = 0; continue; }
+		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			fmt(path, "%s\\", sub);
+			ok &= list_tree(dir, path, depth + 1, out, n);
+			continue;
+		}
+		if (*n == MAP_MAX_FILES || str_len(sub) >= MAP_PATH) { ok = 0; continue; }
+		MapFile *m = &out[(*n)++];
+		str_cpy(m->path, MAP_PATH, sub);
+		m->size = fd.nFileSizeLow;
+		fmt(path, "%s%s", dir, sub);
+		m->hash = hash_file(path);
+	} while (FindNextFileA(f, &fd));
+	FindClose(f);
+	return ok;
+}
+
+static void send_to(const void *p, u32 n, const SOCKADDR_IN *to)
+{
+	if (sendto(g_sock, p, n, 0, to, sizeof *to) >= 0) g_npackets_sent++;   /* a full buffer: asked again */
+}
+
+/* -- The host's side -- */
+
+static MapFile *g_serve;
+static u32 g_nserve, g_serve_level, g_serve_map;
+static int g_serve_ok;
+static HANDLE g_serve_file = INVALID_HANDLE_VALUE;
+static u32 g_serve_index;
+
+/* The level's files can be sent (a custom level, listed once per level and version) */
+static int map_can_serve(void)
+{
+	const char *dir = custom_game_level_dir(g_level);
+
+	if (!dir) return 0;
+	if (!g_serve) g_serve = VirtualAlloc(0, MAP_MAX_FILES * sizeof(MapFile), 0x3000, 4);
+	if (!g_serve) return 0;
+	if (g_serve_level != g_level || g_serve_map != g_map_hash) {
+		if (g_serve_file != INVALID_HANDLE_VALUE) CloseHandle(g_serve_file);
+		g_serve_file = INVALID_HANDLE_VALUE;
+		g_nserve = 0;
+		g_serve_ok = list_tree(dir, "", 0, g_serve, &g_nserve);
+		g_serve_level = g_level;
+		g_serve_map = g_map_hash;
+		log_msg("net: map download: %d files in %s%s", g_nserve, dir,
+		        g_serve_ok ? "" : " (too many files or a path too long: joiners can't download it)");
+	}
+	return g_serve_ok;
+}
+
+static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
+{
+	const PktHead *h = (const PktHead *)buf;
+	char path[1024];
+
+	if (!map_can_serve()) return;
+	if (h->type == PKT_MAP_LIST_REQ && n >= sizeof(PktMapListReq)) {
+		const PktMapListReq *q = (const PktMapListReq *)buf;
+		static u32 last_log;
+		PktMapList p;
+		if (q->level != g_level) return;
+		if (!q->first && GetTickCount() - last_log > LOST_MS) {
+			const u8 *ip = (const u8 *)&to->addr;
+			log_msg("net: %d.%d.%d.%d:%d is downloading the map", ip[0], ip[1], ip[2], ip[3], ntohs(to->port));
+			last_log = GetTickCount();
+		}
+		memset(&p, 0, sizeof p);
+		head(&p.h, PKT_MAP_LIST);
+		p.level = g_level;
+		p.map = g_map_hash;
+		p.total = g_nserve;
+		p.first = q->first;
+		for (u32 i = q->first; i < g_nserve && p.count < MAP_LIST_PAGE; i++) p.f[p.count++] = g_serve[i];
+		send_to(&p, sizeof p, to);
+	} else if (h->type == PKT_MAP_REQ && n >= sizeof(PktMapReq)) {
+		static u8 data[MAP_REQ_MAX * MAP_CHUNK], out[sizeof(PktMapData) + MAP_CHUNK];
+		const PktMapReq *q = (const PktMapReq *)buf;
+		PktMapData *p = (PktMapData *)out;
+		u32 off, len, got = 0;
+		if (q->level != g_level || q->file >= g_nserve || !q->count || q->count > MAP_REQ_MAX) return;
+		const MapFile *m = &g_serve[q->file];
+		if (q->chunk >= (m->size + MAP_CHUNK - 1) / MAP_CHUNK) return;
+		if (g_serve_file == INVALID_HANDLE_VALUE || g_serve_index != q->file) {
+			if (g_serve_file != INVALID_HANDLE_VALUE) CloseHandle(g_serve_file);
+			fmt(path, "%s%s", custom_game_level_dir(g_level), m->path);
+			g_serve_file = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 3, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+			g_serve_index = q->file;
+			if (g_serve_file == INVALID_HANDLE_VALUE) log_msg("net: map download: can't open %s", path);
+		}
+		if (g_serve_file == INVALID_HANDLE_VALUE) return;
+		off = q->chunk * MAP_CHUNK;
+		len = q->count * MAP_CHUNK;
+		if (len > m->size - off) len = m->size - off;
+		SetFilePointer(g_serve_file, (int)off, 0, 0 /* FILE_BEGIN */);
+		if (!ReadFile(g_serve_file, data, len, &got, 0)) return;
+		for (u32 k = 0; k * MAP_CHUNK < got; k++) {
+			u32 size = got - k * MAP_CHUNK;
+			if (size > MAP_CHUNK) size = MAP_CHUNK;
+			head(&p->h, PKT_MAP_DATA);
+			p->level = g_level;
+			p->file = q->file;
+			p->chunk = q->chunk + k;
+			p->size = size;
+			memcpy(out + sizeof *p, data + k * MAP_CHUNK, size);
+			send_to(out, sizeof *p + size, to);
+		}
+	}
+}
+
+/* -- The joiner's side -- */
+
+static u32 g_dl_level;                 /* the level whose load downloads the host's files first */
+static u32 g_dl_declined;              /* its download failed or was cancelled: not again */
+static WMtWindow *g_dl_lines[2];       /* the two lines under the loading popup's bar */
+static u32 g_req_chunk[DL_SLOTS], g_req_time[DL_SLOTS];   /* piece + 1 asked for last, and when */
+
+static void session_end(const char *why);
+
+/* From the host's LOBBY refusal: reload the level, which downloads first (level_load) */
+static int map_download_start(void)
+{
+	u32 level = g_level;
+
+	if (g_dl_declined == level || !custom_game_level_dir(level)) return 0;
+	log_msg("net: the host's map differs from this PC's: reloading level %d to download it", level);
+	g_dl_level = level;
+	session_end("downloading the host's map");
+	ONrGame_StartLevel(level);
+	return 1;
+}
+
+/* A path below the map's folder that stays in it */
+static int safe_path(const char *s)
+{
+	if (!s[0] || s[0] == '\\') return 0;
+	for (const char *c = s; *c; c++)
+		if (*c == ':' || *c == '/' || (u8)*c < 0x20 || (c[0] == '.' && c[1] == '.')) return 0;
+	return 1;
+}
+
+/* The folders of path (up to its last '\') */
+static void make_dirs(char *path)
+{
+	for (char *c = path + 3; *c; c++) {
+		if (*c != '\\') continue;
+		*c = 0;
+		CreateDirectoryA(path, 0);
+		*c = '\\';
+	}
+}
+
+static int move_file(const char *from, const char *to)
+{
+	char dir[1024];
+	str_cpy(dir, sizeof dir, to);
+	make_dirs(dir);
+	if (MoveFileExA(from, to, 3 /* MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED */)) return 1;
+	log_msg("net: map download: can't move %s to %s", from, to);
+	return 0;
+}
+
+static int find_file(const MapFile *list, u32 n, const char *path)
+{
+	for (u32 i = 0; i < n; i++)
+		if (str_ieq_n(list[i].path, path, MAP_PATH)) return (int)i;
+	return -1;
+}
+
+/* One packet from the host, or 0 */
+static u32 dl_receive(u8 *buf, u32 size)
+{
+	SOCKADDR_IN from;
+	int len, n;
+
+	for (;;) {
+		len = sizeof from;
+		n = recvfrom(g_sock, buf, size, 0, &from, &len);
+		if (n < 0) {
+			if (WSAGetLastError() == 10054) continue;
+			return 0;
+		}
+		const PktHead *h = (const PktHead *)buf;
+		if ((u32)n < sizeof *h || h->magic != MAGIC || h->proto != PROTO) continue;
+		if (from.addr != g_peer.addr || from.port != g_peer.port) continue;
+		g_npackets_recv++;
+		return (u32)n;
+	}
+}
+
+static int g_dl_quit;                  /* WM_QUIT came while downloading: posted again after */
+
+/* Windows messages, and Esc (only while this Oni window has the focus) */
+static int dl_cancelled(void)
+{
+	struct { void *hwnd; u32 msg, wp, lp, time, x, y; } m;
+	u32 pid = 0;
+	void *w;
+
+	while (PeekMessageA(&m, 0, 0, 0, 1 /* PM_REMOVE */)) {
+		if (m.msg == 0x12 /* WM_QUIT */) {
+			g_dl_quit = (int)m.wp | 0x10000;
+			return 1;
+		}
+		TranslateMessage(&m);
+		DispatchMessageA(&m);
+	}
+	if (!(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) return 0;
+	w = GetForegroundWindow();
+	if (w) GetWindowThreadProcessId(w, &pid);
+	return pid == GetCurrentProcessId();
+}
+
+/* The two lines under the bar: copies of the "Loading..." label (the popup's first child with
+ * id 0 that isn't its full-size outline), the bar's width */
+static void dl_lines_create(void)
+{
+	WMtWindow *d = ONgLoadingDialog, *label = 0, *bar;
+
+	g_dl_lines[0] = g_dl_lines[1] = 0;
+	if (!d || !(bar = WMrDialog_GetItemByID(d, 100))) return;
+	for (WMtWindow *w = WIN_FIRSTCHILD(d); w; w = WIN_NEXT(w))
+		if (WIN_ID(w) == 0 && WIN_W(w) < WIN_W(d)) { label = w; break; }
+	if (!label) return;
+	for (int i = 0; i < 2; i++) {
+		WMtWindow *w = WMrWindow_New(WIN_CLASS(label), "", WIN_FLAGS(label), WIN_STYLE(label), 0, WIN_X(bar),
+		                             WIN_Y(bar) + WIN_H(bar) + 8 + i * 22, WIN_W(bar), 20, d, 0);
+		if (!w) return;
+		WMrWindow_SetFontInfo(w, WIN_FONTINFO(label));
+		win_insert_after(w, label);   /* before the outline, which would dim it */
+		g_dl_lines[i] = w;
+	}
+}
+
+static void dl_draw(const char *a, const char *b, u32 percent)
+{
+	WMtWindow *d = ONgLoadingDialog;
+
+	if (g_dl_lines[0]) WMrWindow_SetTitle(g_dl_lines[0], a, 0x100);
+	if (g_dl_lines[1]) WMrWindow_SetTitle(g_dl_lines[1], b, 0x100);
+	if (d) WMrMessage_Send(d, LDcMessage_Progress, percent, 0);
+	M3rFrame_Begin(0);
+	WMrDisplay();
+	M3rFrame_End();
+}
+
+static void dl_lines_hide(void)
+{
+	for (int i = 0; i < 2; i++)
+		if (g_dl_lines[i]) WMrWindow_SetVisible(g_dl_lines[i], 0);
+	dl_draw("", "", 10);   /* where the load's bar was */
+}
+
+/* "12.3MB": the unit by basis (the file's size) */
+static void size_text(char *out, u32 bytes, u32 basis)
+{
+	if (basis >= 1u << 20) fmt(out, "%u.%uMB", bytes >> 20, (bytes & 0xfffff) * 10 >> 20);
+	else if (basis >= 1024) fmt(out, "%u.%uKB", bytes >> 10, (bytes & 0x3ff) * 10 >> 10);
+	else fmt(out, "%uB", bytes);
+}
+
+static void speed_text(char *out, u32 bps)
+{
+	if (bps >= 1u << 20) fmt(out, "%u.%02u MB/s", bps >> 20, (bps & 0xfffff) * 100 >> 20);
+	else if (bps >= 1024) fmt(out, "%u.%02u KB/s", bps >> 10, (bps & 0x3ff) * 100 >> 10);
+	else fmt(out, "%u B/s", bps);
+}
+
+/* Downloads the host's version of the level's folder; 1 when it's in place (or already was) */
+static int map_download(u32 level)
+{
+	static u8 buf[2048];
+	const char *dir = custom_game_level_dir(level), *folder = custom_game_level_folder(level);
+	char stage[MAX_PATH], backup[MAX_PATH], path[1024], to[1024], a[128], b[128], s1[32], s2[32], s3[32];
+	MapFile *theirs, *mine;
+	u8 *need, *moved, *got = 0;
+	u32 ntheirs = 0, nmine = 0, total = 0xffffffffu, their_map = 0, nneed = 0, nextra = 0, need_bytes = 0, biggest = 0;
+	u32 now, last_heard, last_req = 0, last_draw = 0, bytes_all = 0, began;
+	HANDLE out = INVALID_HANDLE_VALUE;
+	const char *why = 0;
+	int ok = 0, cur = -1;
+
+	if (!dir || !folder || !g_have_peer) return 0;
+	theirs = VirtualAlloc(0, 2 * MAP_MAX_FILES * (sizeof(MapFile) + 1), 0x3000, 4);
+	if (!theirs) return 0;
+	mine = theirs + MAP_MAX_FILES;
+	need = (u8 *)(mine + MAP_MAX_FILES);
+	moved = need + MAP_MAX_FILES;
+	fmt(path, "GameDataFolder\\CustomLevels.download\\%s\\", folder);
+	if (!GetFullPathNameA(path, sizeof stage, stage, 0)) str_cpy(stage, sizeof stage, path);
+	fmt(path, "GameDataFolder\\CustomLevels.backup\\%s\\", folder);
+	if (!GetFullPathNameA(path, sizeof backup, backup, 0)) str_cpy(backup, sizeof backup, path);
+	dl_lines_create();
+	log_msg("net: map download: asking the host for its list of %s's files", folder);
+
+	/* 1. the host's list */
+	last_heard = GetTickCount();
+	while (total == 0xffffffffu || ntheirs < total) {
+		u32 n;
+		now = GetTickCount();
+		if (dl_cancelled()) { why = "cancelled"; goto done; }
+		if (now - last_heard > LOST_MS) { why = "the host stopped answering"; goto done; }
+		if (!last_req || now - last_req >= DL_RTO_MS) {
+			PktMapListReq q;
+			head(&q.h, PKT_MAP_LIST_REQ);
+			q.level = level;
+			q.first = ntheirs;
+			send_to_peer(&q, sizeof q);
+			last_req = now ? now : 1;
+		}
+		while ((n = dl_receive(buf, sizeof buf))) {
+			const PktMapList *p = (const PktMapList *)buf;
+			if (p->h.type != PKT_MAP_LIST || n < sizeof *p || p->level != level || p->first != ntheirs ||
+			    p->count > MAP_LIST_PAGE || p->total > MAP_MAX_FILES || p->first + p->count > p->total) continue;
+			total = p->total;
+			their_map = p->map;
+			for (u32 i = 0; i < p->count; i++) {
+				theirs[ntheirs] = p->f[i];
+				theirs[ntheirs].path[MAP_PATH - 1] = 0;
+				if (!safe_path(theirs[ntheirs].path)) { why = "the host sent a path outside the map's folder"; goto done; }
+				ntheirs++;
+			}
+			last_heard = now;
+			last_req = 0;   /* the next page at once */
+		}
+		if (now - last_draw >= DL_DRAW_MS) {
+			dl_draw("Connecting to the host...", "", 10);
+			last_draw = now;
+		} else Sleep(1);
+	}
+
+	/* 2. what differs: files to fetch, and files the host doesn't have */
+	if (!list_tree(dir, "", 0, mine, &nmine)) log_msg("net: map download: couldn't list every file in %s", dir);
+	for (u32 i = 0; i < ntheirs; i++) {
+		int k = find_file(mine, nmine, theirs[i].path);
+		need[i] = k < 0 || mine[k].size != theirs[i].size || mine[k].hash != theirs[i].hash;
+		if (!need[i]) continue;
+		nneed++;
+		need_bytes += theirs[i].size;
+		if (theirs[i].size > biggest) biggest = theirs[i].size;
+	}
+	for (u32 i = 0; i < nmine; i++) nextra += find_file(theirs, ntheirs, mine[i].path) < 0;
+	log_msg("net: map download: the host's map has %d files; %d to download (%u bytes), %d here that it doesn't have",
+	        ntheirs, nneed, need_bytes, nextra);
+	got = VirtualAlloc(0, biggest / MAP_CHUNK / 8 + 1, 0x3000, 4);
+	if (!got) { why = "out of memory"; goto done; }
+
+	/* 3. each file, into the download folder */
+	began = GetTickCount();
+	for (u32 i = 0, left = nneed; i < ntheirs; i++) {
+		const MapFile *m = &theirs[i];
+		u32 chunks = (m->size + MAP_CHUNK - 1) / MAP_CHUNK, lo = 0, win = 64, grown_at = 0, last_loss = 0, done_bytes = 0;
+		if (!need[i]) continue;
+		fmt(path, "%s%s", stage, m->path);
+		make_dirs(path);
+		out = CreateFileA(path, 0x40000000 /* GENERIC_WRITE */, 1, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+		if (out == INVALID_HANDLE_VALUE) { why = "can't write to GameDataFolder\\CustomLevels.download"; goto done; }
+		cur = (int)i;
+		memset(got, 0, chunks / 8 + 1);
+		memset(g_req_chunk, 0, sizeof g_req_chunk);
+		last_heard = last_draw = 0;
+		last_heard = GetTickCount();
+		while (lo < chunks) {
+			u32 n, end, run = 0, run_start = 0;
+			int lost = 0, heard = 0;
+			now = GetTickCount();
+			if (dl_cancelled()) { why = "cancelled"; goto done; }
+			if (now - last_heard > LOST_MS) { why = "the host stopped answering"; goto done; }
+			while ((n = dl_receive(buf, sizeof buf))) {
+				const PktMapData *p = (const PktMapData *)buf;
+				u32 w;
+				if (p->h.type != PKT_MAP_DATA || n < sizeof *p || p->level != level || p->file != i || p->chunk >= chunks ||
+				    (got[p->chunk >> 3] & (1 << (p->chunk & 7)))) continue;
+				if (p->size != (p->chunk + 1 < chunks ? MAP_CHUNK : m->size - p->chunk * MAP_CHUNK) || n < sizeof *p + p->size) continue;
+				SetFilePointer(out, (int)(p->chunk * MAP_CHUNK), 0, 0 /* FILE_BEGIN */);
+				if (!WriteFile(out, buf + sizeof *p, p->size, &w, 0) || w != p->size) { why = "can't write the file (disk full?)"; goto done; }
+				got[p->chunk >> 3] |= 1 << (p->chunk & 7);
+				done_bytes += p->size;
+				bytes_all += p->size;
+				heard = 1;
+			}
+			if (heard) last_heard = now;
+			while (lo < chunks && (got[lo >> 3] & (1 << (lo & 7)))) lo++;
+			if (lo - grown_at >= win) {
+				win = win + 32 > DL_WINDOW_MAX ? DL_WINDOW_MAX : win + 32;
+				grown_at = lo;
+			}
+			/* ask for the pieces in the window not asked for yet, or not here DL_RTO_MS later */
+			end = lo + win < chunks ? lo + win : chunks;
+			for (u32 c = lo; c < end; c++) {
+				u32 slot = c % DL_SLOTS;
+				int due = !(got[c >> 3] & (1 << (c & 7))) &&
+				          (g_req_chunk[slot] != c + 1 || now - g_req_time[slot] >= DL_RTO_MS);
+				if (due) {
+					if (g_req_chunk[slot] == c + 1) lost = 1;
+					if (!run) run_start = c;
+					run++;
+					g_req_chunk[slot] = c + 1;
+					g_req_time[slot] = now;
+				}
+				if (run && (!due || run == MAP_REQ_MAX || c + 1 == end)) {
+					PktMapReq q;
+					head(&q.h, PKT_MAP_REQ);
+					q.level = level;
+					q.file = i;
+					q.chunk = run_start;
+					q.count = run;
+					send_to_peer(&q, sizeof q);
+					run = 0;
+				}
+			}
+			if (lost && now - last_loss >= DL_RTO_MS) {
+				win = win / 2 < DL_WINDOW_MIN ? DL_WINDOW_MIN : win / 2;
+				grown_at = lo;
+				last_loss = now;
+			}
+			if (now - last_draw >= DL_DRAW_MS) {
+				u32 ms = now - began ? now - began : 1;
+				size_text(s1, done_bytes, m->size);
+				size_text(s2, m->size, m->size);
+				speed_text(s3, bytes_all / ms * 1000 + bytes_all % ms * 1000 / ms);
+				fmt(a, "Downloading (%d/%d)", left, ntheirs);
+				fmt(b, "%s of %s (%s)", s1, s2, s3);
+				dl_draw(a, b, done_bytes / (m->size / 100 + 1) > 100 ? 100 : done_bytes / (m->size / 100 + 1));
+				last_draw = now;
+			} else if (!heard) {
+				Sleep(1);
+			}
+		}
+		CloseHandle(out);
+		out = INVALID_HANDLE_VALUE;
+		if (hash_file(path) != m->hash) { why = "a file arrived damaged"; goto done; }
+		log_msg("net: map download: got %s (%u bytes)", m->path, m->size);
+		left--;
+	}
+	cur = -1;
+
+	/* 4. the old files out of the folder (to the backup), the new ones in */
+	for (u32 i = 0; i < nmine; i++) {
+		int k = find_file(theirs, ntheirs, mine[i].path);
+		moved[i] = 0;
+		if (k >= 0 && !need[k]) continue;
+		fmt(path, "%s%s", dir, mine[i].path);
+		fmt(to, "%s%s", backup, mine[i].path);
+		if (!move_file(path, to)) {   /* put back what moved, and leave the map as it was */
+			for (u32 j = 0; j < i; j++) {
+				if (!moved[j]) continue;
+				fmt(path, "%s%s", backup, mine[j].path);
+				fmt(to, "%s%s", dir, mine[j].path);
+				move_file(path, to);
+			}
+			why = "the map's files are in use";
+			goto done;
+		}
+		moved[i] = 1;
+	}
+	for (u32 i = 0; i < ntheirs; i++) {
+		if (!need[i]) continue;
+		fmt(path, "%s%s", stage, theirs[i].path);
+		fmt(to, "%s%s", dir, theirs[i].path);
+		if (!move_file(path, to)) {
+			log_msg("net: map download: the map's folder is half updated; its old files are in %s", backup);
+			why = "can't move the downloaded files into the map's folder";
+			goto done;
+		}
+	}
+	if (!custom_game_remount(level)) log_msg("net: map download: couldn't mount the new files");
+	g_map_hash = hash_map(level);
+	log_msg("net: map download: done, %u bytes in %u ms; old files in %s; the map's files are now %08x (the host's %08x%s)",
+	        bytes_all, GetTickCount() - began, backup, g_map_hash, their_map, g_map_hash == their_map ? "" : ", still different");
+	g_problem = 0;
+	ok = 1;
+
+done:
+	if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+	if (!ok) {
+		log_msg("net: map download of level %d stopped: %s; this PC keeps its own version", level, why ? why : "?");
+		for (u32 i = 0; i < ntheirs && cur >= 0; i++) {   /* the downloaded files, left in the download folder */
+			if (!need[i]) continue;
+			fmt(path, "%s%s", stage, theirs[i].path);
+			DeleteFileA(path);
+			if ((int)i == cur) break;
+		}
+	}
+	dl_lines_hide();
+	if (got) VirtualFree(got, 0, 0x8000 /* MEM_RELEASE */);
+	VirtualFree(theirs, 0, 0x8000);
+	if (g_dl_quit) {
+		PostQuitMessage(g_dl_quit & 0xffff);
+		g_dl_quit = 0;
+	}
+	return ok;
+}
+
+/* The level load's TMrLevel_Load call: the host's files first when they're wanted */
+static u16 ONI_FC level_load(u32 level, u32 edx)
+{
+	u32 l = g_dl_level;
+
+	if (l && (level & 0xff) == l) {
+		g_dl_level = 0;
+		if (!map_download(l)) g_dl_declined = l;
+	}
+	return TMrLevel_Load(level, edx);
+}
+
 static void begin_run(void);
 static int net_open(void);
 
@@ -754,6 +1359,10 @@ static void receive(void)
 				log_msg("net: packet of protocol %d from the %s, this is %d: use the same Arklite.dll on both PCs", h->proto,
 				        g_mode == NET_HOST ? "joiner" : "host", PROTO);
 			refuse(g_mode == NET_HOST ? "joiner" : "host", NETBAD_PROTO, 0);
+			continue;
+		}
+		if (g_mode == NET_HOST && (h->type == PKT_MAP_LIST_REQ || h->type == PKT_MAP_REQ)) {
+			map_serve(buf, n, &from);
 			continue;
 		}
 
@@ -814,6 +1423,8 @@ static void receive(void)
 			if (g_state != S_LOBBY || p->level != g_level) continue;
 			if (p->refused) {   /* the host keeps this PC out: nothing else in it counts */
 				refuse("host", p->refused, 0);
+				/* only the map differs and the host can send it: reload, downloading it first */
+				if (p->refused == NETBAD_MAP && p->map_offer) map_download_start();
 				continue;
 			}
 			if (!g_host_heard) log_msg("net: in the host's lobby");
@@ -853,6 +1464,13 @@ static void receive(void)
 			g_last_recv = GetTickCount();
 			if (!g_ninputs_recv++) log_msg("net: first input from the %s", g_mode == NET_HOST ? "joiner" : "host");
 			on_input((const PktInput *)buf, n);
+		} else if (h->type == PKT_NAME && (u32)n >= sizeof(PktName)) {
+			if (!g_have_peer || from.addr != g_peer.addr || from.port != g_peer.port) continue;
+			const PktName *p = (const PktName *)buf;
+			char name[MP_NAME_MAX];
+			memcpy(name, p->name, sizeof name);
+			name[sizeof name - 1] = 0;
+			mp_name_set_peer(name);
 		} else if (h->type == PKT_BYE && g_state == S_RUN) {
 			log_msg("net: the %s left; their player stands still", g_mode == NET_HOST ? "joiner" : "host");
 			g_state = S_LOST;
@@ -1158,6 +1776,7 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 
 	receive();
 	now = GetTickCount();   /* after receive(), which stamps g_last_recv: now - g_last_recv mustn't wrap */
+	if (g_have_peer && (g_name_sent != mp_name_serial() || now - g_last_name >= NAME_MS)) send_name();
 	u32 wanted = GS_SERVER_TIME(gs) - GS_TICK(gs);
 	if (wanted > 6) wanted = 6;
 
@@ -1510,6 +2129,11 @@ static int net_open(void)
 		return 0;
 	}
 	ioctlsocket(g_sock, FIONBIO, &on);
+	{   /* room for a map download's bursts (Windows' default is 64 KB) */
+		int rcv = 4 << 20, snd = 1 << 20;
+		setsockopt(g_sock, 0xffff /* SOL_SOCKET */, 0x1002 /* SO_RCVBUF */, &rcv, 4);
+		setsockopt(g_sock, 0xffff, 0x1001 /* SO_SNDBUF */, &snd, 4);
+	}
 	g_images = VirtualAlloc(0, HASH_SLOTS * IMG_CHARS * sizeof(CharImage), 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
 	if (g_mode == NET_JOIN) {
 		if (!resolve(g_join, &g_peer)) {
@@ -1561,6 +2185,8 @@ void net_install(void)
 	        g_mode == NET_HOST ? "hosting" : "joining", g_delay, g_mode == NET_HOST ? "joiner" : "host");
 	hash_files();
 	if (g_mode == NET_JOIN) view_install();
+	if (g_mode == NET_JOIN && patch_call(ONcLevelLoad_TMCall, (u32)TMrLevel_Load, (u32)level_load))
+		log_msg("net: a map that differs from the host's is downloaded while the level loads");
 	sounds_install();
 	/* a second Oni on the same PC, for testing: skip "There is already an instance". Daodan
 	 * replaces Oni's platform setup (0x50f670) with DD_ONrPlatform_Initialize, which checks

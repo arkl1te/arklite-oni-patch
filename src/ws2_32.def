@@ -12,3 +12,4 @@ EXPORTS
   htons@4
   ntohs@4
   gethostbyname@4
+  setsockopt@20

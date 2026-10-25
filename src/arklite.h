@@ -74,6 +74,8 @@ int  parse_float(const char **s, float *out);  /* "-12.5": advances *s; 0 if no 
 void custom_game_install(void);
 const char *custom_game_level_ini(u32 level);   /* level.ini of the custom level in that slot, or 0 */
 const char *custom_game_level_dir(u32 level);   /* that level's folder (ends with '\'), or 0 */
+const char *custom_game_level_folder(u32 level); /* that folder's name in CustomLevels, or 0 */
+int  custom_game_remount(u32 level);             /* list its files again and mount them (net.c's map download) */
 
 /* ---- volume.c ----------------------------------------------------------------------------- */
 
@@ -163,6 +165,20 @@ enum { MP_LEFT, MP_CENTER, MP_RIGHT };
 void mp_hud_text(const char *s, int x, int y, int align, u32 color);   /* only while the HUD draws */
 int  mp_hud_line_height(void);
 
+/* ---- mp_names.c -------------------------------------------------------------------------- */
+
+#define MP_NAME_MAX 24
+void mp_names_install(void);   /* Arklite.ini [multiplayer] name, [players] p2_name */
+const char *mp_name(int who);  /* 0: Konoko (the host), 1: player 2 (the joiner) */
+const char *mp_name_local(void);          /* this PC's player's */
+u32  mp_name_serial(void);                /* changes with this PC's name */
+void mp_name_set_peer(const char *name);  /* net.c: the other PC's player's */
+int  mp_name_editing(void);               /* typed in the F2 menu */
+void mp_name_edit_begin(void);
+void mp_name_edit_end(int keep);          /* keep: saved in Arklite.ini */
+const char *mp_name_edit_text(void);      /* what's typed so far (the name when not editing) */
+void mp_names_draw(int width, int height);   /* from the HUD: the name of the player faced */
+
 /* ---- char_menu.c ------------------------------------------------------------------------- */
 
 /* Word 11 of an action record (never read by the tick): PLAYERS_CHOICE_TAG | (ONCC instance
@@ -183,6 +199,7 @@ const u32 *players_begin_frame(void);         /* player 2's record for this fram
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
 void players_net_frame(const u32 (*records)[12], u32 n);   /* networked: tick i gets records[i] */
 u8  *players_p2(void);                        /* player 2's character, or 0 */
+u8  *players_char(int who);                   /* 0: Konoko, 1: player 2; or 0 */
 void players_note_hit(u8 *victim, u8 *attacker);   /* from TakeDamage, in a tick */
 int  players_can_change(int who);            /* alive: an F2 choice applies at once */
 int  players_score(int who);                  /* 0: Konoko (player 1), 1: player 2 */
