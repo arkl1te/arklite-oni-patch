@@ -21,6 +21,7 @@ Interactive or Rockstar, and it contains no Oni code or data: you need your own 
 | Live pause menu | In a game with player 2, Esc opens the pause menu but the game keeps running behind it: enemies keep fighting and Konoko stands still until you resume. Single player pauses as in the original. |
 | 255 characters, all active | Raises the character limit from 128 to 255, and the active-character and shadow limits (64 and 32) to 255 too, so big fights no longer crash the game. |
 | No tiny strikers outside the dream lab | Randomized enemies no longer pick the dream lab's half-size striker (or its giant Shinatama). AE moved those classes into the shared `level0`, so about one random striker in four came out tiny. |
+| No skybox seams | The sky no longer shows black lines along the edges and corners of the skybox. |
 | Player 2 on a gamepad | A second character with the IsPlayer flag in a level is played on an XInput gamepad, next to Konoko on keyboard and mouse. See [Player 2](#player-2). |
 | Determinism fixes | Ambient sounds, particles and speech no longer depend on the frame rate, the sound card or what is drawn, so the same input always gives the same game. Multiplayer needs this; in normal play you won't notice a difference. |
 | Input record and replay | For testing: records a level's input and replays it, checking every tick that the game came out the same. Off unless `ARKLITE_RECORD` or `ARKLITE_REPLAY` is set. See [Record and replay](#record-and-replay). |
@@ -107,7 +108,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `delay` | 4 | Input delay in ticks (1/60 s each). The host's value is used on both PCs; raise it if the game stutters over a slow connection |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
-| | `characters` | 16 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24) |
+| | `characters` | 14 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24) |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 

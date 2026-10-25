@@ -54,7 +54,7 @@ static float g_anchor_x, g_anchor_y;   /* the line's top-left, which stays put *
 static u32 ONI_FC text_sprite(const float *pts, const void *uv)
 {
 	float p[8];
-	if (!g_scaling) return M3rDraw_Sprite(pts, uv);
+	if (!g_scaling) return hud_text_sprite(pts, uv);   /* Oni's text: HUD scale (hud_scale.c) */
 	for (int i = 0; i < 8; i++) p[i] = pts[i];
 	for (int k = 0; k < 8; k += 4) {
 		p[k] = g_anchor_x + (p[k] - g_anchor_x) * TEXT_SCALE;
@@ -151,7 +151,7 @@ static void ONI_FC timer_display(void *timer)
 	int width, height;
 	u32 color;
 
-	ONrTimer_Display(timer);
+	hud_timer_display(timer);   /* Oni's timer, scaled with the HUD */
 	if (!ctx || !ONgGameState || !ONrLevel_GetCurrent()) return;
 	net_hud(&h);
 	if (h.state == NETHUD_OFF && !(multiplayer_active() && multiplayer_map())) return;

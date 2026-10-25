@@ -28,6 +28,8 @@
  *   - Sound, Music and Voice volume (volume.c): Options > Overall Volume becomes three sliders.
  *   - No dream-lab classes in random costumes (random_class.c): AE's shared level0 put the
  *     half-size striker_dream_lab in every level's striker_easy random pool.
+ *   - No skybox seams (texture_clamp.c): clamped textures use GL_CLAMP_TO_EDGE, not GL_CLAMP,
+ *     whose black border lined every edge of the skybox cube.
  *   - 255 characters, all active at once (char_limit.c): the stock 64 active slots crash the
  *     game when more AIs than that go into combat.
  *   - Player 2 on a gamepad (players.c): multiplayer step 2.
@@ -37,6 +39,8 @@
  *   - Input record and replay (lockstep.c): the determinism test for multiplayer.
  *   - Two PCs over UDP (net.c): multiplayer step 3, lockstep with input delay; a lobby where F3
  *     readies up, a 7 s countdown, then the match. On-screen text and score (mp_hud.c).
+ *   - Flickering and pulsing vertex lights in custom levels (vertex_light.c): Catwalk's
+ *     vertexlight.bin, applied to the level's quad colors every frame.
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
 #include "arklite.h"
@@ -146,6 +150,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	volume_install();
 	hud_scale_install();
 	random_class_install();
+	texture_clamp_install();
 	char_limit_install();
 	players_install();
 	items_install();

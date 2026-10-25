@@ -181,6 +181,7 @@ static void main_loop_sound(void)
 	SSrUpdate();
 	if (multiplayer_active()) *gs_field(GS_PAUSED) = 0;
 	char_menu_frame();
+	vertex_light_frame();
 	if (g_pending) {
 		g_pending = 0;
 		g_menu_level = ONrLevel_GetCurrent();

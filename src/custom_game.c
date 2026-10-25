@@ -376,6 +376,13 @@ static u32 prepare_save_point(const CustomLevel *cl, u32 slot, u32 sp)
 		log_msg("save point %d: using level %d's saved game", (int)sp, (int)cl->source);
 		return sp;
 	}
+	/* Level 1's save point 0 is Combat Training; save point 1 is the Warehouse start, which
+	 * Catwalk uses as "beginning". Its script places Konoko itself, and restore_game
+	 * (0x4fd8b0) just logs "invalid save" when there's nothing to restore. */
+	if (cl->source == 1 && sp == 1) {
+		log_msg("save point 1: no saved game, starting level 1 after Combat Training");
+		return sp;
+	}
 	log_msg("save point %d: no saved game in slot %d or level %d; starting from the beginning",
 	        (int)sp, (int)slot, (int)cl->source);
 	return 0;

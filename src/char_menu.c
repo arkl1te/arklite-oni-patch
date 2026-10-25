@@ -20,13 +20,19 @@
  * on every PC with the same game files (net.c compares level0's hash).
  *
  * Roster: Arklite.ini [multiplayer] characters = class names separated by commas (level0 ONCC
- * names, e.g. konoko_generic); the default is 16 of the game's characters. Classes that aren't
+ * names, e.g. konoko_generic); the default is 14 of the game's characters. Classes that aren't
  * loaded or don't have the 19-part biped body are left out.
  *
  * Pictures: rendered once in software, the first time the menu opens, from the class's own
  * data in memory, then kept as textures:
- *   - pose: frame 0 of Konoko's idle (TRAM KONOKOidle1; every biped shares the 19 bones), its
- *     rotations from 0x427810 (ECX animation, EDX frame, [quaternions out], ret 4) and the bone
+ *   - pose: each class's own fighting stance or taunt, from its animation collection (ONCC +0xc80
+ *     the TRAC: +0x10 the parent collection, +0x16 the entry count, entries of 12 bytes from
+ *     +0x18 with the TRAM at +8, as 0x42c1b0 walks them), the class's own entries before its
+ *     parents'. Wanted, in order: <xxx>COMtaunt1, taunt2, then COMidle1-4 (the stance); each
+ *     class takes the first one no class before it in the roster took, so characters that share
+ *     moves (Griffin and Comguy) still stand differently. A taunt is shown at 55% of its frames
+ *     (TRAM +0x164 the frame count), a stance at frame 0. Without any, Konoko's idle (KONOKOidle1;
+ *     every biped shares the 19 bones). The rotations come from 0x427810 (ECX animation, EDX frame, [quaternions out], ret 4) and the bone
  *     matrices from 0x4274c0 (ECX body, EDX attachments or 0, [quaternions], [root matrix],
  *     [bone mask], [matrices out], ret 0x10), what the game's own character update uses (call
  *     at 0x4e5bdf). Matrices are 4x3, column-major: p' = m0*x + m3*y + m6*z + m9.
@@ -85,6 +91,11 @@ __declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
 #define TRCM_PARTS(b)           (*(u16 *)((b) + 4))
 #define TRCM_GEOMETRY(b)        (*(u8 ***)((b) + 0x48))
 #define TRAM_BONES(a)           (*(u16 *)((u8 *)(a) + 0x162))
+#define TRAM_FRAMES(a)          (*(u16 *)((u8 *)(a) + 0x164))
+#define ONCC_ANIMATIONS(c)      (*(u8 **)((c) + 0xc80))      /* TRAC */
+#define TRAC_PARENT(t)          (*(u8 **)((t) + 0x10))
+#define TRAC_COUNT(t)           (*(u16 *)((t) + 0x16))
+#define TRAC_ANIMATION(t, i)    (*(void **)((t) + 0x20 + 12 * (i)))
 #define TXMP_FLAGS(t)           (*(u32 *)((t) + 0x80))
 #define TXMP_W(t)               (*(u16 *)((t) + 0x84))
 #define TXMP_H(t)               (*(u16 *)((t) + 0x86))
@@ -119,16 +130,15 @@ __declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
 #define GREY    0xffb0b0b0u
 
 static const char g_default_roster[] =
-	"konoko_generic,griffin_generic,muro_generic,mutantmuro,barabus,SH_generic,ninja_med_1,"
-	"striker_med_1,tanker_med_1,comguy_1,elite_med_1,red_med_1,TCTF_swat_1,Cop_generic,"
-	"thug_wh_1,sniper_generic";
+	"konoko_generic,griffin_generic,muro_generic,barabus,ninja_med_1,striker_med_1,tanker_med_1,"
+	"comguy_1,elite_med_1,red_med_1,TCTF_swat_1,Cop_generic,thug_wh_1,sniper_generic";
 static const char *const g_labels[][2] = {
 	{ "konoko_generic", "Konoko" }, { "griffin_generic", "Griffin" }, { "muro_generic", "Muro" },
 	{ "mutantmuro", "Mutant Muro" }, { "barabus", "Barabas" }, { "SH_generic", "Shinatama" },
 	{ "ninja_med_1", "Ninja" }, { "striker_med_1", "Striker" }, { "tanker_med_1", "Tanker" },
 	{ "comguy_1", "Comguy" }, { "elite_med_1", "Elite" }, { "red_med_1", "Red" },
 	{ "TCTF_swat_1", "TCTF SWAT" }, { "Cop_generic", "Cop" }, { "thug_wh_1", "Thug" },
-	{ "sniper_generic", "Sniper" },
+	{ "sniper_generic", "Sniper" }, { "security_guard_1", "Security Guard" },
 };
 
 typedef struct {
@@ -136,6 +146,8 @@ typedef struct {
 	const char *label;
 	u8 *oncc;
 	u32 number;                 /* among the loaded ONCCs */
+	void *pose;                 /* TRAM, 0: Konoko's idle */
+	u32 frame;
 	u8 *picture;                /* texture, 0: not rendered (or failed) */
 	int x, y, w, h;             /* the cell, from the last draw */
 } Entry;
@@ -415,7 +427,7 @@ static int render(Entry *e, u16 *out, int pitch, int w, int h)
 	u32 first[PARTS + 1], total = 0;
 	View v;
 
-	TRrAnimation_GetRotations(g_idle, 0, &quats[0][0]);
+	TRrAnimation_GetRotations(e->pose ? e->pose : g_idle, e->pose ? e->frame : 0, &quats[0][0]);
 	TRrBody_BuildMatrices(body, 0, &quats[0][0], root, 0xffffffffu, &g_mats[0][0]);
 	for (int i = 0; i < PARTS; i++) {
 		first[i] = total;
@@ -505,6 +517,38 @@ static int render(Entry *e, u16 *out, int pitch, int w, int h)
 	return 1;
 }
 
+/* The class's own stance or taunt (see the top), one no earlier class in the roster took */
+static void pick_pose(Entry *e, int index)
+{
+	static const char *const wanted[] = { "COMtaunt1", "COMtaunt2", "COMidle1", "COMidle2", "COMidle3", "COMidle4" };
+	void *found[16];
+	int n = 0;
+
+	e->pose = 0;
+	e->frame = 0;
+	for (u8 *trac = ONCC_ANIMATIONS(e->oncc); trac && n < 16; trac = TRAC_PARENT(trac))
+		for (u32 w = 0; w < sizeof wanted / sizeof wanted[0]; w++)
+			for (u32 i = 0; i < TRAC_COUNT(trac) && n < 16; i++) {
+				void *a = TRAC_ANIMATION(trac, i);
+				const char *name = a ? TMrInstance_GetInstanceName(a) : 0;
+				if (name && str_len(name) > 3 && str_ieq_n(name + 3, wanted[w], 64) &&
+				    TRAM_BONES(a) == PARTS && TRAM_FRAMES(a)) {
+					found[n++] = a;
+					break;
+				}
+			}
+	for (int k = 0; k < n && !e->pose; k++) {
+		int taken = 0;
+		for (int j = 0; j < index; j++) taken |= g_roster[j].pose == found[k];
+		if (!taken) e->pose = found[k];
+	}
+	if (!e->pose && n) e->pose = found[0];
+	if (!e->pose) return;
+	const char *name = TMrInstance_GetInstanceName(e->pose);
+	if (str_contains_i(name, "taunt")) e->frame = TRAM_FRAMES(e->pose) * 55 / 100;
+	log_msg("char menu: %s posed as %s, frame %u of %u", e->cls, name, e->frame, TRAM_FRAMES(e->pose));
+}
+
 static void render_all(int w, int h)
 {
 	static int serial;
@@ -521,6 +565,7 @@ static void render_all(int w, int h)
 		char name[64];
 		e->picture = 0;
 		if (!g_idle) continue;
+		pick_pose(e, i);
 		fmt(name, "arklite_char_%d", serial++);
 		u8 *t = texture_new(w, h, name);
 		if (!t) continue;
