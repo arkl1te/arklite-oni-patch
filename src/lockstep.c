@@ -51,6 +51,15 @@
  *     noted where the vectors are made: 0x440f48, 0x440fa0, 0x440ff8). Marking itself is as
  *     before: an earlier fix that just stopped marking past the room made long queries (the
  *     beam weapon's) test the same entries over and over.
+ *   - The particle update (0x45c830: ECX time in ticks, DL 1 = the tick's classes) runs twice:
+ *     in the tick for the classes without flag 1 (class +4), and once per frame after the
+ *     frame's ticks (0x4fb1c7, DL 0) for those with it (Bungie's decorative ones), stepping
+ *     them by however many ticks that frame ran. Some of them hurt characters (their damage
+ *     goes through TakeDamage outside the tick), so at different frame rates the same hit did
+ *     different damage (a network game: 1 point on the host at 166 fps, 3 on the joiner at
+ *     60 fps). Every tick now runs that update for its own time, inside the tick (so it draws
+ *     from the tick's RNG streams); the per-frame call then finds its time reached and does
+ *     nothing.
  *
  * While recording or replaying, both RNGs keep their callers: each tick stores the return
  * addresses of the calls since the last tick (bit 31: outside a tick, bit 30: tick local
@@ -61,7 +70,9 @@
 #define ONcGameState_UpdateCall 0x4d472b
 #define ONrGameState_Tick   ((void (ONI_FC *)(void *))0x4fa6a0)
 #define ONcGameState_TickCall 0x4fb133
-#define ONgGameState        (*(u8 **)0x5ece7c)
+#define P3rUpdate           ((void (ONI_FC *)(u32, u32))0x45c830)   /* time, DL all classes */
+#define P3cFrameUpdateCall  0x4fb1c7                   /* per-frame update, DL 0 */
+#define ONgGameState       (*(u8 **)0x5ece7c)
 #define UUrRandom           0x426e10                   /* u16 from the game LCG at 0x5326d4 */
 #define UUrLocalRandom      0x426e30                   /* u16 from the effects LCG at 0x5326d8 */
 #define UUgRandomSeed       (*(u32 *)0x5326d4)
@@ -360,6 +371,24 @@ static void local_rng_install(void)
 	}
 	for (u32 i = 0; i < n; i++) patch_call(modal_sites[i], (u32)WMrDialog_ModalBegin, (u32)modal_begin);
 	log_msg("local RNG: ticks have their own stream, drawing and dialogs keep the original");
+}
+
+/* ---- Per-frame particles ---------------------------------------------------------------- */
+
+static int g_frame_particles;   /* the tick hook runs the per-frame particle update */
+
+static void frame_particles_install(void)
+{
+	/* mov eax,[0x5ece7c]; xor dl,dl; mov ecx,[eax+0x144]; call 0x45c830 */
+	static const u8 site[] = { 0xa1, 0x7c, 0xce, 0x5e, 0x00, 0x32, 0xd2, 0x8b, 0x88, 0x44, 0x01, 0x00, 0x00, 0xe8 };
+	const u32 at = P3cFrameUpdateCall - 13;
+
+	if (!code_matches(at, site, sizeof site) || P3cFrameUpdateCall + 5 + *(u32 *)(P3cFrameUpdateCall + 1) != (u32)P3rUpdate) {
+		log_msg("particles: 0x%x changed, decorative particles still step per frame", P3cFrameUpdateCall);
+		return;
+	}
+	g_frame_particles = 1;
+	log_msg("particles: decorative particles step once per tick, not per frame");
 }
 
 /* ---- Speech ----------------------------------------------------------------------------- */
@@ -847,6 +876,7 @@ static void ONI_FC tick_hook(void *action)
 	g_in_tick = 1;
 	players_tick_record(action);   /* Konoko's F2 choice */
 	ONrGameState_Tick(action);
+	if (g_frame_particles) P3rUpdate(GS_TICK(ONgGameState) + 1, 0);   /* as the tick's own (0x4fa9bd) */
 	g_in_tick = 0;
 	net_tick_done();
 	if (g_session != SESSION_RUN) return;
@@ -942,6 +972,7 @@ void lockstep_install(void)
 	if (tick_ok) {
 		patch_call(ONcGameState_TickCall, (u32)ONrGameState_Tick, (u32)tick_hook);
 		local_rng_install();
+		frame_particles_install();
 	} else {
 		log_msg("local RNG: game tick call changed, skipped");
 	}
