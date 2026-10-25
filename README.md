@@ -98,6 +98,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `pause_music` | `keep` | `keep` (level music goes on), `theme` (original menu theme) or `silence` |
 | `[volume]` | `sound`, `music`, `voice` | Overall Volume | 0–100 each; a missing key starts at your old Overall Volume |
 | `[players]` | `p2` | 1 | 0: no player 2 |
+| | `p2_name` | Player 2 | Player 2's name, shown in the score and over their head |
 | | `p2_pad` | 0 | Which gamepad plays player 2, 0–3 |
 | | `p2_aim_speed` | 8 | Aim per tick at full right stick |
 | | `p2_invert_y` | 0 | 1: invert the right stick's up/down |
@@ -108,7 +109,8 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `delay` | 4 | Input delay in ticks (1/60 s each). The host's value is used on both PCs; raise it if the game stutters over a slow connection |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
-| | `characters` | 14 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24) |
+| | `characters` | 14 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
+| | `name` | Player | Your name in multiplayer games. You can also change it in the **F2** menu, which saves it here |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 
@@ -188,6 +190,13 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
   weapons and items; if you're dead, you come back as that character when you respawn. Every character gets the health the map gives
   Konoko, so a Thug is as tough as a Muro. Your player stands still while the menu is open. The list can be changed
   with `characters` in `[multiplayer]`.
+- **Variations**: most characters have other versions of themselves (Konoko's outfits, the
+  Strikers' colors, the thug gangs). Press Q/E (or Page Up/Down), or click the `<  2 / 7  >` line
+  under a character, to see them, then choose as usual.
+- **Your name**: the F2 menu shows it under its title. Press Tab or click it, type a new one
+  (up to 23 letters), and press Enter to keep it (Esc puts the old one back). It's saved, so
+  you keep it next time. The score shows everyone's name, and when you look straight at
+  another player, their name appears over their head.
 - **Free for all**: players can hit, shoot and throw each other, though they're all on Konoko's
   team. AI characters keep their usual teams.
 - **Damage is x1.25**: every hit on a character does a quarter more (rounded).
@@ -234,7 +243,12 @@ Both need the same Arklite, the same AE and the same map, and must start it the 
 The host checks this when someone joins: if the two PCs' Arklite, Daodan, `daodan.ini`
 gameplay settings, `level0_Final` files or map folder (`GameDataFolder/CustomLevels/<map>`) aren't
 identical, the joiner stays out of the lobby and both screens say in red what differs. Copy
-that file or folder from one PC to the other and join again. Arklite counts as the same when it
+that file or folder from one PC to the other and join again.
+When only the map folder differs, the joiner downloads the host's version instead: the level
+reloads, and its loading box shows `Downloading (files left/files in the map)` and the current
+file's progress and speed. Esc cancels. The joiner's old files go to
+`GameDataFolder/CustomLevels.backup/<map>`. This works for maps in `CustomLevels`, and the joiner
+must already have the map's folder. Arklite counts as the same when it
 was built from the same source: a release download and your own build of that release's commit
 can play together. The joiner uses the host's
 `respawn_delay` and `item_respawn`.

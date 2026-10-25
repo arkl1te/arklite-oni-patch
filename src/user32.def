@@ -7,3 +7,9 @@ EXPORTS
   GetCursorPos@4
   ScreenToClient@8
   GetClientRect@8
+  SetWindowLongA@12
+  CallWindowProcA@20
+  PeekMessageA@20
+  TranslateMessage@4
+  DispatchMessageA@4
+  PostQuitMessage@4

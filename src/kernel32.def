@@ -26,3 +26,8 @@ EXPORTS
   GetTickCount@0
   GetPrivateProfileSectionA@16
   GetCurrentProcessId@0
+  CreateDirectoryA@8
+  MoveFileExA@12
+  DeleteFileA@4
+  SetFilePointer@16
+  Sleep@4

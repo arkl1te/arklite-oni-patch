@@ -645,6 +645,8 @@ static u8 *player_char(int who)
 	return player2_valid() ? character(g_p2) : 0;
 }
 
+u8 *players_char(int who) { return player_char(who); }
+
 static int player_of(u8 *c)
 {
 	if (!c) return -1;

@@ -18,7 +18,8 @@
  * Lobby: "Press F3 to be ready" in red, or "Press F3 to be unready" in green, and under it who
  * is ready or the countdown, until the match starts; in red under that, what keeps a joiner out
  * (the two PCs' files differ, net.c). Match (or a two-player game on one PC): the score in the
- * top right corner, this PC's player in yellow, and "Out of sync" when a state check failed. The F2 character menu
+ * top right corner with the players' names (mp_names.c), this PC's player in yellow, the name of
+ * the player this PC's player faces over their head, and "Out of sync" when a state check failed. The F2 character menu
  * (char_menu.c) is drawn last, over all of it. */
 #include "arklite.h"
 
@@ -138,7 +139,7 @@ static void draw_score(int local, int width)
 	int x = width - 24, y = 24;
 
 	for (int who = 0; who < 2; who++) {
-		fmt(line, local == who ? "Player %d (you)   %d" : "Player %d   %d", who + 1, players_score(who));
+		fmt(line, local == who ? "%s (you)   %d" : "%s   %d", mp_name(who), players_score(who));
 		text(line, x, y, RIGHT, local == who ? YELLOW : WHITE);
 		y += g_line_height + 2;
 	}
@@ -165,6 +166,7 @@ static void ONI_FC timer_display(void *timer)
 	else if (h.state == NETHUD_STARTING) text("Starting the match...", width / 2, height / 5, CENTER, WHITE);
 	else draw_score(h.state == NETHUD_MATCH ? h.local_player : -1, width);
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) draw_problem(&h, width, height);
+	if (h.state != NETHUD_LOBBY && h.state != NETHUD_STARTING) mp_names_draw(width, height);
 	if (h.desynced) text("Out of sync with the other PC (see Arklite.log)", width / 2, 24, CENTER, RED);
 	char_menu_draw(width, height);
 

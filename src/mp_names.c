@@ -1,0 +1,308 @@
+/* Player names in multiplayer games: what each player is called, typing a new one in the F2 menu
+ * (char_menu.c), and the name over another player when this PC's player faces them.
+ *
+ * Names: Arklite.ini [multiplayer] name is this PC's player (default "Player"), [players]
+ * p2_name the gamepad player 2 of a game on one PC (default "Player 2"). Typing a new name in the
+ * F2 menu saves it there, so it's kept for the next game. In a network game each PC sends its
+ * own player's name to the other (net.c, a NAME packet every second and at once on a change);
+ * names are only shown, never part of the game state, so they can't desync anything. A name is
+ * at most 23 characters of plain ASCII (what Oni's fonts draw).
+ *
+ * Typing: while the name is being edited, Oni's window gets our window procedure in front of its
+ * own (SetWindowLongA GWL_WNDPROC, installed the first time and then left in place; it passes
+ * everything on when nothing is being typed), which takes WM_CHAR: letters, Backspace, Enter
+ * (keep) and Esc (put the old name back). Key down and up still reach Oni; this PC's player gets
+ * no game input while the F2 menu is up anyway.
+ *
+ * Facing: every frame, in the HUD (mp_hud.c; the display runs with this PC's player in gs+0xac),
+ * each other player within NAME_RANGE whose feet, middle or head (0x4e3460: ECX character, EDX
+ * the head's position out) is on screen in the zone players look at: the middle 3/11 of the
+ * width, from the top edge down to 3/5 of the height (the camera looks down over this PC's
+ * player, so the others sit above the center). A point there counts if no wall is between it
+ * and the camera: the level's ray query 0x441c80 (ECX the level's collision ([gs+0x150]+0x40),
+ * EDX the start, [the ray: the whole segment], [quad flags to skip], [1]; ret 0xc; al 1: hit),
+ * what the laser sight's test 0x4d4e50 uses with the flags 0x44800, plus 0x20: the quads the
+ * camera made see-through this frame (it sets 0x20 on what stands between it and the player,
+ * cleared by 0x41aab0), so a wall the camera shows through doesn't hide a name. The name is
+ * drawn over the head, and NAME_HOLD_MS after the player leaves the zone, so it doesn't flicker. The camera is Motoko's, *0x631004: +0x08
+ * position, +0x14 view direction, +0x20 up, +0x38 vertical field of view (radians), +0x3c
+ * aspect (0x41b4a0 and 0x41b3b0 read and set them). */
+#include "arklite.h"
+
+
+#define ONgGameState        (*(u8 **)0x5ece7c)
+#define GS_PLAYER(gs)       (*(u8 **)((gs) + 0xac))
+#define M3gActiveCamera     (*(u8 **)0x631004)
+#define CAM_POS(c)          ((const float *)((c) + 0x08))
+#define CAM_VIEW(c)         ((const float *)((c) + 0x14))
+#define CAM_UP(c)           ((const float *)((c) + 0x20))
+#define CAM_FOVY(c)         (*(const float *)((c) + 0x38))
+#define CAM_ASPECT(c)       (*(const float *)((c) + 0x3c))
+#define GS_COLLISION(gs)    (*(u8 **)(*(u8 **)((gs) + 0x150) + 0x40))
+#define AKrCollision_Ray    ((u8 (ONI_FC *)(u8 *, const float *, const float *, u32, u32))0x441c80)
+#define QUAD_SKIP           0x44800  /* what the laser sight's test skips */
+#define QUAD_SEE_THROUGH    0x20     /* set by the camera on the quads in its way */
+#define CHR_POS(c)          ((float *)((c) + 0x148))
+#define ONrCharacter_GetHead ((void (ONI_FC *)(u8 *, float *))0x4e3460)
+
+#define CHR_FLAGS(c)        (*(u32 *)((c) + 4))
+#define CHR_INUSE           0x8000
+#define CHR_DEAD            0x1
+
+#define NAME_RANGE          400.0f
+#define NAME_HOLD_MS        400
+#define ZONE_X              (3.0f / 11)   /* half the zone's width, of the half screen */
+#define ZONE_BOTTOM         (-0.2f)       /* 3/5 of the height down from the top: -1 bottom, 1 top */
+#define NAME_ABOVE          4.0f     /* units over the head */
+
+#define GWL_WNDPROC         (-4)
+#define WM_CHAR             0x102
+
+typedef long (WINAPI *WNDPROC)(void *, u32, u32, long);
+__declspec(dllimport) long WINAPI SetWindowLongA(void *, int, long);
+__declspec(dllimport) long WINAPI CallWindowProcA(WNDPROC, void *, u32, u32, long);
+__declspec(dllimport) void * WINAPI GetForegroundWindow(void);
+__declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
+__declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
+__declspec(dllimport) u32  WINAPI GetTickCount(void);
+
+static char g_name[MP_NAME_MAX], g_p2_name[MP_NAME_MAX], g_peer[MP_NAME_MAX];
+static char g_edit[MP_NAME_MAX], g_before[MP_NAME_MAX];
+static int g_editing;
+static u32 g_serial = 1;
+static WNDPROC g_old_proc;
+static void *g_hwnd;
+static u8 *g_target;               /* the player the name is over */
+static u32 g_target_seen;
+
+/* ---- Names -------------------------------------------------------------------------------- */
+
+static int same(const char *a, const char *b)
+{
+	while (*a && *a == *b) a++, b++;
+	return *a == *b;
+}
+
+/* Plain ASCII, no leading or trailing spaces, at most MP_NAME_MAX - 1; fallback if empty */
+static void clean(char *d, const char *s, const char *fallback)
+{
+	unsigned n = 0;
+	while (*s == ' ') s++;
+	for (; *s && n < MP_NAME_MAX - 1; s++)
+		if (*s >= 0x20 && *s < 0x7f) d[n++] = *s;
+	while (n && d[n - 1] == ' ') n--;
+	d[n] = 0;
+	if (!n) str_cpy(d, MP_NAME_MAX, fallback);
+}
+
+const char *mp_name_local(void) { return g_name; }
+u32 mp_name_serial(void) { return g_serial; }
+
+void mp_name_set_peer(const char *name)
+{
+	char n[MP_NAME_MAX];
+	clean(n, name, "");
+	if (same(n, g_peer)) return;
+	str_cpy(g_peer, sizeof g_peer, n);
+	if (*n) log_msg("names: the other player is %s", n);
+}
+
+const char *mp_name(int who)
+{
+	static char fallback[16];
+	NetHud h;
+
+	net_hud(&h);
+	if (h.state == NETHUD_OFF) return who == 1 ? g_p2_name : g_name;
+	if (who == h.local_player) return g_name;
+	if (*g_peer) return g_peer;
+	fmt(fallback, "Player %d", who + 1);
+	return fallback;
+}
+
+/* ---- Typing ------------------------------------------------------------------------------- */
+
+static void edit_char(u32 c)
+{
+	unsigned n = str_len(g_edit);
+	if (c == 8) {
+		if (n) g_edit[n - 1] = 0;
+	} else if (c == 13) {
+		mp_name_edit_end(1);
+	} else if (c == 27) {
+		mp_name_edit_end(0);
+	} else if (c >= 0x20 && c < 0x7f && n < MP_NAME_MAX - 1 && (n || c != ' ')) {
+		g_edit[n] = (char)c;
+		g_edit[n + 1] = 0;
+	}
+}
+
+static long WINAPI window_proc(void *hwnd, u32 msg, u32 wp, long lp)
+{
+	if (g_editing && msg == WM_CHAR) {
+		edit_char(wp);
+		return 0;
+	}
+	return CallWindowProcA(g_old_proc, hwnd, msg, wp, lp);
+}
+
+int mp_name_editing(void) { return g_editing; }
+
+void mp_name_edit_begin(void)
+{
+	if (g_editing) return;
+	if (!g_old_proc) {
+		u32 pid = 0;
+		void *w = GetForegroundWindow();
+		if (w) GetWindowThreadProcessId(w, &pid);
+		if (!w || pid != GetCurrentProcessId()) return;
+		g_hwnd = w;
+		g_old_proc = (WNDPROC)SetWindowLongA(w, GWL_WNDPROC, (long)window_proc);
+		if (!g_old_proc) {
+			log_msg("names: can't read the keyboard (no window procedure)");
+			return;
+		}
+	}
+	str_cpy(g_before, sizeof g_before, g_name);
+	str_cpy(g_edit, sizeof g_edit, g_name);
+	g_editing = 1;
+}
+
+void mp_name_edit_end(int keep)
+{
+	if (!g_editing) return;
+	g_editing = 0;
+	if (!keep) return;
+	clean(g_name, g_edit, g_before);
+	if (same(g_name, g_before)) return;
+	g_serial++;
+	WritePrivateProfileStringA("multiplayer", "name", g_name, ini_path());
+	log_msg("names: this PC's player is now %s (saved in Arklite.ini)", g_name);
+}
+
+const char *mp_name_edit_text(void) { return g_editing ? g_edit : g_name; }
+
+/* ---- The name over the player this PC's player faces ---------------------------------------- */
+
+static float fsqrt(float x)
+{
+	float r;
+	__asm__("fsqrt" : "=t"(r) : "0"(x));
+	return r;
+}
+
+static float ftan(float x)
+{
+	float r;
+	__asm__("fptan\n\tfstp %%st(0)" : "=t"(r) : "0"(x));
+	return r;
+}
+
+static float dot(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+static void cross(const float *a, const float *b, float *o)
+{
+	o[0] = a[1] * b[2] - a[2] * b[1];
+	o[1] = a[2] * b[0] - a[0] * b[2];
+	o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static int norm(float *v)
+{
+	float l = fsqrt(dot(v, v));
+	if (l < 1e-6f) return 0;
+	v[0] /= l; v[1] /= l; v[2] /= l;
+	return 1;
+}
+
+static int other_player(u8 *c, u8 *me)
+{
+	if (!c || c == me || !(CHR_FLAGS(c) & CHR_INUSE) || (CHR_FLAGS(c) & CHR_DEAD)) return -1;
+	for (int who = 0; who < 2; who++)
+		if (c == players_char(who)) return who;
+	return -1;
+}
+
+typedef struct { const float *pos; float f[3], right[3], u[3], t, aspect; u8 *collision; } View;
+
+/* On screen in the zone (ndc x, y: -1..1, y up), and no wall between it and the camera */
+static int in_zone(const View *v, const float *p)
+{
+	float rel[3];
+	for (int k = 0; k < 3; k++) rel[k] = p[k] - v->pos[k];
+	float z = dot(rel, v->f);
+	if (z < 1.0f || dot(rel, rel) > NAME_RANGE * NAME_RANGE) return 0;
+	float x = dot(rel, v->right) / (z * v->t * v->aspect), y = dot(rel, v->u) / (z * v->t);
+	if (x < -ZONE_X || x > ZONE_X || y < ZONE_BOTTOM || y > 1.0f) return 0;
+	return !v->collision || !AKrCollision_Ray(v->collision, v->pos, rel, QUAD_SKIP | QUAD_SEE_THROUGH, 1);
+}
+
+static int facing(const View *v, u8 *c)
+{
+	float head[3], mid[3];
+	ONrCharacter_GetHead(c, head);
+	for (int k = 0; k < 3; k++) mid[k] = (head[k] + CHR_POS(c)[k]) * 0.5f;
+	return in_zone(v, head) || in_zone(v, mid) || in_zone(v, CHR_POS(c));
+}
+
+void mp_names_draw(int width, int height)
+{
+	u8 *gs = ONgGameState, *cam = M3gActiveCamera, *me;
+	float up[3], head[3], rel[3];
+	u32 now = GetTickCount();
+	View v;
+	int who;
+
+	if (!gs || !cam || !(me = GS_PLAYER(gs)) || char_menu_open() || live_menu_open()) {
+		g_target = 0;
+		return;
+	}
+	for (int k = 0; k < 3; k++) { v.f[k] = CAM_VIEW(cam)[k]; up[k] = CAM_UP(cam)[k]; }
+	if (!norm(v.f)) return;
+	cross(v.f, up, v.right);
+	if (!norm(v.right)) return;
+	cross(v.right, v.f, v.u);
+	v.pos = CAM_POS(cam);
+	float fovy = CAM_FOVY(cam);
+	if (fovy <= 0.05f || fovy >= 3.0f) fovy = 0.785398f;
+	v.aspect = CAM_ASPECT(cam);
+	if (v.aspect <= 0.1f) v.aspect = (float)width / (float)height;
+	v.t = ftan(fovy * 0.5f);
+	v.collision = *(u8 **)(gs + 0x150) ? GS_COLLISION(gs) : 0;
+
+	/* the one already named keeps it while it's still faced; else the first one faced */
+	if (g_target && other_player(g_target, me) >= 0 && facing(&v, g_target)) g_target_seen = now;
+	else
+		for (int i = 0; i < 2; i++) {
+			u8 *c = players_char(i);
+			if (c != g_target && other_player(c, me) >= 0 && facing(&v, c)) {
+				g_target = c;
+				g_target_seen = now;
+				break;
+			}
+		}
+	if (!g_target || now - g_target_seen > NAME_HOLD_MS || (who = other_player(g_target, me)) < 0) {
+		g_target = 0;
+		return;
+	}
+
+	ONrCharacter_GetHead(g_target, head);
+	head[1] += NAME_ABOVE;
+	for (int k = 0; k < 3; k++) rel[k] = head[k] - v.pos[k];
+	float z = dot(rel, v.f);
+	if (z < 1.0f) return;
+	int x = (int)(width * 0.5f * (1 + dot(rel, v.right) / (z * v.t * v.aspect)));
+	int y = (int)(height * 0.5f * (1 - dot(rel, v.u) / (z * v.t))) - mp_hud_line_height();
+	if (x < 0 || x >= width || y < 0 || y >= height) return;
+	mp_hud_text(mp_name(who), x, y, MP_CENTER, 0xffffffffu);
+}
+
+void mp_names_install(void)
+{
+	char s[64];
+	GetPrivateProfileStringA("multiplayer", "name", "Player", s, sizeof s, ini_path());
+	clean(g_name, s, "Player");
+	GetPrivateProfileStringA("players", "p2_name", "Player 2", s, sizeof s, ini_path());
+	clean(g_p2_name, s, "Player 2");
+	log_msg("names: this PC's player is %s", g_name);
+}

@@ -29,6 +29,7 @@ static char g_igmdFormat[256] = "IGMD\\%s";
 static int  g_slot = -1;
 static char g_mountedIni[MAX_PATH];           /* level.ini of the level mounted in g_slot */
 static char g_mountedDir[MAX_PATH];           /* its folder, ends with '\' */
+static char g_mountedFolder[64];              /* its folder's name in CustomLevels */
 /* Debug: ARKLITE_AUTOSTART=<folder> opens Custom Game and plays that folder, as if clicked. */
 static char g_autostart[64];
 static int  g_autostartPending;
@@ -200,6 +201,7 @@ static int mount_custom_level(const CustomLevel *cl)
 	TMgLevelValid[s] = 1;
 	fmt(g_mountedIni, "%sCustomLevels\\%s\\level.ini", g_dataDir, cl->folder);
 	fmt(g_mountedDir, "%sCustomLevels\\%s\\", g_dataDir, cl->folder);
+	str_cpy(g_mountedFolder, sizeof g_mountedFolder, cl->folder);
 
 	fmt(path, "%sCustomLevels\\%s\\IGMD", g_dataDir, cl->folder);
 	if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
@@ -241,6 +243,26 @@ const char *custom_game_level_ini(u32 level)
 const char *custom_game_level_dir(u32 level)
 {
 	return custom_game_level_ini(level) ? g_mountedDir : 0;
+}
+
+const char *custom_game_level_folder(u32 level)
+{
+	return custom_game_level_ini(level) ? g_mountedFolder : 0;
+}
+
+/* The mounted level's folder changed on disk (net.c downloaded the host's version): its files
+ * are listed again and mounted in the same slot, before the engine opens them */
+int custom_game_remount(u32 level)
+{
+	char folder[64];
+
+	if (!custom_game_level_ini(level)) return 0;
+	str_cpy(folder, sizeof folder, g_mountedFolder);
+	scan_custom_levels();
+	for (int i = 0; i < g_ncustom; i++)
+		if (str_ieq_n(g_custom[i].folder, folder, sizeof folder)) return mount_custom_level(&g_custom[i]);
+	log_msg("remount: CustomLevels\\%s has no level files any more", folder);
+	return 0;
 }
 
 /* ---- "Custom Game" dialog (reuses the Load Game layout, dialog 0x97) ------------------------- */
