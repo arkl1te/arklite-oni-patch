@@ -95,10 +95,24 @@ float hud_scale(void);                /* 1.0 = original size */
 /* ---- hud_scale.c -------------------------------------------------------------------------- */
 
 void hud_scale_install(void);
+/* mp_hud.c owns the text sprite call (0x42deae) and the timer call (0x50061f) and hands the HUD's
+ * own text to these, which scale it with the rest of the HUD */
+u32  ONI_FC hud_text_sprite(const float *points, const void *uvs);   /* for 0x41a5e0 */
+void ONI_FC hud_timer_display(void *center);                         /* for 0x4fd500 */
+
+/* ---- hud_smooth.c ------------------------------------------------------------------------- */
+
+void hud_smooth_frame(void);                   /* before the HUD draws at a scale other than 1 */
+u8  *hud_smooth_swap(float scale, u32 *saved); /* the draw's texture, now our resampled copy, or 0 */
+void hud_smooth_restore(u8 *texture, u32 saved);
 
 /* ---- random_class.c----------------------------------------------------------------------- */
 
 void random_class_install(void);
+
+/* ---- texture_clamp.c ---------------------------------------------------------------------- */
+
+void texture_clamp_install(void);
 
 /* ---- char_limit.c ------------------------------------------------------------------------- */
 
@@ -199,6 +213,10 @@ void live_menu_request(void);  /* open it after this frame's update */
 /* WMrDialog_ModalBegin for every dialog (lockstep.c wraps the calls): in a multiplayer game a
  * dialog outside a tick runs with the game going on behind it, one inside a tick isn't shown */
 u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick);
+
+/* ---- vertex_light.c ---------------------------------------------------------------------- */
+
+void vertex_light_frame(void);   /* every frame: animated corners of a custom level (vertexlight.bin) */
 
 /* ---- crash_log.c -------------------------------------------------------------------------- */
 

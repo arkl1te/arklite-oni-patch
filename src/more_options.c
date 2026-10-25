@@ -20,6 +20,11 @@
 #define cHudScaleMin  50
 #define cHudScaleMax  300
 #define cHudScaleStep 5
+/* The HUD Scale slider counts steps (0..50), not percent: Oni's slider moves by whole pixels
+ * over its travel (width - 4 - 4 px track caps - 9 px thumb, art psui_oniUI), so 250 percent
+ * on a 64 px slider (47 px of travel) skipped values, 100 among them. 72 px gives 55 px of
+ * travel for the 51 steps, so every step has a pixel. */
+#define cHudScaleSteps ((cHudScaleMax - cHudScaleMin) / cHudScaleStep)
 
 static int g_hudScale = 100;            /* percent */
 static int g_pauseBackground = 33;      /* percent; 33 was Arklite's fixed value */
@@ -34,6 +39,7 @@ static void settings_load(void)
 	char music[16];
 
 	g_hudScale = clamp((int)GetPrivateProfileIntA("options", "hud_scale", 100, ini_path()), cHudScaleMin, cHudScaleMax);
+	g_hudScale = cHudScaleMin + (g_hudScale - cHudScaleMin + cHudScaleStep / 2) / cHudScaleStep * cHudScaleStep;
 	g_pauseBackground = clamp((int)GetPrivateProfileIntA("options", "pause_background", 33, ini_path()), 0, 100);
 	GetPrivateProfileStringA("options", "pause_music", "keep", music, sizeof music, ini_path());
 	g_pauseMusic = PAUSE_MUSIC_KEEP;
@@ -167,11 +173,11 @@ void more_options_init(WMtWindow *dialog)
 	 * the stock controls end by x 280). "Pause Background:" is about 125 px in the dialog font
 	 * and wraps in a 130 px label; "100%" is about 36 px. Everything ends by x 285. */
 	add(header, "Display", 0, 50, 35, 150, 20);
-	add(rowLabel, "HUD Scale:", 0, 30, 65, 140, 20);
-	hud = add(slider, "hud scale", ID_HUD_SCALE, 173, 65, 64, 20);
+	add(rowLabel, "HUD Scale:", 0, 30, 65, 136, 20);
+	hud = add(slider, "hud scale", ID_HUD_SCALE, 168, 65, 72, 20);
 	g_hudValue = add(rowLabel, "", 0, 241, 65, 44, 20);
-	add(rowLabel, "Pause Background:", 0, 30, 90, 140, 20);
-	background = add(slider, "pause background", ID_PAUSE_BACKGROUND, 173, 90, 64, 20);
+	add(rowLabel, "Pause Background:", 0, 30, 90, 136, 20);
+	background = add(slider, "pause background", ID_PAUSE_BACKGROUND, 168, 90, 72, 20);
 	g_backgroundValue = add(rowLabel, "", 0, 241, 90, 44, 20);
 
 	/* When Game Pauses: the Sound frame (y 175..275) */
@@ -180,7 +186,10 @@ void more_options_init(WMtWindow *dialog)
 	add(checkbox, "Play Main Theme (original)", ID_MUSIC_THEME, 30, 215, 270, 20);
 	add(checkbox, "Silence", ID_MUSIC_SILENCE, 30, 240, 270, 20);
 
-	if (hud) { WMrSlider_SetRange(hud, cHudScaleMin, cHudScaleMax); WMrSlider_SetValue(hud, g_hudScale); }
+	if (hud) {
+		WMrSlider_SetRange(hud, 0, cHudScaleSteps);
+		WMrSlider_SetValue(hud, (g_hudScale - cHudScaleMin) / cHudScaleStep);
+	}
 	if (background) { WMrSlider_SetRange(background, 0, 100); WMrSlider_SetValue(background, g_pauseBackground); }
 	show_percent(g_hudValue, g_hudScale);
 	show_percent(g_backgroundValue, g_pauseBackground);
@@ -213,7 +222,7 @@ int more_options_command(WMtWindow *dialog, u32 id, u32 notify)
 
 		if (!slider) return 1;
 		if (id == ID_HUD_SCALE) {
-			v = clamp((v + cHudScaleStep / 2) / cHudScaleStep * cHudScaleStep, cHudScaleMin, cHudScaleMax);
+			v = cHudScaleMin + clamp(v, 0, cHudScaleSteps) * cHudScaleStep;
 			if (v == g_hudScale) return 1;
 			g_hudScale = v;
 			settings_save_int("hud_scale", v);
