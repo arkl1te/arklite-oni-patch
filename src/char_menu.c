@@ -152,7 +152,7 @@ static const char g_default_roster[] =
 	"comguy_1,elite_med_1,red_med_1,TCTF_swat_1,Cop_generic,thug_wh_1,sniper_generic";
 static const char *const g_labels[][2] = {
 	{ "konoko_generic", "Konoko" }, { "griffin_generic", "Griffin" }, { "muro_generic", "Muro" },
-	{ "mutantmuro", "Mutant Muro" }, { "barabus", "Barabas" }, { "SH_generic", "Shinatama" },
+	{ "barabus", "Barabas" }, { "SH_generic", "Shinatama" },
 	{ "ninja_med_1", "Ninja" }, { "striker_med_1", "Striker" }, { "tanker_med_1", "Tanker" },
 	{ "comguy_1", "Comguy" }, { "elite_med_1", "Elite" }, { "red_med_1", "Red" },
 	{ "TCTF_swat_1", "TCTF SWAT" }, { "Cop_generic", "Cop" }, { "thug_wh_1", "Thug" },
@@ -163,10 +163,10 @@ static const char *const g_labels[][2] = {
 static const char *const g_families[] = {
 	"konoko_generic|k3|k4_A|k4_F|k4_G|k4_K|k4_L",
 	"griffin_generic|griffin_swat",
-	"muro_generic|mutantmuro",
+	"muro_generic",
 	"SH_generic|SH_dream_lab|Shinzom_generic",
 	"ninja_easy_1|ninja_easy_2|ninja_easy_3|ninja_med_1|ninja_med_2|ninja_med_3|ninja_hard_1|ninja_hard_2|ninja_hard_3|super_ninja_1|ninjabot",
-	"striker_easy_1|striker_easy_2|striker_easy_3|striker_med_1|striker_med_2|striker_med_3|striker_hard_1|striker_hard_2|striker_hard_3|striker_dream_lab",
+	"striker_easy_1|striker_easy_2|striker_easy_3|striker_med_1|striker_med_2|striker_med_3|striker_hard_1|striker_hard_2|striker_hard_3",
 	"tanker_easy_1|tanker_med_1|tanker_hard_1",
 	"comguy_1|comguy_2|comguy_3",
 	"elite_easy_1|elite_easy_2|elite_easy_3|elite_med_1|elite_med_2|elite_med_3|elite_hard_1|elite_hard_2|elite_hard_3",
