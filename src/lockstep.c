@@ -352,6 +352,139 @@ static void visited_install(void)
 	log_msg("collision: visited marks are always undone (walls no longer go missing)");
 }
 
+/* ---- Collision query log ---------------------------------------------------------------- *
+ * While recording, every level collision query made in a tick (0x441cb0: ECX the level's
+ * collision, EDX the sphere (x, y, z, radius), [the move], [quad flags to skip], [most
+ * results]; ret 0xc; results: count *0x6a906c (u16), 0x48 bytes each from 0x6a9080, the quad
+ * at +0x28 and the contact point at +0x1c) goes to <recording>.col with its input, its result
+ * and the visited marks left over in the three vectors (set bits the undo list doesn't hold,
+ * which would hide quads from it). tools/col_diff.py compares two PCs' logs and prints the
+ * first query that differs. A character's wall contacts (active +0xb0) come from these
+ * queries in its environment callback (call at 0x4ebddf). */
+#define AKrCollision_Sphere     ((u8 (ONI_FC *)(void *, const float *, const float *, u32, u32))0x441cb0)
+#define AKgResultCount          (*(u16 *)0x6a906c)
+#define AKgResults              ((const u8 *)0x6a9080)
+#define COL_MAX_RESULTS         32
+
+typedef struct { u32 tick; u16 site; u16 count; float sphere[4], move[3]; u32 mask, max, stray[3]; } ColQuery;
+typedef struct { u32 quad; float point[3]; } ColResult;
+
+static HANDLE g_col_out = INVALID_HANDLE_VALUE;
+static u8 g_col_buf[0x10000];
+static u32 g_col_len, g_col_queries, g_col_stray_queries, g_col_stray_max;
+static const u32 g_col_sites[] = { 0x43b8d0, 0x44f2e7, 0x4661ab, 0x466351, 0x49ec55, 0x4d6d75, 0x4e2524, 0x4ebddf, 0x4ec240 };
+
+static void col_flush(void)
+{
+	u32 written;
+	if (g_col_out != INVALID_HANDLE_VALUE && g_col_len) WriteFile(g_col_out, g_col_buf, g_col_len, &written, 0);
+	g_col_len = 0;
+}
+
+static void col_write(const void *p, u32 n)
+{
+	if (g_col_len + n > sizeof g_col_buf) col_flush();
+	memcpy(g_col_buf + g_col_len, p, n);
+	g_col_len += n;
+}
+
+/* Set bits in a visited vector that its undo list doesn't hold (after an overflow there are
+ * some, but the next clear wipes the vector whole, so they don't count) */
+static u32 visited_stray(u32 *v)
+{
+	u32 set = 0, bits = 0;
+	if (!v) return 0;
+	for (int k = 0; k < 8; k++)
+		if (g_visited[k].v == v) {
+			if (g_visited[k].overflowed) return 0;
+			bits = g_visited[k].bits;
+		}
+	for (u32 i = 0; i < (bits + 7) / 8; i++)
+		for (u8 b = ((u8 *)v[0])[i]; b; b &= b - 1) set++;
+	return set > v[2] ? set - v[2] : 0;
+}
+
+static u8 ONI_FC col_query(void *collision, const float *sphere, const float *move, u32 mask, u32 max)
+{
+	u32 from = (u32)__builtin_return_address(0) - 5;
+	int logging = g_in_tick && g_session == SESSION_RUN && g_col_out != INVALID_HANDLE_VALUE;
+	ColQuery q;
+
+	if (logging) {
+		q.stray[0] = visited_stray(*(u32 **)0x5ccebc);
+		q.stray[1] = visited_stray(*(u32 **)0x5ccec0);
+		q.stray[2] = visited_stray(*(u32 **)0x5ccec4);
+	}
+	u8 hit = AKrCollision_Sphere(collision, sphere, move, mask, max);
+	if (!logging) return hit;
+
+	q.tick = GS_TICK(ONgGameState);
+	q.site = 0xffff;
+	for (u16 k = 0; k < sizeof g_col_sites / sizeof g_col_sites[0]; k++)
+		if (g_col_sites[k] == from) q.site = k;
+	q.count = hit ? AKgResultCount : 0;
+	memcpy(q.sphere, sphere, sizeof q.sphere);
+	memcpy(q.move, move, sizeof q.move);
+	q.mask = mask;
+	q.max = max & 0xffff;
+	col_write(&q, sizeof q);
+	for (u32 i = 0; i < q.count && i < COL_MAX_RESULTS; i++) {
+		ColResult r;
+		r.quad = *(const u32 *)(AKgResults + i * 0x48 + 0x28);
+		memcpy(r.point, AKgResults + i * 0x48 + 0x1c, sizeof r.point);
+		col_write(&r, sizeof r);
+	}
+	g_col_queries++;
+	u32 stray = q.stray[0] + q.stray[1] + q.stray[2];
+	if (stray) {
+		g_col_stray_queries++;
+		if (stray > g_col_stray_max) g_col_stray_max = stray;
+	}
+	return hit;
+}
+
+static void col_log_begin(void)
+{
+	char path[MAX_PATH];
+	u32 n = 0;
+
+	while (g_path[n]) n++;
+	str_cpy(path, sizeof path, g_path);
+	if (n > 4 && str_ieq_n(g_path + n - 4, ".akr", 4)) path[n - 4] = 0;
+	if (n + 4 < sizeof path) {
+		u32 m = 0;
+		while (path[m]) m++;
+		str_cpy(path + m, sizeof path - m, ".col");
+	}
+	g_col_len = g_col_queries = g_col_stray_queries = g_col_stray_max = 0;
+	g_col_out = CreateFileA(path, 0x40000000, 1, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+	if (g_col_out == INVALID_HANDLE_VALUE) log_msg("lockstep: can't create %s", path);
+	else log_msg("lockstep: collision queries to %s", path);
+}
+
+static void col_log_end(void)
+{
+	if (g_col_out == INVALID_HANDLE_VALUE) return;
+	col_flush();
+	CloseHandle(g_col_out);
+	g_col_out = INVALID_HANDLE_VALUE;
+	log_msg("lockstep: %d collision queries in ticks logged; %d of them started with leftover visited marks (most %d)",
+	        g_col_queries, g_col_stray_queries, g_col_stray_max);
+}
+
+static void col_install(void)
+{
+	const u32 n = sizeof g_col_sites / sizeof g_col_sites[0];
+	for (u32 i = 0; i < n; i++) {
+		const u8 *p = (const u8 *)g_col_sites[i];
+		if (p[0] != 0xe8 || g_col_sites[i] + 5 + *(u32 *)(p + 1) != (u32)AKrCollision_Sphere) {
+			log_msg("collision: query call 0x%x changed, queries not logged", g_col_sites[i]);
+			return;
+		}
+	}
+	for (u32 i = 0; i < n; i++) patch_call(g_col_sites[i], (u32)AKrCollision_Sphere, (u32)col_query);
+}
+
 static void local_rng_install(void)
 {
 	static const u8 entry[] = { 0xa1, 0xd8, 0x26, 0x53, 0x00 };   /* mov eax, [0x5326d8] */
@@ -800,6 +933,7 @@ static void session_end(const char *why)
 		out_flush();
 		CloseHandle(g_out);
 		g_out = INVALID_HANDLE_VALUE;
+		col_log_end();
 		log_msg("lockstep: recorded level %d, %d frames, %d ticks (%d s) to %s (%s)",
 		        g_level, g_frames, g_ticks, g_ticks / 60, g_path, why);
 	} else if (!g_bad_ticks) {
@@ -838,6 +972,7 @@ static void session_begin(u32 level)
 			return;
 		}
 		out_write(&h, sizeof h);
+		col_log_begin();
 		record_tick();
 		log_msg("lockstep: recording level %d from tick %d, RNG %08x, FPU %04x", level, h.start_tick, h.seed, h.fpu_cw);
 	} else {
@@ -968,6 +1103,7 @@ void lockstep_install(void)
 	sound_rng_install();
 	speech_install();
 	visited_install();
+	col_install();
 	/* the tick hook tells the local RNG when a tick is running, so it's always in */
 	if (tick_ok) {
 		patch_call(ONcGameState_TickCall, (u32)ONrGameState_Tick, (u32)tick_hook);
