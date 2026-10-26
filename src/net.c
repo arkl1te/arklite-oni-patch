@@ -102,7 +102,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    NET_DEFAULT_PORT
-#define PROTO           8
+#define PROTO           9
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -208,6 +208,7 @@ typedef struct {
 	u32 first, count;      /* inputs for ticks first..first+count-1 follow */
 	u32 ack;               /* every input of ours before this tick arrived */
 	u32 hash_tick, hash;   /* our latest state hash (hash_tick 0: none yet) */
+	int adv;               /* our ticks run minus the peer's inputs we have, as sent (time sync) */
 } PktInput;
 typedef struct {
 	PktHead h;
@@ -248,6 +249,14 @@ static u32 g_ticks;                    /* ticks run this session */
 static u32 g_gen;                      /* our inputs are made for ticks < g_gen */
 static u32 g_remote;                   /* the peer's inputs are here for ticks < g_remote */
 static u32 g_stall_frames, g_stall_ticks, g_last_stall_log;   /* frames held back by the peer's inputs */
+/* Time sync (rollback): each PC sends how far its ticks are past the peer's inputs it has (adv).
+ * With the same latency both ways, (ours - theirs) / 2 is how many ticks this PC runs ahead of
+ * the other in real time; the PC ahead leaves out one tick in every SYNC_EVERY until it isn't.
+ * Never faster: the old catch-up ran one extra tick every frame, frames with no tick due
+ * included, which at high frame rates ran the game about 3x as fast. */
+#define SYNC_EVERY      8
+static int g_peer_adv, g_peer_adv_known;
+static u32 g_sync_skip_at, g_sync_skipped;
 /* Rollback (delay 0, the default): this PC's input runs at once, the peer's is predicted, and a
  * wrong guess puts the game back (rollback.c) and runs the ticks again */
 #define ROLLING         (g_delay == 0)
@@ -714,6 +723,7 @@ static void send_inputs(void)
 	p->ack = g_remote;
 	p->hash_tick = g_last_hash_tick;
 	p->hash = g_last_hash;
+	p->adv = (int)g_ticks - (int)g_remote;
 	for (u32 i = 0; i < n; i++) memcpy(buf + sizeof *p + i * 0x30, g_local_in[(from + i) % RING], 0x30);
 	send_to_peer(buf, sizeof *p + n * 0x30);
 	g_sent_gen = g_gen;
@@ -805,6 +815,8 @@ static void on_input(const PktInput *p, u32 size)
 
 	if (size < sizeof *p || p->count > MAX_SEND || size < sizeof *p + p->count * 0x30) return;
 	if (p->ack > g_peer_ack && p->ack <= g_gen) g_peer_ack = p->ack;
+	g_peer_adv = p->adv;
+	g_peer_adv_known = 1;
 	for (u32 i = 0; i < p->count; i++) {
 		u32 t = p->first + i, slot = t % RING;
 		if (t < g_remote || t >= g_ticks + RING - 8) continue;
@@ -1590,6 +1602,8 @@ static void session_begin(u32 level)
 	}
 	g_ticks = g_remote = g_peer_ack = g_sent_gen = 0;
 	g_stall_frames = g_stall_ticks = 0;
+	g_peer_adv = g_peer_adv_known = 0;
+	g_sync_skip_at = g_sync_skipped = 0;
 	g_has_pending = 0;
 	memset(g_local_in, 0, sizeof g_local_in);
 	memset(g_remote_at, 0, sizeof g_remote_at);
@@ -1920,11 +1934,16 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 	g_verified = g_remote < g_ticks ? g_remote : g_ticks;
 	publish_verified();
 
-	/* this frame's ticks: as many as the clock asks, one more when behind the peer, but never
-	 * further past the peer's last real input than the snapshots reach */
+	/* this frame's ticks: as many as the clock asks, one fewer now and then while ahead of the
+	 * peer (time sync), and never further past the peer's last real input than the snapshots reach */
 	u32 n = wanted;
-	if (g_remote > g_ticks + 1) n++;
 	if (n > 6) n = 6;
+	if (n && g_peer_adv_known && ((int)g_ticks - (int)g_remote - g_peer_adv) / 2 >= 2 &&
+	    (int)(g_ticks - g_sync_skip_at) >= SYNC_EVERY) {
+		n--;
+		g_sync_skip_at = g_ticks;
+		g_sync_skipped++;
+	}
 	if (g_ticks + n > g_remote + RB_AHEAD) {
 		u32 can = g_remote + RB_AHEAD > g_ticks ? g_remote + RB_AHEAD - g_ticks : 0;
 		g_stall_frames++;
@@ -1939,8 +1958,10 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 			log_msg("net: in the last %d s, %d frames waited for the %s's inputs (%d ticks in all)",
 			        STALL_LOG_MS / 1000, g_stall_frames, g_mode == NET_HOST ? "joiner" : "host", g_stall_ticks);
 		if (g_rb_started)
-			log_msg("net: rollback so far: %d rollbacks, %d ticks run again (deepest %d), %d pages kept per tick",
-			        g_rollbacks, g_resim_ticks, g_rb_deepest, rollback_known_pages());
+			log_msg("net: rollback so far: %d rollbacks, %d ticks run again (deepest %d), %d pages kept per tick; "
+			        "time sync left out %d ticks, now %d ahead of the %s", g_rollbacks, g_resim_ticks, g_rb_deepest,
+			        rollback_known_pages(), g_sync_skipped, ((int)g_ticks - (int)g_remote - g_peer_adv) / 2,
+			        g_mode == NET_HOST ? "joiner" : "host");
 		g_stall_frames = g_stall_ticks = 0;
 		g_last_stall_log = now;
 	}
@@ -2031,7 +2052,6 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	 * shrank back. A frame that makes no input merges its record into the next one. */
 	u32 remote_avail = g_state == S_LOST ? 6 : g_remote - g_ticks;
 	u32 n = wanted;
-	if (g_state == S_RUN && g_remote > g_ticks + g_delay + 1) n++;   /* the peer is ahead */
 	if (n > remote_avail) {
 		g_stall_frames++;
 		g_stall_ticks += n - remote_avail;
