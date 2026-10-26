@@ -268,6 +268,7 @@ static u32 g_sent_gen;
 static u32 g_seed, g_local_seed;       /* the host's, put in place before the first tick */
 static u32 g_start_hash, g_start_tick, g_start_fpu;
 static u32 g_last_recv, g_last_send, g_last_hello;
+static int g_lost_left;                /* S_LOST because the peer said goodbye, not silence */
 static u32 g_frame_p1[6][12], g_frame_p2[6][12];
 
 typedef struct { u32 index, flags; int health; float pos[3], facing, vel[3]; } CharSum;
@@ -1567,6 +1568,7 @@ static void receive(void)
 			mp_name_set_peer(name);
 		} else if (h->type == PKT_BYE && g_state == S_RUN) {
 			log_msg("net: the %s left; their player stands still", g_mode == NET_HOST ? "joiner" : "host");
+			g_lost_left = 1;
 			g_state = S_LOST;
 		}
 	}
@@ -1851,6 +1853,8 @@ void net_hud(NetHud *h)
 	if (h->needed < 2) h->needed = 2;
 	if (g_problem && g_problem_at && now - g_problem_at < PROBLEM_MS) h->problem = g_problem;
 	h->desynced = (g_state == S_RUN || g_state == S_LOST) && g_bad_checks;
+	if (g_state == S_RUN && (int)(now - g_last_recv) > 1500) h->silent_ms = (int)(now - g_last_recv);
+	if (g_state == S_LOST) h->lost = g_lost_left ? 2 : 1;
 }
 
 /* ---- Rollback ------------------------------------------------------------------------------ */
@@ -2015,6 +2019,7 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	if (g_state == S_RUN && (int)(now - g_last_recv) > LOST_MS) {
 		log_msg("net: nothing from the %s for %d s; their player stands still (packets sent %d, received %d, inputs received %d)",
 		        g_mode == NET_HOST ? "joiner" : "host", LOST_MS / 1000, g_npackets_sent, g_npackets_recv, g_ninputs_recv);
+		g_lost_left = 0;
 		g_state = S_LOST;
 	}
 

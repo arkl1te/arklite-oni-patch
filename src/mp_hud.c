@@ -145,6 +145,23 @@ static void draw_score(int local, int width)
 	}
 }
 
+/* The other PC went quiet or is gone */
+static void draw_connection(const NetHud *h, int width, int height)
+{
+	char line[96];
+	const char *who = mp_name(1 - h->local_player);
+	int x = width / 2, y = height / 5;
+
+	if (h->lost) {
+		fmt(line, h->lost == 2 ? "%s left the game" : "Connection lost: %s stopped answering", who);
+		text(line, x, y, CENTER, RED);
+		text("Their player stands still. Esc opens the menu to quit.", x, y + g_line_height + 4, CENTER, WHITE);
+	} else if (h->silent_ms) {
+		fmt(line, "Waiting for %s... (%d s)", who, (h->silent_ms + 999) / 1000);
+		text(line, x, y, CENTER, YELLOW);
+	}
+}
+
 static void ONI_FC timer_display(void *timer)
 {
 	NetHud h;
@@ -168,6 +185,7 @@ static void ONI_FC timer_display(void *timer)
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) draw_problem(&h, width, height);
 	if (h.state != NETHUD_LOBBY && h.state != NETHUD_STARTING) mp_names_draw(width, height);
 	if (h.desynced) text("Out of sync with the other PC (see Arklite.log)", width / 2, 24, CENTER, RED);
+	if (h.state == NETHUD_MATCH) draw_connection(&h, width, height);
 	char_menu_draw(width, height);
 
 	TSrContext_SetColor(ctx, color);

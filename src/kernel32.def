@@ -37,3 +37,7 @@ EXPORTS
   GetModuleFileNameA@12
   HeapWalk@8
   GetCurrentThreadId@0
+  OpenThread@12
+  SuspendThread@4
+  ResumeThread@4
+  GetThreadContext@8
