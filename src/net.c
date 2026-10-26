@@ -101,8 +101,8 @@ typedef unsigned long long u64;
 #define IMG_SIZE        (CHR_SIZE + ACTIVE_SIZE)
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
-#define DEFAULT_PORT    27777
-#define PROTO           6
+#define DEFAULT_PORT    NET_DEFAULT_PORT
+#define PROTO           8
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -158,6 +158,7 @@ __declspec(dllimport) int  WINAPI TranslateMessage(const void *);
 __declspec(dllimport) int  WINAPI DispatchMessageA(const void *);
 __declspec(dllimport) void WINAPI PostQuitMessage(int);
 __declspec(dllimport) int  WINAPI setsockopt(u32, int, int, const void *, int);
+__declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(void *), void *, u32, u32 *);
 #ifndef ARKLITE_SRC_HASH
 #define ARKLITE_SRC_HASH 0   /* build.sh: a hash of the source, the same for every build of it */
 #endif
@@ -168,7 +169,7 @@ __declspec(dllimport) int  WINAPI setsockopt(u32, int, int, const void *, int);
 /* ---- Packets ------------------------------------------------------------------------------ */
 
 enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY, PKT_NAME,
-       PKT_MAP_LIST_REQ, PKT_MAP_LIST, PKT_MAP_REQ, PKT_MAP_DATA };
+       PKT_MAP_LIST_REQ, PKT_MAP_LIST, PKT_MAP_REQ, PKT_MAP_DATA, PKT_INFO_REQ, PKT_INFO };
 
 typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
 #define NFILES 4
@@ -212,6 +213,22 @@ typedef struct {
 	PktHead h;
 	char name[MP_NAME_MAX];   /* this PC's player's (mp_names.c); only shown, not game state */
 } PktName;
+/* The Join list asks every server it shows (mp_menu.c). The host answers whatever protocol the
+ * question has, with its own in the head, so a joiner on another Arklite sees why it can't join */
+typedef struct {
+	PktHead h;
+	u32 token, sent;       /* echoed back: which list entry asked, and when (the ping) */
+} PktInfoReq;
+typedef struct {
+	PktHead h;
+	u32 token, sent;
+	u32 level, players, max_players, spectators, max_spectators;
+	u32 in_match;          /* the match is on: a joiner waits in its lobby until the next one */
+	u32 server_id;         /* random per hosting: the same server reached at two addresses */
+	char name[NET_SERVER_NAME_MAX];   /* the server's, Host dialog */
+	char folder[64];       /* the map's folder in CustomLevels, "" for a numbered level */
+	char map[48];          /* the map's name */
+} PktInfo;
 
 /* ---- State -------------------------------------------------------------------------------- */
 
@@ -279,6 +296,13 @@ static u32 g_last_lobby;
 static u32 g_last_name, g_name_sent;   /* when our name last went out, and mp_name_serial() then */
 static u32 g_match_seed, g_match_local_seed;   /* the RNGs the match's level loads with */
 static u32 g_problem, g_problem_at;    /* NETBAD_* last seen (refused / refusing), and when */
+
+/* The server, as the Host dialog (or Arklite.ini [host]) has it */
+static char g_server_name[NET_SERVER_NAME_MAX] = "New Oni multiplayer game";
+static u32 g_max_players = 8, g_max_spectators;
+static u32 g_server_id;
+static int g_startup_mode;             /* set by the environment or Arklite.ini [net], not the menu */
+static int g_hashed, g_join_installed;
 
 /* What both PCs must have the same of besides Oni.exe: Daodan patches Oni's code and has
  * gameplay settings, and level0 holds the characters and animations */
@@ -1373,6 +1397,32 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 static void begin_run(void);
 static int net_open(void);
 
+/* Players this game takes: the netcode has the host and one joiner */
+#define NET_MAX_PLAYERS 2
+
+static void answer_info(const PktInfoReq *q, const SOCKADDR_IN *to)
+{
+	PktInfo p;
+	const char *folder = custom_game_level_folder(g_level), *map = custom_game_level_name(g_level);
+
+	memset(&p, 0, sizeof p);
+	head(&p.h, PKT_INFO);
+	p.token = q->token;
+	p.sent = q->sent;
+	p.level = g_level;
+	p.players = g_state == S_LOBBY ? lobby_players() : g_state == S_RUN || g_state == S_WAIT ? 1u + g_have_peer : 1;
+	p.max_players = g_max_players < NET_MAX_PLAYERS ? g_max_players : NET_MAX_PLAYERS;
+	p.spectators = 0;   /* no spectators yet */
+	p.max_spectators = g_max_spectators;
+	p.in_match = g_state != S_LOBBY;
+	p.server_id = g_server_id;
+	str_cpy(p.name, sizeof p.name, g_server_name);
+	if (folder) str_cpy(p.folder, sizeof p.folder, folder);
+	if (map) str_cpy(p.map, sizeof p.map, map);
+	else fmt(p.map, "Level %d", g_level);
+	send_to(&p, sizeof p, to);
+}
+
 static void receive(void)
 {
 	static u8 buf[2048];
@@ -1389,6 +1439,10 @@ static void receive(void)
 		const PktHead *h = (const PktHead *)buf;
 		if ((u32)n < sizeof *h || h->magic != MAGIC) continue;
 		g_npackets_recv++;
+		if (h->type == PKT_INFO_REQ && g_mode == NET_HOST && (u32)n >= sizeof(PktInfoReq)) {
+			answer_info((const PktInfoReq *)buf, &from);
+			continue;
+		}
 		if (g_have_peer && (from.addr != g_peer.addr || from.port != g_peer.port)) {
 			/* one joiner at a time: another only takes an empty lobby's place */
 			if (g_mode == NET_JOIN || g_state != S_LOBBY || g_peer_seen) continue;
@@ -2194,7 +2248,8 @@ __attribute__((naked)) static void hypo_sound(void)
 		"ret\n" :: "i"(hypo_sound_wanted));
 }
 
-static void sounds_install(void)
+/* The joiner's spots (pass-through while hosting or off) */
+static void sounds_join_install(void)
 {
 	static const u8 cmp_bytes[12] = { 0x8b, 0x15, 0x7c, 0xce, 0x5e, 0x00, 0x3b, 0xb2, 0xac, 0x00, 0x00, 0x00 };
 	static const u8 edi_bytes[6] = { 0x8b, 0xbe, 0xac, 0x00, 0x00, 0x00 };
@@ -2202,8 +2257,6 @@ static void sounds_install(void)
 	u32 rel;
 	int ok = 1;
 
-	if (patch_call(0x4edb9c, ONrUISound_Play, (u32)hypo_sound)) log_msg("net: hypo sounds only for this PC's player");
-	if (g_mode != NET_JOIN) return;
 	ok &= patch_call(0x51ca39, ONrPlayer_Get, (u32)get_player_here);
 	ok &= patch_call(0x4ddea9, ONrPlayer_Get, (u32)get_player_here);
 	if (code_matches(0x4f755b, cmp_bytes, sizeof cmp_bytes)) {
@@ -2222,6 +2275,11 @@ static void sounds_install(void)
 	} else ok = 0;
 	log_msg(ok ? "net: pickup, overheal and error sounds follow player 2"
 	           : "net: some player sounds couldn't be moved to player 2 (game code changed)");
+}
+
+static void sounds_install(void)
+{
+	if (patch_call(0x4edb9c, ONrUISound_Play, (u32)hypo_sound)) log_msg("net: hypo sounds only for this PC's player");
 }
 
 static void ONI_FC listener_position(u8 *chr, void *out) { ONrListener_Position(view_character(chr), out); }
@@ -2311,7 +2369,8 @@ static int net_open(void)
 		setsockopt(g_sock, 0xffff /* SOL_SOCKET */, 0x1002 /* SO_RCVBUF */, &rcv, 4);
 		setsockopt(g_sock, 0xffff, 0x1001 /* SO_SNDBUF */, &snd, 4);
 	}
-	g_images = VirtualAlloc(0, HASH_SLOTS * IMG_CHARS * sizeof(CharImage), 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
+	if (!g_images)
+		g_images = VirtualAlloc(0, HASH_SLOTS * IMG_CHARS * sizeof(CharImage), 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
 	if (g_mode == NET_JOIN) {
 		if (!resolve(g_join, &g_peer)) {
 			log_msg("net: can't find host %s, networking off", g_join);
@@ -2328,10 +2387,240 @@ static int net_open(void)
 	return 1;
 }
 
+/* What the first networked level needs, once: the game files' hashes and the hypo sound */
+static void net_prepare(void)
+{
+	if (g_hashed) return;
+	g_hashed = 1;
+	hash_files();
+	sounds_install();
+}
+
+/* The joiner's view, sounds and map download. Every patch only changes anything while this PC
+ * is joining (view_character, g_dl_level), so hosting or playing alone later is as before. */
+static void join_install(void)
+{
+	if (g_join_installed) return;
+	g_join_installed = 1;
+	view_install();
+	if (patch_call(ONcLevelLoad_TMCall, (u32)TMrLevel_Load, (u32)level_load))
+		log_msg("net: a map that differs from the host's is downloaded while the level loads");
+	sounds_join_install();
+}
+
+/* Out of the network game this PC was in (the main menu's Custom Game picks the next mode) */
+static void net_leave(void)
+{
+	session_end("left from the menu");
+	if (g_sock != INVALID_SOCKET) closesocket(g_sock);
+	g_sock = INVALID_SOCKET;
+	g_have_peer = g_peer_seen = g_peer_ready = 0;
+	g_match_pending = 0;
+	g_problem = 0;
+	g_mode = NET_OFF;
+}
+
+void net_menu_local(void)
+{
+	if (g_mode == NET_OFF) return;
+	if (g_startup_mode) {
+		log_msg("net: Play: %s stays on (set by %s)", mode_name(), "ARKLITE_HOST/ARKLITE_JOIN or Arklite.ini [net]");
+		return;
+	}
+	net_leave();
+	log_msg("net: off, playing alone");
+}
+
+void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectators)
+{
+	net_leave();
+	g_startup_mode = 0;
+	g_mode = NET_HOST;
+	g_port = (u16)(port >= 1 && port <= 65535 ? port : DEFAULT_PORT);
+	str_cpy(g_server_name, sizeof g_server_name, name && name[0] ? name : "New Oni multiplayer game");
+	g_max_players = max_players;
+	g_max_spectators = max_spectators;
+	g_server_id = GetTickCount() * 2654435761u ^ (u32)GetCurrentProcessId();
+	net_prepare();
+	log_msg("net: hosting \"%s\" on UDP port %d, %d players (%d for now), %d spectators", g_server_name, g_port,
+	        g_max_players, g_max_players < NET_MAX_PLAYERS ? g_max_players : NET_MAX_PLAYERS, g_max_spectators);
+}
+
+void net_menu_join(const char *address)
+{
+	net_leave();
+	g_startup_mode = 0;
+	g_mode = NET_JOIN;
+	str_cpy(g_join, sizeof g_join, address);
+	net_prepare();
+	join_install();
+	log_msg("net: joining %s", g_join);
+}
+
+/* ---- Server info for the Join list ------------------------------------------------------- */
+
+static u32 g_qsock = INVALID_SOCKET;
+
+static int query_open(void)
+{
+	u8 wsa[400];
+	SOCKADDR_IN local;
+	u32 on = 1;
+
+	if (g_qsock != INVALID_SOCKET) return 1;
+	if (WSAStartup(0x0202, wsa)) return 0;
+	g_qsock = socket(2, 2, 17);
+	if (g_qsock == INVALID_SOCKET) return 0;
+	memset(&local, 0, sizeof local);
+	local.family = 2;
+	if (bind(g_qsock, &local, sizeof local)) {
+		closesocket(g_qsock);
+		g_qsock = INVALID_SOCKET;
+		return 0;
+	}
+	ioctlsocket(g_qsock, FIONBIO, &on);
+	setsockopt(g_qsock, 0xffff /* SOL_SOCKET */, 0x20 /* SO_BROADCAST */, &on, 4);
+	return 1;
+}
+
+/* Name lookups (gethostbyname waits for DNS, seconds for a name that doesn't exist) run on a
+ * thread of their own, one at a time; the Join dialog asks and polls every frame */
+static volatile int g_rs_state;        /* 0 idle, 1 asked, 2 answered */
+static char g_rs_address[300];
+static SOCKADDR_IN g_rs_result;
+static int g_rs_ok;
+static HANDLE g_rs_thread;
+
+static u32 WINAPI resolver_thread(void *unused)
+{
+	u8 wsa[400];
+	WSAStartup(0x0202, wsa);
+	for (;;) {
+		while (g_rs_state != 1) Sleep(5);
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		g_rs_ok = resolve(g_rs_address, &g_rs_result) && g_rs_result.port;
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		g_rs_state = 2;
+	}
+	return 0;
+}
+
+int net_resolve_start(const char *address)
+{
+	if (g_rs_state != 0 || !address[0]) return 0;
+	if (!g_rs_thread) {
+		g_rs_thread = CreateThread(0, 0, resolver_thread, 0, 0, 0);
+		if (!g_rs_thread) return 0;
+	}
+	str_cpy(g_rs_address, sizeof g_rs_address, address);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	g_rs_state = 1;
+	return 1;
+}
+
+int net_resolve_poll(u32 *addr, u16 *port)
+{
+	if (g_rs_state != 2) return -1;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	*addr = g_rs_result.addr;
+	*port = g_rs_result.port;
+	int ok = g_rs_ok;
+	g_rs_state = 0;
+	return ok;
+}
+
+void net_query_send(u32 token, u32 addr, u16 port)
+{
+	PktInfoReq q;
+	SOCKADDR_IN to;
+
+	if (!query_open()) return;
+	memset(&q, 0, sizeof q);
+	head(&q.h, PKT_INFO_REQ);
+	q.token = token;
+	q.sent = GetTickCount();
+	memset(&to, 0, sizeof to);
+	to.family = 2;
+	to.addr = addr;
+	to.port = port;
+	sendto(g_qsock, &q, sizeof q, 0, &to, sizeof to);
+}
+
+/* Servers on this PC and the local network: the default port and Arklite.ini's */
+void net_query_broadcast(u32 token)
+{
+	u32 ports[2] = { DEFAULT_PORT, GetPrivateProfileIntA("net", "port", DEFAULT_PORT, ini_path()) };
+	for (int i = 0; i < 2; i++) {
+		if (i && (ports[i] == ports[0] || ports[i] < 1 || ports[i] > 65535)) continue;
+		net_query_send(token, 0xffffffffu, htons((u16)ports[i]));   /* 255.255.255.255 */
+		net_query_send(token, 0x0100007fu, htons((u16)ports[i]));   /* 127.0.0.1 */
+	}
+}
+
+int net_query_poll(NetServerInfo *out)
+{
+	static u8 buf[2048];
+	SOCKADDR_IN from;
+	int len, n;
+
+	if (g_qsock == INVALID_SOCKET) return 0;
+	for (;;) {
+		len = sizeof from;
+		n = recvfrom(g_qsock, buf, sizeof buf, 0, &from, &len);
+		if (n < 0) {
+			if (WSAGetLastError() == 10054) continue;   /* WSAECONNRESET: nobody on that port */
+			return 0;
+		}
+		const PktInfo *p = (const PktInfo *)buf;
+		if ((u32)n < sizeof p->h || p->h.magic != MAGIC || p->h.type != PKT_INFO) continue;
+		memset(out, 0, sizeof *out);
+		/* another protocol's reply may not be laid out like ours: only its token and time count */
+		if ((u32)n < 3 * 4 + sizeof p->h) continue;
+		out->token = p->token;
+		out->ping_ms = GetTickCount() - p->sent;
+		out->from_addr = from.addr;
+		out->from_port = from.port;
+		out->same_version = p->h.proto == PROTO && (u32)n >= sizeof *p;
+		if (out->same_version) {
+			out->level = p->level;
+			out->players = p->players;
+			out->max_players = p->max_players;
+			out->spectators = p->spectators;
+			out->max_spectators = p->max_spectators;
+			out->in_match = p->in_match;
+			out->server_id = p->server_id;
+			memcpy(out->name, p->name, sizeof out->name);
+			memcpy(out->folder, p->folder, sizeof out->folder);
+			memcpy(out->map, p->map, sizeof out->map);
+			out->name[sizeof out->name - 1] = out->folder[sizeof out->folder - 1] = out->map[sizeof out->map - 1] = 0;
+		}
+		return 1;
+	}
+}
+
+void net_query_close(void)
+{
+	if (g_qsock != INVALID_SOCKET) closesocket(g_qsock);
+	g_qsock = INVALID_SOCKET;
+}
+
+/* ---- Install ------------------------------------------------------------------------------ */
+
 void net_install(void)
 {
 	char host_env[32];
 	u32 port;
+
+	/* The server's description, as the Host dialog saved it */
+	GetPrivateProfileStringA("host", "name", g_server_name, g_server_name, sizeof g_server_name, ini_path());
+	g_max_players = GetPrivateProfileIntA("host", "max_players", 8, ini_path());
+	g_max_spectators = GetPrivateProfileIntA("host", "max_spectators", 0, ini_path());
+	port = GetPrivateProfileIntA("net", "port", DEFAULT_PORT, ini_path());
+	g_delay = GetPrivateProfileIntA("net", "delay", 0, ini_path());   /* 0: rollback, no input delay */
+	g_record = GetPrivateProfileIntA("net", "record", 1, ini_path()) != 0;
+	if (g_delay > 30) g_delay = 30;
+	if (port < 1 || port > 65535) port = DEFAULT_PORT;
+	g_port = (u16)port;
 
 	if (GetEnvironmentVariableA("ARKLITE_HOST", host_env, sizeof host_env)) g_mode = NET_HOST;
 	else if (GetEnvironmentVariableA("ARKLITE_JOIN", g_join, sizeof g_join)) g_mode = NET_JOIN;
@@ -2342,28 +2631,21 @@ void net_install(void)
 			g_mode = NET_JOIN;
 	}
 	if (g_mode == NET_OFF) {
-		log_msg("net: off (set ARKLITE_HOST or ARKLITE_JOIN, or host/join in Arklite.ini [net])");
+		log_msg("net: off until Custom Game hosts or joins (or ARKLITE_HOST / ARKLITE_JOIN, or host/join in Arklite.ini [net])");
 		return;
 	}
+	g_startup_mode = 1;
+	g_server_id = GetTickCount() * 2654435761u ^ (u32)GetCurrentProcessId();
 
-	port = GetPrivateProfileIntA("net", "port", DEFAULT_PORT, ini_path());
-	g_delay = GetPrivateProfileIntA("net", "delay", 0, ini_path());   /* 0: rollback, no input delay */
-	g_record = GetPrivateProfileIntA("net", "record", 1, ini_path()) != 0;
-	if (g_delay > 30) g_delay = 30;
 	if (g_mode == NET_HOST) {   /* ARKLITE_HOST=1, or a port number */
 		u32 v = 0;
 		for (const char *s = host_env; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
-		if (v > 1 && v < 65536) port = v;
+		if (v > 1 && v < 65536) g_port = (u16)v;
 	}
-	if (port < 1 || port > 65535) port = DEFAULT_PORT;
-	g_port = (u16)port;
 	log_msg("net: %s, input delay %d ticks; the game waits at the level's start for the %s",
 	        g_mode == NET_HOST ? "hosting" : "joining", g_delay, g_mode == NET_HOST ? "joiner" : "host");
-	hash_files();
-	if (g_mode == NET_JOIN) view_install();
-	if (g_mode == NET_JOIN && patch_call(ONcLevelLoad_TMCall, (u32)TMrLevel_Load, (u32)level_load))
-		log_msg("net: a map that differs from the host's is downloaded while the level loads");
-	sounds_install();
+	net_prepare();
+	if (g_mode == NET_JOIN) join_install();
 	/* a second Oni on the same PC, for testing: skip "There is already an instance". Daodan
 	 * replaces Oni's platform setup (0x50f670) with DD_ONrPlatform_Initialize, which checks
 	 * the same way (FindWindowA for class "ONI ", call eax; sub esp,8; test eax,eax; je at
@@ -2386,6 +2668,7 @@ void net_install(void)
 void net_exit(void)
 {
 	session_end("game closed");
+	net_query_close();
 	if (g_sock != INVALID_SOCKET) closesocket(g_sock);
 	g_sock = INVALID_SOCKET;
 }

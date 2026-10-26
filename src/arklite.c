@@ -4,8 +4,9 @@
  * Addresses are for the original Oni.exe (sha256 363cf09684ca6b729b62f22f90701d7ebf9a33778e55b191f5040bccdcdd013d).
  *
  * Patches:
- *   - Custom Game (custom_game.c): a main-menu button that lists and starts the levels in
- *     GameDataFolder\CustomLevels and any installed non-original level.
+ *   - Custom Game (custom_game.c, mp_menu.c): a main-menu button that lists and starts the levels in
+ *     GameDataFolder\CustomLevels and any installed non-original level, alone or as a network
+ *     host, and joins network games from a list of saved servers.
  *   - Pause menu music (Options > More... > When Game Pauses; more_options.c). Pressing
  *     Escape during a level opens the main menu dialog (0x96). Its init handler (0x4d2cd0,
  *     msg 0x3d) starts "main_menu_win" at full volume and then fades it to 1.0 over 0.5 s

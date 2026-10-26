@@ -76,6 +76,8 @@ const char *custom_game_level_ini(u32 level);   /* level.ini of the custom level
 const char *custom_game_level_dir(u32 level);   /* that level's folder (ends with '\'), or 0 */
 const char *custom_game_level_folder(u32 level); /* that folder's name in CustomLevels, or 0 */
 int  custom_game_remount(u32 level);             /* list its files again and mount them (net.c's map download) */
+const char *custom_game_level_name(u32 level);   /* the custom level's name (level.ini), or 0 */
+int  custom_game_has_folder(const char *folder);  /* CustomLevels\<folder> holds a level */
 
 /* ---- volume.c ----------------------------------------------------------------------------- */
 
@@ -158,6 +160,28 @@ void lockstep_net_record_end(const char *why);
 void net_install(void);        /* ARKLITE_HOST / ARKLITE_JOIN: two PCs in lockstep over UDP */
 void net_exit(void);
 int  net_active(void);
+/* Custom Game picks what the next level is: alone, hosting, or joining */
+#define NET_DEFAULT_PORT    27777
+#define NET_SERVER_NAME_MAX 48
+void net_menu_local(void);     /* Play (a mode set at startup stays) */
+void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectators);
+void net_menu_join(const char *address);   /* host[:port] */
+/* What a server says about itself, for the Join list */
+typedef struct {
+	u32 token, ping_ms;
+	int same_version;          /* it runs this Arklite's protocol (else nothing below is known) */
+	u32 level, players, max_players, spectators, max_spectators, in_match, server_id;
+	u32 from_addr;             /* where the reply came from (network order) */
+	u16 from_port;
+	char name[NET_SERVER_NAME_MAX], folder[64], map[48];
+} NetServerInfo;
+/* host[:port] looked up on a thread, one at a time: start (0 if one is still going), then poll
+ * every frame: -1 not yet, 0 not found, 1 addr/port (network order) */
+int  net_resolve_start(const char *address);
+int  net_resolve_poll(u32 *addr, u16 *port);
+void net_query_send(u32 token, u32 addr, u16 port);
+void net_query_broadcast(u32 token);   /* this PC and the local network */
+int  net_query_poll(NetServerInfo *out);   /* 1: a reply came, in *out */
 #define NET_CHAR_IMAGE_SIZE (0x16a0 + 0x2838)   /* a character and its active data */
 int  net_char_image(u32 index, u8 *img);   /* the character's state without drawing's fields; 0 if not in use */
 u32  net_update(u32 count, void *actions, u32 *ticks_run);   /* the game update while it's on */
@@ -179,6 +203,61 @@ enum {
 };
 void net_hud(NetHud *h);
 const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
+
+/* ---- mp_menu.c --------------------------------------------------------------------------- */
+
+/* Custom Game's dialogs: the New/Join popup, the Host settings and the Join list */
+enum { MPMENU_CANCEL, MPMENU_NEW, MPMENU_JOIN };
+void mp_menu_install(void);   /* text fields: keys and caret */
+int  mp_menu_choose(void);
+int  mp_menu_host(const char *map_name);   /* 1: Host (net.c is set up), 0: Cancel */
+/* 1: Join (net.c is set up); the host's map: its CustomLevels folder ("" for a numbered level) and level */
+int  mp_menu_join(char *folder, u32 folder_size, u32 *level);
+
+/* Building dialogs from code, shared with custom_game.c's level list */
+#define WMcClass_EditField 7
+#define WMcClass_ListBox   8
+#define WMcClass_Label     0x14
+#define WMrWindow_SetEnabled ((u8 (ONI_FC *)(WMtWindow *, u32))0x475580)
+#define WMrWindow_GetBytes   ((u8 *(ONI_FC *)(WMtWindow *, u32))0x474dc0)   /* the class's data (volume.c: GetData) */
+/* List box (class 8, proc 0x46c720); style 0x80000 keeps copies of the strings, 0x10000 has a scroll bar */
+#define LBcMessage_DeleteString 0x46   /* p2 index */
+#define LBcMessage_GetNumLines  0x48
+#define LBcMessage_GetSelection 0x49   /* index, or -1 */
+#define LBcMessage_ReplaceString 0x4d  /* p1 text, p2 index */
+#define LBcMessage_Reset        0x4e
+#define LBcMessage_SetSelection 0x53   /* p1 notify, p2 index (-1: none); scrolls it into view */
+#define LBcMessage_Scroll       0x58   /* p1 4 << 16, p2 first line */
+#define LBcStyle_Strings        0x80000
+#define LBcStyle_ScrollBar      0x10000
+/* Edit field (class 7, proc 0x46b9c0); style 0x10000 takes only digits, '.' and '-' */
+#define EFcMessage_GetText      0x40   /* p1 buffer, p2 size */
+#define EFcMessage_SetMaxLength 0x41   /* p1 characters */
+#define EFcMessage_SetText      0x42   /* p1 text */
+#define EFcStyle_Numbers        0x10000
+#define EFcNotify_Changed       0xa    /* sent with the field's id after every key that changed it */
+/* A new window like src (class unless cls != 0, flags, style unless style != ~0, font), placed after
+ * anchor in the drawing order (earlier children draw on top) */
+WMtWindow *ui_add(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *src, u32 cls, u32 style,
+                  const char *text, u32 id, int x, int y, int w, int h);
+void ui_set_frame(WMtWindow *w, int x, int y, int width, int height);
+void ui_set_text(WMtWindow *w, const char *text);
+void ui_set_text_fit(WMtWindow *w, const char *text);   /* cut with "..." to the window's width */
+/* Tahoma Bold 10 (the menus' font): width in pixels, and src cut with "..." to fit width */
+int  ui_text_width(const char *s);
+void ui_fit(char *dst, unsigned size, const char *src, int width);
+/* A label (copy of font's font) with its text cut to w */
+enum { UI_LEFT, UI_CENTER, UI_RIGHT };
+#define UI_LABEL_STYLE 0x110000   /* the Options dialog's labels: vertically centered */
+#define UI_ORANGE      0xffff7f00   /* the menus' text */
+#define UI_BLUE        0xff689be4   /* the Options dialog's frame headers */
+#define LBcStyle_OwnerDraw 0x100000 /* the list asks its dialog to draw each row's text (msg 0x36) */
+#define LBcMessage_DrawRow 0x36
+int  ui_list_draw_row(u32 p2, u32 color);   /* from the dialog proc on msg 0x36: that row's text in color */
+void ui_list_draw_text(u32 p2, int x, int width, const char *text, u32 color);   /* text at x in the row, cut to width */
+WMtWindow *ui_label(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, const char *text, int x, int y, int w, int h, int align);
+void *ui_frame_hook(void (*fn)(void));   /* called every frame while a dialog is up; returns the old one */
+void ui_frame_hook_call(void *old);       /* from fn: the hook it replaced */
 
 /* ---- mp_hud.c ---------------------------------------------------------------------------- */
 

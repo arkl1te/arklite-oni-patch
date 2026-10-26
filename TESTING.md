@@ -80,12 +80,18 @@ again for single player.
 The level starts as a lobby: **F3** = ready. With everyone ready a 7 s countdown runs, then both
 PCs reload the level and the synced match starts. The host needs UDP port 27777 open.
 
+By default the match uses rollback (`[net] delay=0`, the host's setting counts): no input delay,
+and the log says `net: rollback on` and, every 30 s, how many corrections ran. Rollback matches
+aren't recorded. For a recorded lockstep match (to track a desync with the tools below), set
+`delay=4` under `[net]` in the host's `Arklite.ini`.
+
 Files after a network game (in `AE/` of each PC):
 
 | File | Contents |
 | --- | --- |
 | `Arklite.log` / `Arklite-join.log` | `net:` lines; `DESYNC` if the games came apart |
-| `Arklite-net-host.akr` / `Arklite-net-join.akr` | each PC's recording of the match |
+| `Arklite-net-host.akr` / `Arklite-net-join.akr` | each PC's recording of the match (lockstep only) |
+| `Arklite-net-host.col` / `Arklite-net-join.col` | each PC's collision log: every in-tick collision query and character move step |
 | `Arklite-desync-host.bin` / `-join.bin` | all characters at the first desync |
 
 Compare them (copy the joiner's files next to the host's first):
@@ -94,10 +100,24 @@ Compare them (copy the joiner's files next to the host's first):
 grep -E "DESYNC|state hashes|respawned|changed" Arklite.log Arklite-join.log
 python3 ~/Projects/oni-decompiled/arklite/tools/akr_diff.py Arklite-net-host.akr Arklite-net-join.akr
 python3 ~/Projects/oni-decompiled/arklite/tools/desync_diff.py Arklite-desync-host.bin Arklite-desync-join.bin
+python3 ~/Projects/oni-decompiled/arklite/tools/col_diff.py Arklite-net-host.col Arklite-net-join.col
 ```
 
 At the end of a level each log says how many state hashes were compared and how many differed
 (`state hashes: N compared, 0 differed` = in step all along).
+
+## 2b. Rollback tests (one PC, no network)
+
+Don't press Esc (the pause menu runs inside a tick) and don't use a gamepad (player 2's input
+isn't kept per tick there). Play actively until the log says the survey or the test is done.
+
+```sh
+env ARKLITE_AUTOSTART=StalwartXL ARKLITE_MEMSURVEY=20 wine Oni.exe -noswitch       # Arklite-memsurvey.txt
+env ARKLITE_AUTOSTART=StalwartXL ARKLITE_ROLLBACK_TEST=20 wine Oni.exe -noswitch   # Arklite-rollbacktest.txt
+```
+
+The rewind test logs `game state MATCHED` or `DIFFERS` per sample and `ALL MATCHED` at the end;
+the report lists differing characters and pages with their owners.
 
 ## 3. Checklist for the F1 / F2 changes
 

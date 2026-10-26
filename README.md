@@ -12,7 +12,7 @@ Interactive or Rockstar, and it contains no Oni code or data: you need your own 
 
 | Feature | What it does |
 | --- | --- |
-| Custom Game | A **Custom Game** button on the main menu lists and starts custom levels from `AE/GameDataFolder/CustomLevels/`. Levels don't need a unique level number. See [Custom Game](#custom-game). |
+| Custom Game | A **Custom Game** button on the main menu: **New** lists and starts custom levels from `AE/GameDataFolder/CustomLevels/` (play alone, or host them for others), **Join** lists your saved servers and joins one. Levels don't need a unique level number. See [Custom Game](#custom-game). |
 | Options > More... | A **More...** button next to Close opens a second page of options (below). |
 | HUD scale | **HUD Scale** (50–300%) grows or shrinks the health and weapon rings toward their screen corners. The stock HUD is a fixed number of pixels, so it gets tiny at high resolutions. |
 | Sound, Music and Voice volume | Options > Overall Volume becomes three sliders: **Sound Volume** (effects and ambience), **Music Volume** (music and Bink movies) and **Voice Volume** (character dialog). |
@@ -25,7 +25,7 @@ Interactive or Rockstar, and it contains no Oni code or data: you need your own 
 | Player 2 on a gamepad | A second character with the IsPlayer flag in a level is played on an XInput gamepad, next to Konoko on keyboard and mouse. See [Player 2](#player-2). |
 | Determinism fixes | Ambient sounds, particles and speech no longer depend on the frame rate, the sound card or what is drawn, so the same input always gives the same game. Multiplayer needs this; in normal play you won't notice a difference. |
 | Input record and replay | For testing: records a level's input and replays it, checking every tick that the game came out the same. Off unless `ARKLITE_RECORD` or `ARKLITE_REPLAY` is set. See [Record and replay](#record-and-replay). |
-| Network test (two PCs) | For testing: one PC hosts, another joins by IP, and both play the same map in lockstep, Konoko on the host and player 2 on the joiner. Off unless `ARKLITE_HOST` or `ARKLITE_JOIN` is set. See [Network test](#network-test). |
+| Network test (two PCs) | For testing: one PC hosts, another joins by IP, and both play the same map in lockstep, Konoko on the host and player 2 on the joiner. Start it from **Custom Game** (Host / Join), or with `ARKLITE_HOST` / `ARKLITE_JOIN`. See [Network test](#network-test). |
 | Crash log | If Oni crashes, `AE/Arklite.log` gets the registers and the stack values that point into Oni, Daodan or Arklite. |
 
 Multiplayer over the network is at its first test: two players, started by hand with
@@ -104,9 +104,12 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `p2_invert_y` | 0 | 1: invert the right stick's up/down |
 | `[net]` | `host` | 0 | 1: host a network game, as `ARKLITE_HOST=1` does. Set it back to 0 for single player |
 | | `join` | (empty) | `<ip>[:port]`: join that host, as `ARKLITE_JOIN` does. Empty it for single player |
-| | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one |
+| | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one. The Host dialog saves its Port here |
 | | `record` | 1 | 0: don't record network games to `Arklite-net-host.akr` / `-join.akr` |
-| | `delay` | 4 | Input delay in ticks (1/60 s each). The host's value is used on both PCs; raise it if the game stutters over a slow connection |
+| | `delay` | 0 | 0: no input delay; the other player's input is predicted and the game corrects itself when the real one arrives (rollback). 1 or more: the input delay in ticks (1/60 s each), and the game waits for the other player's input instead. The host's value is used on both PCs |
+| `[host]` | `name` | New Oni multiplayer game | The server's name in other players' Join list (the Host dialog saves it) |
+| | `max_players`, `max_spectators` | 8, 0 | The Host dialog's last values. For now a game has 2 players and no spectators |
+| `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by Add and Remove |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
 | | `characters` | 14 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
@@ -128,9 +131,24 @@ On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`,
 
 ## Custom Game
 
-The button lists every level in `GameDataFolder/CustomLevels/` plus any installed level whose
-number isn't from the original game. Custom levels don't need a unique level number: each one
-gets a free number (31 or lower) when you pick it. Put each level in its own folder:
+The button asks whether to start a **New** custom game or **Join** one through the network.
+
+**New** lists every level in `GameDataFolder/CustomLevels/` plus any installed level whose
+number isn't from the original game, with how many players it has room for (its Player-flagged
+characters, the spawn points); the ones that can be played in multiplayer are blue. **Play** plays it alone. **Host** opens the host settings (map,
+server name, port, max players and spectators; the last ones used are kept) and starts the level
+as a network game others can join. A map needs two or more spawn points to be hosted; the list
+says so under it when the selected one hasn't. **Dedicate** (a server without a game window) isn't
+built yet. In the text fields, **Enter** or **Esc** confirms what you typed and leaves the field (Esc doesn't close the screen while you're in a field), and **Tab** goes to the next field. Text is selected as in Windows: **Shift** with the arrows, **Home** and **End** (and **Ctrl** for whole words), a double click selects a word, a triple click everything, **Ctrl+A** too.
+
+**Join** lists your saved servers with their ping, name and players, and adds the games hosted on
+this PC or your local network by itself (those aren't saved unless you edit their address). Select one to see what it
+says about itself (name, players connected, spectators, map) and **Play** to join it; you need the
+same map in your `CustomLevels`. **Add** makes a new entry: type its address (`192.168.1.10`, a
+name, and `:port` if it isn't 27777) in **Address**. **Remove** deletes the selected one.
+
+ Custom levels don't need a unique level number: each one
+gets a free number (31 or lower) when you pick it (a joiner takes the host's). Put each level in its own folder:
 
 ```
 CustomLevels/<AnyFolderName>/
@@ -141,8 +159,7 @@ CustomLevels/<AnyFolderName>/
     IGMD/<level name>/     BSL scripts (optional; otherwise GameDataFolder/IGMD is used)
 ```
 
-Known gaps: the screen reuses the Load Game dialog, so its background art still says "Load
-Game"; save points made in a custom level go to the persist.dat slot it was mounted in (when that
+Known gaps: save points made in a custom level go to the persist.dat slot it was mounted in (when that
 slot has no save for a save point, the `source` level's is used); and what happens when a
 custom level ends (its "next level") isn't handled yet.
 
@@ -252,6 +269,10 @@ must already have the map's folder. Arklite counts as the same when it
 was built from the same source: a release download and your own build of that release's commit
 can play together. The joiner uses the host's
 `respawn_delay` and `item_respawn`.
+
+The easy way is **Custom Game**: one PC picks a map under **New** and clicks **Host**, the other
+adds the host's IP under **Join** and clicks **Play**. For scripted tests the environment works
+too (a mode set this way stays on for the whole session, even when you pick **Play**):
 
 ```sh
 cd "/path/to/Oni/AE"
