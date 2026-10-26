@@ -106,7 +106,7 @@ typedef unsigned long long u64;
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
-#define MAX_AHEAD       6            /* inputs made past the delay before merging */
+#define STALL_LOG_MS    30000        /* how often waits for the peer's inputs are logged */
 #define HASH_EVERY      60
 #define HASH_SLOTS      8
 #define MAX_CHARS       255
@@ -230,6 +230,17 @@ static u32 g_level, g_last_tick;
 static u32 g_ticks;                    /* ticks run this session */
 static u32 g_gen;                      /* our inputs are made for ticks < g_gen */
 static u32 g_remote;                   /* the peer's inputs are here for ticks < g_remote */
+static u32 g_stall_frames, g_stall_ticks, g_last_stall_log;   /* frames held back by the peer's inputs */
+/* Rollback (delay 0, the default): this PC's input runs at once, the peer's is predicted, and a
+ * wrong guess puts the game back (rollback.c) and runs the ticks again */
+#define ROLLING         (g_delay == 0)
+#define RB_AHEAD        (ROLLBACK_KEPT_TICKS - 2)   /* ticks run past the peer's last real input, at most */
+#define ONgSoundOn      (*(u8 *)0x5eb757)           /* SS2 "a sound driver is there": every sound call checks it */
+static u32 g_verified;                 /* ticks < this ran with the peer's real inputs */
+static u32 g_pred[RING][12];           /* the peer's input each tick last ran with */
+static int g_rb_started;               /* the engine is on for this match */
+static u8  g_sound_on;                 /* ONgSoundOn as the game had it */
+static u32 g_rollbacks, g_resim_ticks, g_rb_failed, g_rb_deepest, g_rb_frames;
 static u32 g_peer_ack;                 /* the peer has our inputs for ticks < g_peer_ack */
 static u32 g_local_in[RING][12], g_remote_in[RING][12];
 static u32 g_remote_at[RING];          /* tick + 1 of the input in the slot, 0: none */
@@ -246,6 +257,7 @@ typedef struct { u32 index, flags; int health; float pos[3], facing, vel[3]; } C
 static struct { u32 tick, hash, n; CharSum chars[MAX_CHARS]; } g_mine[HASH_SLOTS];
 static struct { u32 tick, hash; } g_theirs[HASH_SLOTS];
 static u32 g_checked[HASH_SLOTS];        /* the tick each slot was last compared at */
+static u32 g_published[HASH_SLOTS];      /* rollback: the tick each slot's hash went out for (verified) */
 static u32 g_last_hash_tick, g_last_hash;
 static u32 g_checks, g_bad_checks, g_first_bad;
 /* Per hash slot, the full image of each character in use (character, then active data), for
@@ -472,6 +484,16 @@ static void image_of(u32 index, u8 *img)
 	*(u32 *)(img + 0x166c) = 0;                             /* HUD hit arrows, faded for the viewer only */
 }
 
+/* rollback.c: character index's state as compared between PCs (image_of), 0 if not in use */
+int net_char_image(u32 index, u8 *img)
+{
+	u8 *gs = ONgGameState;
+	if (!gs || index >= ONgCharacterSlots || index >= MAX_CHARS) return 0;
+	if (!(*(u32 *)(GS_CHARACTERS(gs) + index * CHR_SIZE + 4) & CHR_INUSE)) return 0;
+	image_of(index, img);
+	return 1;
+}
+
 static void capture_images(u32 slot)
 {
 	u8 *chr = GS_CHARACTERS(ONgGameState);
@@ -521,6 +543,7 @@ static void compare_hash(u32 slot)
 {
 	u32 tick = g_mine[slot].tick;
 	if (!tick || g_theirs[slot].tick != tick || g_checked[slot] == tick) return;
+	if (ROLLING && g_published[slot] != tick) return;   /* not run with the peer's real inputs yet */
 	g_checked[slot] = tick;
 	g_checks++;
 	if (g_theirs[slot].hash != g_mine[slot].hash) {
@@ -544,9 +567,26 @@ void net_tick_done(void)
 	g_mine[slot].hash = summarize(g_mine[slot].chars, &g_mine[slot].n);
 	capture_images(slot);
 	g_mine[slot].tick = g_ticks;
+	if (ROLLING && g_ticks > g_remote) return;   /* a guess: published once verified (publish_verified) */
+	g_published[slot] = g_ticks;
 	g_last_hash_tick = g_ticks;
 	g_last_hash = g_mine[slot].hash;
 	compare_hash(slot);
+}
+
+/* Rollback: the hashes of ticks that turned out to have been run with the right inputs */
+static void publish_verified(void)
+{
+	for (u32 slot = 0; slot < HASH_SLOTS; slot++) {
+		u32 tick = g_mine[slot].tick;
+		if (!tick || g_published[slot] == tick || tick > g_verified) continue;
+		g_published[slot] = tick;
+		if (tick > g_last_hash_tick) {
+			g_last_hash_tick = tick;
+			g_last_hash = g_mine[slot].hash;
+		}
+		compare_hash(slot);
+	}
 }
 
 /* ---- Sending and receiving ---------------------------------------------------------------- */
@@ -1458,7 +1498,7 @@ static void receive(void)
 			check_start("host", p->start_tick, p->state_hash, p->fpu_cw, &p->c);
 			g_seed = p->seed;
 			g_local_seed = p->local_seed;
-			if (p->delay >= 1 && p->delay <= 30) g_delay = p->delay;   /* the host's, on both PCs */
+			if (p->delay <= 30) g_delay = p->delay;   /* the host's, on both PCs (0: rollback) */
 			begin_run();
 		} else if (h->type == PKT_INPUT && (g_state == S_RUN)) {
 			g_last_recv = GetTickCount();
@@ -1493,6 +1533,7 @@ static void session_begin(u32 level)
 		g_map_hash = map;
 	}
 	g_ticks = g_remote = g_peer_ack = g_sent_gen = 0;
+	g_stall_frames = g_stall_ticks = 0;
 	g_has_pending = 0;
 	memset(g_local_in, 0, sizeof g_local_in);
 	memset(g_remote_at, 0, sizeof g_remote_at);
@@ -1502,6 +1543,11 @@ static void session_begin(u32 level)
 	memset(g_checked, 0, sizeof g_checked);
 	g_last_hash_tick = g_last_hash = 0;
 	g_checks = g_bad_checks = g_first_bad = 0;
+	memset(g_published, 0, sizeof g_published);
+	memset(g_pred, 0, sizeof g_pred);
+	g_verified = 0;
+	g_rb_started = 0;
+	g_rollbacks = g_resim_ticks = g_rb_failed = g_rb_deepest = g_rb_frames = 0;
 	g_npackets_sent = g_npackets_recv = g_ninputs_recv = g_send_errors = 0;
 	g_last_status = GetTickCount();
 	g_gen = g_delay;   /* ticks 0..delay-1: no input from either PC */
@@ -1538,6 +1584,13 @@ static void session_end(const char *why)
 	if (g_state == S_IDLE) return;
 	if (g_state == S_RUN) send_bye();
 	lockstep_net_record_end(why);
+	if (g_rb_started) {
+		rollback_net_end();
+		ONgSoundOn = g_sound_on;
+		log_msg("net: rollback: %d rollbacks re-ran %d ticks (deepest %d), %d couldn't go back far enough",
+		        g_rollbacks, g_resim_ticks, g_rb_deepest, g_rb_failed);
+		g_rb_started = 0;
+	}
 	if (g_state == S_RUN || g_state == S_LOST)
 		log_msg("net: level %d ended (%s) after %d ticks (%d s); state hashes: %d compared, %d differed%s",
 		        g_level, why, g_ticks, g_ticks / 60, g_checks, g_bad_checks, g_bad_checks ? ", see DESYNC above" : "");
@@ -1746,6 +1799,114 @@ void net_hud(NetHud *h)
 	h->desynced = (g_state == S_RUN || g_state == S_LOST) && g_bad_checks;
 }
 
+/* ---- Rollback ------------------------------------------------------------------------------ */
+
+static int same_input(const u32 *a, const u32 *b)
+{
+	for (int i = 0; i < 12; i++)
+		if (a[i] != b[i]) return 0;
+	return 1;
+}
+
+/* The inputs of ticks g_ticks.. g_ticks+n-1 into the frame records: ours, and the peer's real one
+ * or, past g_remote, a guess: its last real input with its buttons held and no stick or mouse
+ * movement (as make_input repeats ours). The peer's input each tick runs with goes to g_pred. */
+static void rb_fill_frames(u32 n)
+{
+	u32 guess[12];
+	if (g_remote) memcpy(guess, g_remote_in[(g_remote - 1) % RING], sizeof guess);
+	else memset(guess, 0, sizeof guess);
+	guess[7] = guess[8] = guess[9] = guess[10] = 0;
+	for (u32 k = 0; k < n; k++) {
+		u32 t = g_ticks + k, slot = t % RING;
+		const u32 *mine = g_local_in[slot], *theirs = t < g_remote ? g_remote_in[slot] : guess;
+		memcpy(g_pred[slot], theirs, 0x30);
+		memcpy(g_frame_p1[k], g_mode == NET_HOST ? mine : theirs, 0x30);
+		memcpy(g_frame_p2[k], g_mode == NET_HOST ? theirs : mine, 0x30);
+	}
+}
+
+/* Run the ticks again from g_ticks (just put back) up to to, silently */
+static void rb_resimulate(u32 to)
+{
+	ONgSoundOn = 0;
+	while (g_ticks < to) {
+		u32 n = to - g_ticks, before = g_ticks;
+		if (n > 6) n = 6;
+		rb_fill_frames(n);
+		players_net_frame(g_frame_p2, n);
+		run_update(n, 0);
+		if (g_ticks == before) break;   /* the update ran nothing: don't spin */
+	}
+	ONgSoundOn = g_sound_on;
+}
+
+static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u32 now)
+{
+	/* the peer's inputs that came in: were the guesses right? */
+	u32 upto = g_remote < g_ticks ? g_remote : g_ticks;
+	for (u32 t = g_verified; t < upto; t++) {
+		if (same_input(g_pred[t % RING], g_remote_in[t % RING])) continue;
+		u32 to = g_ticks;
+		if (rollback_restore_tick(t)) {
+			g_ticks = t;
+			rb_resimulate(to);
+			g_rollbacks++;
+			g_resim_ticks += to - t;
+			if (to - t > g_rb_deepest) g_rb_deepest = to - t;
+		} else if (!g_rb_failed++) {
+			log_msg("net: rollback: tick %d isn't kept any more (now %d): this game will come apart", t, g_ticks);
+		}
+		break;
+	}
+	g_verified = g_remote < g_ticks ? g_remote : g_ticks;
+	publish_verified();
+
+	/* this frame's ticks: as many as the clock asks, one more when behind the peer, but never
+	 * further past the peer's last real input than the snapshots reach */
+	u32 n = wanted;
+	if (g_remote > g_ticks + 1) n++;
+	if (n > 6) n = 6;
+	if (g_ticks + n > g_remote + RB_AHEAD) {
+		u32 can = g_remote + RB_AHEAD > g_ticks ? g_remote + RB_AHEAD - g_ticks : 0;
+		g_stall_frames++;
+		g_stall_ticks += n - can;
+		n = can;
+	}
+	if ((count & 0xffff) && actions) take_record((const u32 *)actions);
+	while (g_gen < g_ticks + n) make_input();
+	if (g_gen != g_sent_gen || now - g_last_send >= RESEND_MS) send_inputs();
+	if (now - g_last_stall_log >= STALL_LOG_MS) {
+		if (g_stall_frames)
+			log_msg("net: in the last %d s, %d frames waited for the %s's inputs (%d ticks in all)",
+			        STALL_LOG_MS / 1000, g_stall_frames, g_mode == NET_HOST ? "joiner" : "host", g_stall_ticks);
+		if (g_rb_started)
+			log_msg("net: rollback so far: %d rollbacks, %d ticks run again (deepest %d), %d pages kept per tick",
+			        g_rollbacks, g_resim_ticks, g_rb_deepest, rollback_known_pages());
+		g_stall_frames = g_stall_ticks = 0;
+		g_last_stall_log = now;
+	}
+	if (n) {
+		g_last_status = now;
+	} else if (now - g_last_status >= 1000) {
+		log_msg("net: waiting at tick %d: the %s's inputs up to %d; packets sent %d, received %d",
+		        g_ticks, g_mode == NET_HOST ? "joiner" : "host", g_remote, g_npackets_sent, g_npackets_recv);
+		g_last_status = now;
+	}
+
+	rb_fill_frames(n);
+	if (n && !g_rb_started) {   /* the match's first tick */
+		lockstep_set_seeds(g_seed, g_local_seed);
+		g_sound_on = ONgSoundOn;
+		g_rb_started = rollback_net_begin();
+		log_msg("net: rollback %s: no input delay, the %s's input guessed and corrected up to %d ticks back%s",
+		        g_rb_started ? "on" : "FAILED", g_mode == NET_HOST ? "joiner" : "host", RB_AHEAD,
+		        g_record ? " (recording is off with rollback)" : "");
+	}
+	players_net_frame(g_frame_p2, n);
+	return run_update(n, ticks_run);
+}
+
 /* lockstep.c's update hook, in place of the update, while networking is on */
 u32 net_update(u32 count, void *actions, u32 *ticks_run)
 {
@@ -1803,16 +1964,32 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 		g_state = S_LOST;
 	}
 
-	if ((count & 0xffff) && actions) take_record((const u32 *)actions);
-	for (u32 k = 0; k < wanted && g_gen < g_ticks + g_delay + MAX_AHEAD; k++) make_input();
-	if (g_state == S_RUN && (g_gen != g_sent_gen || now - g_last_send >= RESEND_MS)) send_inputs();
+	if (g_state == S_RUN && ROLLING) return rolling_frame(count, actions, ticks_run, wanted, now);
 
+	/* The ticks this frame runs, then this PC's inputs up to the delay past them: an input made
+	 * now is always used g_delay ticks later. Making them ahead by wall-clock time instead let
+	 * the queue grow (up to delay + 6 ticks) whenever the peer's inputs came late, and it never
+	 * shrank back. A frame that makes no input merges its record into the next one. */
 	u32 remote_avail = g_state == S_LOST ? 6 : g_remote - g_ticks;
 	u32 n = wanted;
 	if (g_state == S_RUN && g_remote > g_ticks + g_delay + 1) n++;   /* the peer is ahead */
-	if (n > g_gen - g_ticks) n = g_gen - g_ticks;
-	if (n > remote_avail) n = remote_avail;
+	if (n > remote_avail) {
+		g_stall_frames++;
+		g_stall_ticks += n - remote_avail;
+		n = remote_avail;
+	}
 	if (n > 6) n = 6;
+	if ((count & 0xffff) && actions) take_record((const u32 *)actions);
+	while (g_gen < g_ticks + g_delay + n) make_input();
+	if (n > g_gen - g_ticks) n = g_gen - g_ticks;
+	if (g_state == S_RUN && (g_gen != g_sent_gen || now - g_last_send >= RESEND_MS)) send_inputs();
+	if (now - g_last_stall_log >= STALL_LOG_MS) {
+		if (g_stall_frames)
+			log_msg("net: in the last %d s, %d frames waited for the %s's inputs (%d ticks late in all)",
+			        STALL_LOG_MS / 1000, g_stall_frames, g_mode == NET_HOST ? "joiner" : "host", g_stall_ticks);
+		g_stall_frames = g_stall_ticks = 0;
+		g_last_stall_log = now;
+	}
 	if (n || g_state != S_RUN) {
 		g_last_status = now;
 	} else if (now - g_last_status >= 1000) {   /* stuck waiting: say on what */
@@ -2170,9 +2347,8 @@ void net_install(void)
 	}
 
 	port = GetPrivateProfileIntA("net", "port", DEFAULT_PORT, ini_path());
-	g_delay = GetPrivateProfileIntA("net", "delay", 4, ini_path());
+	g_delay = GetPrivateProfileIntA("net", "delay", 0, ini_path());   /* 0: rollback, no input delay */
 	g_record = GetPrivateProfileIntA("net", "record", 1, ini_path()) != 0;
-	if (g_delay < 1) g_delay = 1;
 	if (g_delay > 30) g_delay = 30;
 	if (g_mode == NET_HOST) {   /* ARKLITE_HOST=1, or a port number */
 		u32 v = 0;

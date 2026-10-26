@@ -32,7 +32,11 @@
  *     a tick. The exception is the text console page (dialog 0x47, the BSL text_console command,
  *     0x504c40), which consoles use to show text: it waits for the end of the tick and then opens
  *     live, set up as 0x504c40 does it (the psui_oniUI part set, game input off). Its param
- *     points at {TxtC, page 0} on that function's stack, so the request keeps a copy;
+ *     points at {TxtC, page 0} on that function's stack, so the request keeps a copy. In a
+ *     network match it opens only on the PC whose player used the console: Oni fires a console's
+ *     events (and two other object types') through 0x4f3cc0 with the character that did it in edx,
+ *     and its script's text_console runs inside that call. A page asked for outside such a call
+ *     (a script that sleeps first, or one no character started) still opens on both PCs;
  *   - the game's own pause flag (gs+0x1679ac, read by the main loop through 0x4fc960) is
  *     cleared every frame;
  *   - the help screen doesn't turn the sound down: 0x5018c0 halves the master volume
@@ -60,6 +64,7 @@
 #define UIrPartSpec_Find        ((void *(ONI_FC *)(const char *))0x46aa80)
 #define UIgPartSpec             (*(void **)0x5e9758)
 #define WMcDialog_TextConsole   0x47
+#define ONrEventList_Fire       0x4f3cc0                   /* (events, character): a console's or trigger's */
 #define GS_PAUSED               0x1679ac                   /* u8, stock offset */
 #define GS_LEVEL_END            0x1679bc                   /* u32, stock offset: 1 won, 2 lost */
 
@@ -70,11 +75,13 @@
 #define ONcPauseMenu_SoundPauseCall 0x4d2d4a               /* init: call SSrSetPaused(1) */
 #define SSrSetPaused            ((void (ONI_FC *)(u32))0x514e60)
 #define ONcHelp_VolumeDownCall  0x501922
+static const u32 ONcEventList_FireCalls[] = { 0x4c0934, 0x4c28d6, 0x4cbb0a };   /* console used, and two other objects' events */
 #define SSrSetMasterVolume      ((float (__stdcall *)(float))0x483e00)
 #define SSgMasterVolumeNow      (*(float *)0x5eb744)
 
 static int g_open, g_pending;
-static struct { int pending; WMtDialogProc proc; u32 param[2]; } g_console;   /* text console page after the tick */
+static struct { int pending; WMtDialogProc proc; u32 param[2]; u8 *who; } g_console;   /* text console page after the tick */
+static u8 *g_event_char;   /* the character whose console or trigger events are firing, or 0 */
 static u32 g_menu_level;
 static void (ONI_FC *g_utility_input)(void *);
 
@@ -175,6 +182,28 @@ static void run_console(void)
 	UIgPartSpec = parts;
 }
 
+/* Whether this PC shows a text console page that character's events asked for */
+static int console_for_this_pc(u8 *who)
+{
+	NetHud h;
+
+	net_hud(&h);
+	if (!who || h.state != NETHUD_MATCH) return 1;
+	if (who != players_char(0) && who != players_char(1)) return 1;   /* an AI's: everyone's, as before */
+	return who == players_char(h.local_player);
+}
+
+static u16 ONI_FC fire_events(void *events, u8 *who)
+{
+	u8 *outer = g_event_char;
+	u16 r;
+
+	g_event_char = who;
+	r = ((u16 (ONI_FC *)(void *, u8 *))ONrEventList_Fire)(events, who);
+	g_event_char = outer;
+	return r;
+}
+
 /* After the main loop's update: open a requested menu outside the tick */
 static void main_loop_sound(void)
 {
@@ -190,7 +219,7 @@ static void main_loop_sound(void)
 	if (g_console.pending) {
 		g_console.pending = 0;
 		g_menu_level = ONrLevel_GetCurrent();
-		if (level_running() && !g_open) run_console();
+		if (level_running() && !g_open && console_for_this_pc(g_console.who)) run_console();
 	}
 }
 
@@ -210,6 +239,7 @@ u16 live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u3
 		g_console.proc = proc;
 		g_console.param[0] = ((u32 *)param)[0];
 		g_console.param[1] = ((u32 *)param)[1];
+		g_console.who = g_event_char;
 		g_console.pending = 1;
 		if (result) *result = 0;
 		return 0;
@@ -258,6 +288,9 @@ void live_menu_install(void)
 	patch_call(ONcMainLoop_SoundCall, (u32)SSrUpdate, (u32)main_loop_sound);
 	patch_call(ONcTick_UtilityInputCall, (u32)g_utility_input, (u32)utility_input);
 	patch_call(ONcPauseMenu_SoundPauseCall, (u32)SSrSetPaused, (u32)pause_menu_sound_pause);
+	for (u32 i = 0; i < sizeof ONcEventList_FireCalls / sizeof *ONcEventList_FireCalls; i++)
+		if (!patch_call(ONcEventList_FireCalls[i], ONrEventList_Fire, (u32)fire_events))
+			log_msg("live menu: event call at 0x%x changed, its text console pages show on both PCs", ONcEventList_FireCalls[i]);
 	if (!patch_call(ONcHelp_VolumeDownCall, (u32)SSrSetMasterVolume, (u32)help_volume_down))
 		log_msg("live menu: help screen code changed, it turns the sound down in multiplayer too");
 	log_msg("live menu: in multiplayer games the game keeps running behind the pause menu");

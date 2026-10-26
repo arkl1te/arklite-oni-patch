@@ -71,8 +71,8 @@ typedef struct {
 	int  made;
 } Item;
 
-static Item g_items[MAX_ITEMS];
-static int  g_nitems, g_delays_read;
+static Item g_items[MAX_ITEMS] TICK_STATE;
+static int  g_nitems TICK_STATE, g_delays_read TICK_STATE;
 static u32  g_default_ticks = 30 * 60;
 
 static Item *item_for(u8 *obj, u32 type)
