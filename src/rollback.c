@@ -350,6 +350,13 @@ typedef struct { EXCEPTION_RECORD *record; void *context; } EXCEPTION_POINTERS;
 
 __declspec(dllimport) int WINAPI HeapWalk(HANDLE, PROCESS_HEAP_ENTRY *);
 __declspec(dllimport) u32 WINAPI GetCurrentThreadId(void);
+__declspec(dllimport) u32 WINAPI GetTickCount(void);
+__declspec(dllimport) void WINAPI Sleep(u32);
+__declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(void *), void *, u32, u32 *);
+__declspec(dllimport) HANDLE WINAPI OpenThread(u32, int, u32);
+__declspec(dllimport) u32 WINAPI SuspendThread(HANDLE);
+__declspec(dllimport) u32 WINAPI ResumeThread(HANDLE);
+__declspec(dllimport) int WINAPI GetThreadContext(HANDLE, void *);
 
 typedef struct { u32 page, n, old; } Run;
 
@@ -371,6 +378,9 @@ typedef struct {
 	u32 oni[RB_MAX_ONI], noni;     /* allocation bases of Oni's runtime memory */
 	u32 samples_wanted, samples_done, next_sample, total_bad, ticks_protected, last_runs, nshared;
 	u32 fault_page, fault_tid, fault_repeat, forced;   /* a fault that keeps coming back */
+	volatile u32 body_serial, in_fault;   /* rb_watchdog: ticks begun; the main thread is in rb_fault */
+	u32 stack_top, rescues, rescue_learned;
+	HANDLE main_thread;
 	u8 mask[1024];                 /* rb_lock_mask: dwords of live critical sections */
 	u8 *gimg, *gnow;               /* every character's state before the rewind, and one now */
 	u8 ginuse[256];
@@ -479,16 +489,42 @@ static int rb_open_now(u32 p)
 	return VirtualQuery((const void *)(p << PAGE_SHIFT), &m, sizeof m) == sizeof m && (m.Protect & WRITABLE);
 }
 
+/* A protected page the main thread is about to write in this tick: known from now on, its
+ * content (as at the tick's start: nothing wrote it since) copied into the kept snapshots */
+static void rb_learn(u32 p)
+{
+	Engine *e = g_e;
+	u32 i = e->npages++;
+	e->pages[i] = p;
+	e->index[p] = (u16)(i + 1);
+	for (u32 s = 0; s < RB_SLOTS; s++)   /* not written in a tick since any of them */
+		if (e->slot_valid[s]) memcpy(slot_page(s, i), (const void *)(p << PAGE_SHIFT), 0x1000);
+}
+
+static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid);
+
 static long WINAPI rb_fault(EXCEPTION_POINTERS *ep)
+{
+	Engine *e = g_e;
+	u32 tid = GetCurrentThreadId();
+	long r;
+	if (!e) return 0;
+	if (tid != e->main_tid) return rb_fault_main(ep, tid);
+	e->in_fault = 1;
+	r = rb_fault_main(ep, tid);
+	e->in_fault = 0;
+	return r;
+}
+
+static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid)
 {
 	EXCEPTION_RECORD *r = ep->record;
 	Engine *e = g_e;
-	u32 p, old, tid;
+	u32 p, old;
 
-	if (!e || r->code != 0xc0000005u || r->nparams < 2) return 0;
+	if (r->code != 0xc0000005u || r->nparams < 2) return 0;
 	p = r->info[1] >> PAGE_SHIFT;
 	if (p >= PAGES || !(e->flag[p] & PF_CAND)) return 0;
-	tid = GetCurrentThreadId();
 	if (p == e->fault_page && tid == e->fault_tid) {
 		if (++e->fault_repeat > 4) {   /* never loop: open it for good */
 			e->flag[p] |= PF_FOREIGN | PF_SHARED;
@@ -515,11 +551,7 @@ static long WINAPI rb_fault(EXCEPTION_POINTERS *ep)
 	if (!(e->flag[p] & PF_PROT)) return rb_open_now(p) ? -1 : 0;   /* another thread just opened it */
 	if (r->info[0] != 1) return 0;
 	if (tid == e->main_tid && e->in_body && e->npages < RB_MAX_PAGES) {
-		u32 i = e->npages++;
-		e->pages[i] = p;
-		e->index[p] = (u16)(i + 1);
-		for (u32 s = 0; s < RB_SLOTS; s++)   /* not written in a tick since any of them */
-			if (e->slot_valid[s]) memcpy(slot_page(s, i), (const void *)(p << PAGE_SHIFT), 0x1000);
+		rb_learn(p);
 	} else {
 		if (tid == e->main_tid) e->overflow++;
 		else e->nforeign_pages++;
@@ -571,6 +603,8 @@ static void rb_start(void)
 	e->npages = e->overflow = 0;
 	for (u32 s = 0; s < RB_SLOTS; s++) e->slot_valid[s] = 0;
 	e->main_tid = GetCurrentThreadId();
+	if (!e->main_thread) e->main_thread = OpenThread(0x1fffff /* THREAD_ALL_ACCESS */, 0, e->main_tid);
+	__asm__ volatile("movl %%fs:4, %0" : "=r"(e->stack_top));
 	e->active = 1;
 	u32 pages = 0;
 	for (u32 i = 0; i < e->nregs; i++) pages += e->regs[i].size >> PAGE_SHIFT;
@@ -919,16 +953,137 @@ int rollback_test_tick(void *action, void (*body)(void *))
 	}
 	if (e->ticks_protected < 3) log_msg("rollback: tick %d: protecting %d known pages' neighbours", tick, e->npages);
 	rb_protect();
+	e->body_serial++;
 	e->in_body = 1;
 	body(action);
 	e->in_body = 0;
 	rb_unprotect();
 	e->ticks_protected++;
+	if (e->rescues && e->ticks_protected <= 3)
+		log_msg("rollback: tick %d finished after the watchdog stepped in", tick);
 	if (e->ticks_protected <= 3 || !(e->ticks_protected % 600))
 		log_msg("rollback: tick %d done (%d protected): %d known pages, %d shared, %d foreign, %d over the limit, %d runs",
 		        tick, e->ticks_protected, e->npages, e->nshared, e->nforeign_pages, e->overflow, e->last_runs);
 	if (e->ticks_protected <= RB_WATCH_FIRST || !(e->ticks_protected % RB_WATCH_EVERY)) rb_watch();
 	return 1;
+}
+
+/* ---- The watchdog ------------------------------------------------------------------------ *
+ * A write the game makes from inside a system call doesn't fault: the call fails instead. Under
+ * Wine (new WoW64 mode) that is every kernel32/ntdll call that stores into the caller's buffer
+ * (a read into a heap buffer, a time stamp into an Oni.exe global), so a buffer on a
+ * write-protected page can make a tick wait forever on a call that never succeeds; the first
+ * networked rollback test froze the Linux host in tick 0 that way, while Windows ran on.
+ * So while a tick runs with protection on, this thread checks on it every 200 ms. A tick still
+ * running after 1.5 s: the main thread is suspended, its EIP and the Oni.exe/Arklite return
+ * addresses on its stack go to Arklite.log, and every protected page that its registers or its
+ * stack point into is learned (as a first write would: the page is copied into the snapshots
+ * and opened), so the call can succeed. Still running 1.5 s later: every page is opened for
+ * the rest of that tick (pages it writes then aren't learned; logged). */
+#define RB_DOG_MS 1500
+
+static int rb_learn_at(u32 a)
+{
+	Engine *e = g_e;
+	u32 p = a >> PAGE_SHIFT, old;
+	if (p >= PAGES || !(e->flag[p] & PF_PROT) || e->index[p] || (e->flag[p] & PF_FOREIGN)) return 0;
+	if (e->npages >= RB_MAX_PAGES) return 0;
+	rb_learn(p);
+	VirtualProtect((void *)(p << PAGE_SHIFT), 0x1000, e->flag[p] & PF_EXEC ? 0x40 : 0x04, &old);
+	e->flag[p] &= ~PF_PROT;
+	return 1;
+}
+
+static int rb_in_image(u32 a, u32 base)
+{
+	u32 pe = *(u32 *)(base + 0x3c), size = *(u32 *)(base + pe + 24 + 56);   /* SizeOfImage */
+	return a >= base + 0x1000 && a < base + size;
+}
+
+static void rb_dog_report(u32 stage, u32 ms, const u32 *ctx, u32 learned)
+{
+	Engine *e = g_e;
+	char mod[128] = "?", calls[400];
+	MEMORY_BASIC_INFORMATION m;
+	u32 eip = ctx[0xb8 / 4], esp = ctx[0xc4 / 4], n = 0, len = 0;
+	const char *name = mod;
+
+	if (VirtualQuery((const void *)eip, &m, sizeof m) == sizeof m && GetModuleFileNameA(m.AllocationBase, mod, sizeof mod)) {
+		for (const char *c = mod; *c; c++)
+			if (*c == '\\' || *c == '/') name = c + 1;
+	}
+	calls[0] = 0;
+	for (u32 a = esp; a + 4 <= e->stack_top && a < esp + 0x10000 && n < 12; a += 4) {
+		u32 v = *(const u32 *)a;
+		if (!rb_in_image(v, 0x400000) && !rb_in_image(v, (u32)&__ImageBase)) continue;
+		fmt(calls + len, " %08x", v);
+		while (calls[len]) len++;
+		n++;
+	}
+	log_msg("rollback: watchdog: tick %d has run %d ms (stage %d): main thread at %08x (%s, base %08x), esp %08x; "
+	        "return addresses on its stack:%s", GS_TICK(ONgGameState), ms, stage, eip, name,
+	        (u32)m.AllocationBase, esp, n ? calls : " none");
+	if (stage == 1)
+		log_msg("rollback: watchdog: learned %d protected page(s) the main thread's registers and stack point into", learned);
+	else
+		log_msg("rollback: watchdog: opened every protected page for the rest of this tick (%d runs); writes in it "
+		        "aren't learned, so a rollback past this tick can come out different", e->nruns);
+}
+
+static u32 WINAPI rb_watchdog(void *unused)
+{
+	u32 serial = 0, since = 0, stage = 0;
+	u32 ctx[0x2cc / 4];
+
+	for (;;) {
+		Engine *e = g_e;
+		Sleep(200);
+		if (!e || !e->active || !e->in_body || !e->main_thread) {
+			stage = 0;
+			continue;
+		}
+		u32 now = GetTickCount();
+		if (e->body_serial != serial) {
+			serial = e->body_serial;
+			since = now;
+			stage = 0;
+			continue;
+		}
+		if (stage >= 2 || now - since < RB_DOG_MS * (stage + 1)) continue;
+		if (SuspendThread(e->main_thread) == 0xffffffffu) continue;
+		if (e->in_fault || !e->in_body || e->body_serial != serial) {   /* moving after all */
+			ResumeThread(e->main_thread);
+			continue;
+		}
+		memset(ctx, 0, sizeof ctx);
+		ctx[0] = 0x10007;   /* CONTEXT_FULL */
+		int have = GetThreadContext(e->main_thread, ctx);
+		u32 learned = 0;
+		stage++;
+		e->rescues++;
+		if (stage == 1 && have) {
+			for (u32 k = 0x9c / 4; k <= 0xb4 / 4; k++) {   /* edi esi ebx edx ecx eax ebp */
+				learned += rb_learn_at(ctx[k]);
+				learned += rb_learn_at(ctx[k] + 63);
+			}
+			for (u32 a = ctx[0xc4 / 4] & ~3u; a + 4 <= e->stack_top && a < ctx[0xc4 / 4] + 0x10000; a += 4) {
+				u32 v = *(const u32 *)a;
+				learned += rb_learn_at(v);
+				learned += rb_learn_at(v + 63);
+			}
+		} else {
+			for (u32 i = 0; i < e->nruns; i++) {
+				u32 old;
+				VirtualProtect((void *)(e->runs[i].page << PAGE_SHIFT), e->runs[i].n << PAGE_SHIFT, e->runs[i].old, &old);
+				for (u32 k = e->runs[i].page; k < e->runs[i].page + e->runs[i].n; k++) e->flag[k] &= ~PF_PROT;
+			}
+		}
+		e->rescue_learned += learned;
+		ResumeThread(e->main_thread);
+		if (have) rb_dog_report(stage, now - since, ctx, learned);
+		else log_msg("rollback: watchdog: tick stuck, but the main thread's registers can't be read (stage %d)", stage);
+	}
+	return 0;
 }
 
 static int rb_alloc(void)
@@ -944,6 +1099,7 @@ static int rb_alloc(void)
 	if (!g_e->flag || !g_e->index || !g_e->regs || !g_e->gimg || !g_e->gnow) return 0;
 	for (u32 s = 0; s < RB_SLOTS; s++)
 		if (!(g_e->slot[s] = alloc_own(RB_MAX_PAGES * 0x1000))) return 0;
+	CreateThread(0, 0x10000, rb_watchdog, 0, 0, 0);
 	return AddVectoredExceptionHandler(1, (void *)rb_fault) != 0;
 }
 

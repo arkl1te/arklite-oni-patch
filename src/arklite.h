@@ -195,6 +195,8 @@ typedef struct {
 	int countdown_ms;          /* -1: none */
 	u32 problem;               /* NETBAD_*: what keeps the joiner out (joiner: of the host's game; host: a joiner) */
 	int desynced;              /* a state hash differed in this match */
+	int silent_ms;             /* match: nothing from the other PC for this long (0: under 1.5 s) */
+	int lost;                  /* match: 1 the other PC stopped answering, 2 it left */
 } NetHud;
 /* What differs between the two PCs, so the host doesn't let the joiner in */
 enum {
