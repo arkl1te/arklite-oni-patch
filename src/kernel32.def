@@ -31,3 +31,8 @@ EXPORTS
   DeleteFileA@4
   SetFilePointer@16
   Sleep@4
+  VirtualQuery@12
+  GetProcessHeaps@8
+  GetModuleFileNameA@12
+  HeapWalk@8
+  GetCurrentThreadId@0

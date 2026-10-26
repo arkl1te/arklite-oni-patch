@@ -125,6 +125,26 @@ u32  char_limit_gs_offset(u32 offset);   /* a stock game state offset, where it 
 
 void lockstep_install(void);   /* ARKLITE_RECORD / ARKLITE_REPLAY: input record and replay */
 void lockstep_exit(void);      /* finish the recording or the replay report */
+
+/* Arklite's own game state: variables the game's ticks change and depend on (a tick's RNG, the
+ * players' score and respawns, item respawns). They go in their own section, .tstate, which is
+ * all of Arklite that rollback.c snapshots and puts back; everything else Arklite keeps (the
+ * network, the log, menus, recordings) must never be rewound. */
+#define TICK_STATE __attribute__((section(".tstate")))
+
+/* ---- rollback.c ------------------------------------------------------------------------ */
+void rollback_install(void);     /* ARKLITE_MEMSURVEY: which memory the game's ticks write */
+void rollback_frame(void);       /* lockstep.c: at every frame's update */
+void rollback_tick_begin(void);  /* lockstep.c: around every tick */
+void rollback_tick_end(void);
+/* ARKLITE_ROLLBACK_TEST: runs the tick (body(action)) itself, twice from the same memory, and
+ * returns 1, or 0 when the caller runs it */
+int  rollback_test_tick(void *action, void (*body)(void *));
+int  rollback_net_begin(void);            /* net.c: snapshots from the next tick on */
+void rollback_net_end(void);
+int  rollback_restore_tick(u32 tick);     /* back to the start of tick: 1, or 0 if not kept */
+u32  rollback_known_pages(void);
+#define ROLLBACK_KEPT_TICKS 12            /* RB_SLOTS: how far back the game can go */
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
 /* net.c's recording of a networked game (same format, player 2's record per tick) */
@@ -138,6 +158,8 @@ void lockstep_net_record_end(const char *why);
 void net_install(void);        /* ARKLITE_HOST / ARKLITE_JOIN: two PCs in lockstep over UDP */
 void net_exit(void);
 int  net_active(void);
+#define NET_CHAR_IMAGE_SIZE (0x16a0 + 0x2838)   /* a character and its active data */
+int  net_char_image(u32 index, u8 *img);   /* the character's state without drawing's fields; 0 if not in use */
 u32  net_update(u32 count, void *actions, u32 *ticks_run);   /* the game update while it's on */
 void net_tick_done(void);      /* after every tick */
 enum { NETHUD_OFF, NETHUD_LOBBY, NETHUD_STARTING, NETHUD_MATCH };

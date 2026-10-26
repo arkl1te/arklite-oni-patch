@@ -171,7 +171,7 @@ static int g_logged_diffs;        /* desyncs logged in detail, at most DIFFS_LOG
 static u32 g_calls[MAX_CALLS], g_ncalls;
 static int g_in_tick;
 static int g_trace;                       /* recording or replaying: keep RNG callers */
-static u32 g_tick_local_seed = 0xfded;    /* UUrLocalRandom inside ticks */
+static u32 g_tick_local_seed TICK_STATE = 0xfded;   /* UUrLocalRandom inside ticks */
 static u32 g_fpu_cw;                      /* at the start of this tick */
 
 static u32 fpu_control_word(void)
@@ -360,14 +360,33 @@ static void visited_install(void)
  * and the visited marks left over in the three vectors (set bits the undo list doesn't hold,
  * which would hide quads from it). tools/col_diff.py compares two PCs' logs and prints the
  * first query that differs. A character's wall contacts (active +0xb0) come from these
- * queries in its environment callback (call at 0x4ebddf). */
+ * queries in its environment callback (call at 0x4ebddf).
+ *
+ * Its contacts then go through the physics move step 0x43a710 (ECX the physics context, EDX the
+ * move): the environment callback (context's callbacks +0x148, +4) and the object callback
+ * (+8) fill 0x28-byte contacts (+0 kind: 0 level, 1 object; +8 the plane; +0x18 the point;
+ * +0x24 the squared distance), 0x43a9a0 drops some (unless context +0x128 has 0x100), the
+ * sort at 0x43a80b (qsort 0x51e8b1) orders them by distance, and unless context +0x128 has
+ * 0x800 the first contact whose push (0x433da0) is at least 1/1024 moves the character and makes
+ * the physics query again. For a character's context (callbacks 0x5ec918) each sort also goes
+ * to the log: the context's 0x150 bytes, the move and the sorted contacts. Records start with
+ * a tag: COL_TAG_QUERY or COL_TAG_STEP. */
 #define AKrCollision_Sphere     ((u8 (ONI_FC *)(void *, const float *, const float *, u32, u32))0x441cb0)
 #define AKgResultCount          (*(u16 *)0x6a906c)
 #define AKgResults              ((const u8 *)0x6a9080)
 #define COL_MAX_RESULTS         32
+#define COL_TAG_QUERY           0x59525551   /* 'QURY' */
+#define COL_TAG_STEP            0x50455453   /* 'STEP' */
+#define PHcStep_SortCall        0x43a80b
+#define UUrQsort                0x51e8b1
+#define PHgContexts             (*(u8 **)0x5cb520)   /* u32 count, then contexts from +8 */
+#define PH_CONTEXT_SIZE         0x150
+#define PH_CONTACT_SIZE         0x28
+#define ONcCharacterCallbacks   0x5ec918
 
 typedef struct { u32 tick; u16 site; u16 count; float sphere[4], move[3]; u32 mask, max, stray[3]; } ColQuery;
 typedef struct { u32 quad; float point[3]; } ColResult;
+typedef struct { u32 tick, context, count; float move[3]; u8 data[PH_CONTEXT_SIZE]; } ColStep;
 
 static HANDLE g_col_out = INVALID_HANDLE_VALUE;
 static u8 g_col_buf[0x10000];
@@ -427,6 +446,8 @@ static u8 ONI_FC col_query(void *collision, const float *sphere, const float *mo
 	memcpy(q.move, move, sizeof q.move);
 	q.mask = mask;
 	q.max = max & 0xffff;
+	u32 tag = COL_TAG_QUERY;
+	col_write(&tag, 4);
 	col_write(&q, sizeof q);
 	for (u32 i = 0; i < q.count && i < COL_MAX_RESULTS; i++) {
 		ColResult r;
@@ -441,6 +462,45 @@ static u8 ONI_FC col_query(void *collision, const float *sphere, const float *mo
 		if (stray > g_col_stray_max) g_col_stray_max = stray;
 	}
 	return hit;
+}
+
+/* After the move step's sort (0x43a80b), for a character's context */
+static void __cdecl col_step(const u8 *context, const float *move, const u8 *contacts, u32 count)
+{
+	ColStep s;
+	u8 *all = PHgContexts;
+	u32 tag = COL_TAG_STEP;
+
+	if (!g_in_tick || g_session != SESSION_RUN || g_col_out == INVALID_HANDLE_VALUE) return;
+	if (*(const u32 *)(context + 0x148) != ONcCharacterCallbacks) return;
+	s.tick = GS_TICK(ONgGameState);
+	s.context = all && context >= all + 8 ? (u32)(context - (all + 8)) / PH_CONTEXT_SIZE : 0xffffffffu;
+	s.count = count & 0xffff;
+	memcpy(s.move, move, sizeof s.move);
+	memcpy(s.data, context, PH_CONTEXT_SIZE);
+	col_write(&tag, 4);
+	col_write(&s, sizeof s);
+	col_write(contacts, (s.count < COL_MAX_RESULTS ? s.count : COL_MAX_RESULTS) * PH_CONTACT_SIZE);
+}
+
+/* In place of the cdecl call qsort(contacts, count, 0x28, compare): EDI the context, EBP the move */
+__attribute__((naked)) static void step_sort(void)
+{
+	__asm__ volatile(
+		"pushl 16(%%esp)\n\t"
+		"pushl 16(%%esp)\n\t"
+		"pushl 16(%%esp)\n\t"
+		"pushl 16(%%esp)\n\t"
+		"movl $%c0, %%eax\n\t"
+		"call *%%eax\n\t"
+		"addl $16, %%esp\n\t"
+		"pushl 8(%%esp)\n\t"   /* count */
+		"pushl 8(%%esp)\n\t"   /* contacts */
+		"pushl %%ebp\n\t"
+		"pushl %%edi\n\t"
+		"call %c1\n\t"
+		"addl $16, %%esp\n\t"
+		"ret\n" :: "i"(UUrQsort), "i"(col_step));   /* EAX is free: qsort returns nothing */
 }
 
 static void col_log_begin(void)
@@ -483,6 +543,8 @@ static void col_install(void)
 		}
 	}
 	for (u32 i = 0; i < n; i++) patch_call(g_col_sites[i], (u32)AKrCollision_Sphere, (u32)col_query);
+	if (!patch_call(PHcStep_SortCall, UUrQsort, (u32)step_sort))
+		log_msg("collision: move step sort 0x%x changed, move steps not logged", PHcStep_SortCall);
 }
 
 static void local_rng_install(void)
@@ -1005,13 +1067,21 @@ static void session_begin(u32 level)
 
 /* ---- Hooks ------------------------------------------------------------------------------ */
 
-static void ONI_FC tick_hook(void *action)
+/* One tick of the game, with its input record (rollback.c may run it twice) */
+static void tick_body(void *action)
 {
-	g_fpu_cw = fpu_control_word();
-	g_in_tick = 1;
 	players_tick_record(action);   /* Konoko's F2 choice */
 	ONrGameState_Tick(action);
 	if (g_frame_particles) P3rUpdate(GS_TICK(ONgGameState) + 1, 0);   /* as the tick's own (0x4fa9bd) */
+}
+
+static void ONI_FC tick_hook(void *action)
+{
+	rollback_tick_begin();
+	g_fpu_cw = fpu_control_word();
+	g_in_tick = 1;
+	if (!rollback_test_tick(action, tick_body)) tick_body(action);
+	rollback_tick_end();
 	g_in_tick = 0;
 	net_tick_done();
 	if (g_session != SESSION_RUN) return;
@@ -1028,6 +1098,7 @@ static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 
 	const u32 *p2;
 
+	rollback_frame();
 	char_menu_tag(count, actions);   /* this PC's F2 choice, in every record (a replay uses its own) */
 	if (net_active()) return net_update(count, actions, ticks_run);
 	if (g_mode != MODE_OFF) {

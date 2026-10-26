@@ -145,9 +145,9 @@ static int g_enabled, g_pad, g_invert_y;
 static float g_aim_speed = 8.0f;
 static XInputGetState_t g_xinput;
 
-static int g_p2 = -1;                  /* character index, -1: none */
+static int g_p2 TICK_STATE = -1;       /* character index, -1: none */
 static u32 g_level;
-static u32 g_input[12];                /* player 2's input state, like gs+0xb8 */
+static u32 g_input[12] TICK_STATE;     /* player 2's input state, like gs+0xb8 */
 static u32 g_record[12];               /* this frame's record */
 static int g_has_record, g_tick_index;
 static const u32 (*g_net_records)[12];  /* networked game: one record per tick (net.c) */
@@ -158,17 +158,17 @@ static u32 g_net_count;
 static u8 *g_spawn[MAX_SPAWN];         /* Player-flagged placements: [0] Konoko's, [1] player 2's */
 static int g_nspawn;
 static u32 g_spawn_level;             /* for the spawn pick only: the level isn't current yet */
-static int g_p1_point = -1;            /* where Konoko just spawned, for player 2's pick */
+static int g_p1_point TICK_STATE = -1;  /* where Konoko just spawned, for player 2's pick */
 static u32 g_respawn_ticks = 90;       /* dead this long, an attack button brings a player back */
 /* Score (see "Score" below) */
 #define KILL_CREDIT     600     /* 10 s */
-static int g_score[2], g_was_dead[2];
-static int g_class[2] = { -1, -1 };    /* ONCC instance number chosen with F2, -1: the placement's */
-static int g_base_health[2];           /* each player's maximum health with the map's class */
-static int g_as[2] = { -1, -1 };       /* the class each player's character is, -1: the map's */
-static u8 *g_map_class[2];             /* the ONCC each player was last spawned as with the map's class */
-static int g_hit_by[2] = { -1, -1 };
-static u32 g_hit_tick[2];
+static int g_score[2] TICK_STATE, g_was_dead[2] TICK_STATE;
+static int g_class[2] TICK_STATE = { -1, -1 };   /* ONCC instance number chosen with F2, -1: the placement's */
+static int g_base_health[2] TICK_STATE;          /* each player's maximum health with the map's class */
+static int g_as[2] TICK_STATE = { -1, -1 };      /* the class each player's character is, -1: the map's */
+static u8 *g_map_class[2] TICK_STATE;            /* the ONCC each player was last spawned as with the map's class */
+static int g_hit_by[2] TICK_STATE = { -1, -1 };
+static u32 g_hit_tick[2] TICK_STATE;
 /* Attack buttons in the input state (record bits 29 punch, 30 kick; 38-40 fire1-3) */
 #define ATTACK_LO       0x60000000u
 #define ATTACK_HI       0x1c0u
