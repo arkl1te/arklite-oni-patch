@@ -634,18 +634,23 @@ static void rb_snapshot(u32 tick, const void *action)
 	e->cur = s;
 }
 
-/* Put the game back to the start of a kept tick */
-/* In one of the writable regions listed at the engine's start (g_regions, in address order) */
+/* Readable now. Asked of the system, not of the region list made at the engine's start: memory
+ * freed since then (a heap shrinking) made a restore read a decommitted page and crash. The last
+ * few readable regions are cached for one page's scan (rb_lock_mask clears them). */
+#define RB_RD_CACHE 4
+static u32 g_rd_lo[RB_RD_CACHE], g_rd_hi[RB_RD_CACHE], g_rd_next;
+
 static int rb_readable(u32 a)
 {
-	u32 lo = 0, hi = g_nregions;
-	while (lo < hi) {
-		u32 mid = (lo + hi) / 2;
-		if (a < g_regions[mid].base) hi = mid;
-		else if (a >= g_regions[mid].base + g_regions[mid].size) lo = mid + 1;
-		else return 1;
-	}
-	return 0;
+	MEMORY_BASIC_INFORMATION m;
+	for (u32 i = 0; i < RB_RD_CACHE; i++)
+		if (a >= g_rd_lo[i] && a < g_rd_hi[i]) return 1;
+	if (VirtualQuery((const void *)a, &m, sizeof m) != sizeof m || m.State != MEM_COMMIT) return 0;
+	if ((m.Protect & (0x01 | PAGE_GUARD)) || !(m.Protect & 0xee)) return 0;   /* no access, guard; any read right */
+	g_rd_lo[g_rd_next] = (u32)m.BaseAddress;
+	g_rd_hi[g_rd_next] = (u32)m.BaseAddress + m.RegionSize;
+	g_rd_next = (g_rd_next + 1) % RB_RD_CACHE;
+	return 1;
 }
 
 /* g_e->mask[k] = 1 for the dwords of the page that belong to a live critical section: its
@@ -654,6 +659,7 @@ static void rb_lock_mask(u32 p)
 {
 	const u32 *page = (const u32 *)(p << PAGE_SHIFT);
 	memset(g_e->mask, 0, sizeof g_e->mask);
+	memset(g_rd_hi, 0, sizeof g_rd_hi);   /* forget what was readable before */
 	for (u32 k = 0; k < 1024; k++) {
 		u32 d = page[k];
 		if ((d & 3) || d < 0x10000 || !rb_readable(d) || !rb_readable(d + 7)) continue;
