@@ -40,7 +40,16 @@
  * lists its fonts at +0x18 (+0x14 of them); a font has its size at +0x6, style +0x8, ascender
  * +0xc, descender +0xe.
  * The glyph call and the timer call belong to mp_hud.c (its own text is drawn there at twice
- * Oni's size), which passes the rest to hud_text_sprite and hud_timer_display. */
+ * Oni's size), which passes the rest to hud_text_sprite and hud_timer_display.
+ *
+ * Subtitles: the subtitle area (*0x5cb470) and the message area (*0x5cb398), which shows when
+ * there are no subtitles, are text areas laid out by 0x42fb70 between the rings: bounds at +0x12
+ * (left, top, right, bottom as shorts) = 148, bottom - 10 lines, width - 148, height - 2, 148 px
+ * being a ring's box (128 px background, 10 px in from the corner, 10 px gap). 0x430400 draws
+ * one of them (called at 0x4fbde3, after the HUD), wrapping the text to the bounds every frame
+ * (0x430fd0). On a frame the HUD drew at a scale above 100%, both get the gap between the scaled
+ * rings for that draw; when that is narrower than cSubtitleMinWidth of the screen, they go above
+ * the rings instead (ring height: the backgrounds *0x5ed020 left, *0x5ecf98 right, +0x86). */
 #include "arklite.h"
 
 #define M3rDraw_Triangle ((u32 (ONI_FC *)(const float *, const void *))0x41a5c0)
@@ -60,6 +69,12 @@
 #define ONcHelp_LeftSpriteCall  0x501608
 #define ONcHelp_RightSpriteCall 0x5016cf
 #define ONcHelp_LayoutCall      0x501790
+#define ONrSubtitles_Display ((void (*)(void))0x430400)
+#define ONcSubtitles_DisplayCall 0x4fbde3
+#define ONgSubtitleArea (*(u8 **)0x5cb470)
+#define ONgMessageArea  (*(u8 **)0x5cb398)
+#define ONgLeftRingBackground  (*(u8 **)0x5ed020)
+#define ONgRightRingBackground (*(u8 **)0x5ecf98)
 
 /* The OpenGL driver: its table of GL functions (stdcall), its state and the texture it last
  * bound on unit 0, which it doesn't bind again (0x40d74f) */
@@ -75,10 +90,14 @@
 /* How near a font's height must be to the scaled height to be used */
 #define cFontTolerance 1.15f
 
+/* The narrowest the subtitles may get between the rings, of the screen's width */
+#define cSubtitleMinWidth 0.4f
+
 static const u32 g_triangleCalls[] = { 0x50073a, 0x5007af };
 static const u32 g_spriteCalls[] = { 0x5000f2, 0x50045d, 0x50053a, 0x500fdb, 0x501309, 0x50141b };
 
 static int g_inHud;
+static int g_hudDrawn;   /* this frame, for the subtitles */
 
 /* Textures switched to GL_NEAREST this frame */
 static u8 *g_sharp[64];
@@ -325,9 +344,59 @@ static u16 ONI_FC help_layout(u8 *context, const u8 *item, void *bounds, short *
 	return TSrContext_Layout(context, item, bounds, point, out);
 }
 
+/* The taller ring background's height */
+static int ring_height(void)
+{
+	const u8 *left = ONgLeftRingBackground, *right = ONgRightRingBackground;
+	int h = left ? *(const u16 *)(left + 0x86) : 128;
+
+	if (right && *(const u16 *)(right + 0x86) > h) h = *(const u16 *)(right + 0x86);
+	return h;
+}
+
+/* Gives a text area the room the rings scaled by s leave it; its bounds go to saved */
+static void subtitle_bounds(u8 *area, short *saved, float s)
+{
+	short *r = (short *)(area + 0x12);
+	int w = M3rScreen_Width(), h = M3rScreen_Height(), left, right, bottom, dy;
+
+	for (int i = 0; i < 4; i++) saved[i] = r[i];
+	left = (int)round_px(r[0] * s);
+	right = w - (int)round_px((w - r[2]) * s);
+	if (right - left >= w * cSubtitleMinWidth) {
+		r[0] = (short)left;
+		r[2] = (short)right;
+		return;
+	}
+	/* No room between them: above them, as wide as at 100% */
+	bottom = h - (int)round_px(ring_height() * s) - 2;
+	dy = r[3] - bottom;
+	if (dy <= 0 || bottom < 32) return;
+	r[3] = (short)bottom;
+	r[1] = (short)(r[1] - dy < 2 ? 2 : r[1] - dy);
+}
+
+static void subtitles_display(void)
+{
+	u8 *areas[2] = { ONgSubtitleArea, ONgMessageArea };
+	short saved[2][4];
+	float s = hud_scale();
+	int scaled = g_hudDrawn && s > 1.0f;
+
+	g_hudDrawn = 0;
+	if (!scaled) { ONrSubtitles_Display(); return; }
+	for (int i = 0; i < 2; i++)
+		if (areas[i]) subtitle_bounds(areas[i], saved[i], s);
+	ONrSubtitles_Display();
+	for (int i = 0; i < 2; i++)
+		if (areas[i])
+			for (int k = 0; k < 4; k++) ((short *)(areas[i] + 0x12))[k] = saved[i][k];
+}
+
 static void hud_display(void)
 {
 	if (hud_scale() != 1.0f) hud_smooth_frame();
+	g_hudDrawn = 1;
 	g_inHud = 1;
 	ONiInGameUI_DisplayHUD();
 	g_inHud = 0;
@@ -341,7 +410,7 @@ static void hud_display(void)
 
 void hud_scale_install(void)
 {
-	int n = 0, total = 4;
+	int n = 0, total = 5;
 
 	for (unsigned i = 0; i < sizeof g_triangleCalls / sizeof g_triangleCalls[0]; i++, total++)
 		n += patch_call(g_triangleCalls[i], (u32)M3rDraw_Triangle, (u32)hud_triangle);
@@ -351,5 +420,6 @@ void hud_scale_install(void)
 	n += patch_call(ONcHelp_RightSpriteCall, (u32)M3rDraw_Sprite, (u32)help_right_sprite);
 	n += patch_call(ONcHelp_LayoutCall, (u32)TSrContext_Layout, (u32)help_layout);
 	n += patch_call(ONcHUD_DisplayCall, (u32)ONiInGameUI_DisplayHUD, (u32)hud_display);
+	n += patch_call(ONcSubtitles_DisplayCall, (u32)ONrSubtitles_Display, (u32)subtitles_display);
 	log_msg("hud scale: %d of %d patches applied", n, total);
 }

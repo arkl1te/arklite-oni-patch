@@ -210,6 +210,7 @@ static void main_loop_sound(void)
 	SSrUpdate();
 	if (multiplayer_active()) *gs_field(GS_PAUSED) = 0;
 	char_menu_frame();
+	chat_frame();
 	vertex_light_frame();
 	if (g_pending) {
 		g_pending = 0;
@@ -228,12 +229,58 @@ static void ONI_FC pause_menu_sound_pause(u32 paused)
 	if (!g_open) SSrSetPaused(paused);   /* the game goes on: so do its new sounds */
 }
 
+/* The live dialogs open now, outermost first, so live_menu_close can end them: each one's proc
+ * is wrapped to learn its window from its first message (a dialog being created is the newest
+ * one without a window yet) */
+#define LIVE_MAX_DIALOGS 8
+static struct { WMtDialogProc proc; WMtWindow *win; } g_dialogs[LIVE_MAX_DIALOGS];
+static int g_ndialogs;
+
+static u8 ONI_FC tracked_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
+{
+	int i;
+
+	for (i = g_ndialogs - 1; i >= 0; i--)
+		if (g_dialogs[i].win == dialog) return g_dialogs[i].proc(dialog, msg, p1, p2);
+	for (i = g_ndialogs - 1; i >= 0; i--)
+		if (!g_dialogs[i].win) {
+			if (dialog) g_dialogs[i].win = dialog;
+			return g_dialogs[i].proc(dialog, msg, p1, p2);
+		}
+	return 0;
+}
+
+static u16 tracked_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result)
+{
+	u16 r;
+
+	if (g_ndialogs >= LIVE_MAX_DIALOGS) return WMrDialog_ModalBegin(id, parent, proc, param, result);
+	g_dialogs[g_ndialogs].proc = proc;
+	g_dialogs[g_ndialogs].win = 0;
+	g_ndialogs++;
+	r = WMrDialog_ModalBegin(id, parent, tracked_proc, param, result);
+	g_ndialogs--;
+	return r;
+}
+
+/* net.c, before it reloads the level: a reload inside a live dialog's frame (live_frame) left
+ * the dialog's loop drawing a game nothing ran any more, a frozen picture (the Windows joiner,
+ * pause menu open, going back to the lobby). Ends every live dialog as Esc does (result 0: the
+ * pause menu's sub-dialogs then do nothing); the menu loops return before the next main-loop
+ * frame, where net.c reloads */
+void live_menu_close(void)
+{
+	for (int i = g_ndialogs - 1; i >= 0; i--)
+		if (g_dialogs[i].win) WMrDialog_ModalEnd(g_dialogs[i].win, 0);
+}
+
 u16 live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick)
 {
 	static int told;
 	u16 r;
 
-	if (g_open || !multiplayer_active() || !ONrLevel_GetCurrent())
+	if (g_open) return tracked_modal(id, parent, proc, param, result);   /* a sub-dialog of a live one */
+	if (!multiplayer_active() || !ONrLevel_GetCurrent())
 		return WMrDialog_ModalBegin(id, parent, proc, param, result);
 	if (in_tick && id == WMcDialog_TextConsole && param) {
 		g_console.proc = proc;
@@ -253,7 +300,7 @@ u16 live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u3
 	g_menu_level = ONrLevel_GetCurrent();
 	g_open = 1;
 	WMgDrawHook = live_frame;
-	r = WMrDialog_ModalBegin(id, parent, proc, param, result);
+	r = tracked_modal(id, parent, proc, param, result);
 	if (WMgDrawHook == live_frame) WMgDrawHook = ONrGameState_Display;
 	g_open = 0;
 	return r;
@@ -261,7 +308,7 @@ u16 live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u3
 
 static void ONI_FC utility_input(void *action)
 {
-	if (!g_open && !char_menu_open()) g_utility_input(action);
+	if (!g_open && !char_menu_open() && !chat_blocking()) g_utility_input(action);
 }
 
 /* The help screen's volume down: kept in multiplayer games */

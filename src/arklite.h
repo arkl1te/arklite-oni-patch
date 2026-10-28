@@ -145,10 +145,13 @@ int  rollback_test_tick(void *action, void (*body)(void *));
 int  rollback_net_begin(void);            /* net.c: snapshots from the next tick on */
 void rollback_net_end(void);
 int  rollback_restore_tick(u32 tick);     /* back to the start of tick: 1, or 0 if not kept */
+void rollback_impulses(int on);           /* one-shot sounds off while ticks run again */
+u32  rollback_ambients_stopped(void);     /* ambient sounds stopped because their ticks were taken back */
 u32  rollback_known_pages(void);
 #define ROLLBACK_KEPT_TICKS 12            /* RB_SLOTS: how far back the game can go */
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
+void lockstep_impulses_mute(int muted);   /* one-shot sounds off while rollback re-runs ticks */
 /* net.c's recording of a networked game (same format, player 2's record per tick) */
 int  lockstep_net_record_begin(u32 level, const char *path);
 void lockstep_net_record_frame(u32 n, const u32 (*p1)[12], const u32 (*p2)[12]);
@@ -159,13 +162,21 @@ void lockstep_net_record_end(const char *why);
 
 void net_install(void);        /* ARKLITE_HOST / ARKLITE_JOIN: two PCs in lockstep over UDP */
 void net_exit(void);
+void net_main_menu(void);      /* the main menu opened: the network game this PC was in is over */
 int  net_active(void);
 /* Custom Game picks what the next level is: alone, hosting, or joining */
 #define NET_DEFAULT_PORT    27777
 #define NET_SERVER_NAME_MAX 48
 void net_menu_local(void);     /* Play (a mode set at startup stays) */
-void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectators);
+/* time_limit in minutes, score_limit in points (below 0: reached going down); 0: none */
+void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectators, u32 time_limit, int score_limit);
+#define NET_TIME_LIMIT_MAX  999
+#define NET_SCORE_LIMIT_MAX 999
 void net_menu_join(const char *address);   /* host[:port] */
+/* Joining without the host's map: downloads its CustomLevels\<folder> from the host (after
+ * net_menu_join, from the menu, in the loading popup); 1 when it's here. Else why not: */
+int  net_map_fetch(const char *folder, u32 level);
+const char *net_map_fetch_error(void);
 /* What a server says about itself, for the Join list */
 typedef struct {
 	u32 token, ping_ms;
@@ -197,6 +208,14 @@ typedef struct {
 	int desynced;              /* a state hash differed in this match */
 	int silent_ms;             /* match: nothing from the other PC for this long (0: under 1.5 s) */
 	int lost;                  /* match: 1 the other PC stopped answering, 2 it left */
+	u32 time_limit;            /* the match's limits (the host's): minutes, 0 none */
+	int score_limit;           /* 0: none; below 0: reached going down */
+	int ping_ms;               /* the last round trip to the other PC, -1: not known */
+	int peer_present;          /* the other PC's player is in this lobby or match */
+	int over;                  /* match: a limit was reached, the game stands until everyone pressed fire */
+	int over_ready;            /* this PC's player pressed fire */
+	u32 over_players, over_ready_count;
+	int over_left_ms;          /* until everyone goes back to the lobby anyway */
 } NetHud;
 /* What differs between the two PCs, so the host doesn't let the joiner in */
 enum {
@@ -204,6 +223,7 @@ enum {
 	NETBAD_MAP = 32, NETBAD_PLAYERS = 64,
 };
 void net_hud(NetHud *h);
+u8  *net_swapped_konoko(void);   /* Konoko while the joiner's display runs with player 2 in gs+0xac, else 0 */
 const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
 
 /* ---- mp_menu.c --------------------------------------------------------------------------- */
@@ -215,6 +235,7 @@ int  mp_menu_choose(void);
 int  mp_menu_host(const char *map_name);   /* 1: Host (net.c is set up), 0: Cancel */
 /* 1: Join (net.c is set up); the host's map: its CustomLevels folder ("" for a numbered level) and level */
 int  mp_menu_join(char *folder, u32 folder_size, u32 *level);
+void mp_menu_join_failed(const char *folder, const char *why);   /* the map download stopped: the Join list says why */
 
 /* Building dialogs from code, shared with custom_game.c's level list */
 #define WMcClass_EditField 7
@@ -261,12 +282,18 @@ WMtWindow *ui_label(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, const
 void *ui_frame_hook(void (*fn)(void));   /* called every frame while a dialog is up; returns the old one */
 void ui_frame_hook_call(void *old);       /* from fn: the hook it replaced */
 
+/* ---- mp_board.c -------------------------------------------------------------------------- */
+
+void mp_board_install(void);   /* the F1 screen: Scoreboard tab, the match's goal on Objective */
+void mp_board_goal(char *out, u32 minutes, int score);   /* that goal, one sentence (192 bytes) */
+
 /* ---- mp_hud.c ---------------------------------------------------------------------------- */
 
 void mp_hud_install(void);     /* lobby text ("Press F3 to be ready"), countdown and score on screen */
 enum { MP_LEFT, MP_CENTER, MP_RIGHT };
 void mp_hud_text(const char *s, int x, int y, int align, u32 color);   /* only while the HUD draws */
 int  mp_hud_line_height(void);
+int  mp_hud_text_width(const char *s, int n);   /* the first n characters (n < 0: all), trailing spaces included */
 
 /* ---- mp_names.c -------------------------------------------------------------------------- */
 
@@ -281,6 +308,21 @@ void mp_name_edit_begin(void);
 void mp_name_edit_end(int keep);          /* keep: saved in Arklite.ini */
 const char *mp_name_edit_text(void);      /* what's typed so far (the name when not editing) */
 void mp_names_draw(int width, int height);   /* from the HUD: the name of the player faced */
+void mp_names_say(int who, const char *text);   /* chat.c: a message over that player's head for a while */
+
+/* ---- chat.c ------------------------------------------------------------------------------- */
+
+/* Chat in network games: Enter opens it, Enter sends, Esc closes (see chat.c) */
+#define CHAT_MAX 128                  /* characters + 1 */
+void chat_install(void);              /* Arklite.ini [chat] */
+void chat_frame(void);                /* every frame, after the update */
+void chat_draw(int width, int height);   /* from the HUD */
+int  chat_blocking(void);             /* open (or Enter/Esc that closed it still down): the game gets the mouse but no keyboard */
+void chat_receive(const char *text);  /* net.c: the other PC's player said it */
+int  chat_wrap(const char *s, int width, int *starts, int max);   /* line starts of s wrapped to width (HUD text); returns the count */
+int  net_chat_send(const char *text); /* net.c: to the other PC; 0 if there's nobody */
+int  chat_muted(int who);             /* the F1 scoreboard muted that player's messages */
+void chat_set_muted(int who, int on);
 
 /* ---- char_menu.c ------------------------------------------------------------------------- */
 
@@ -290,6 +332,8 @@ void mp_names_draw(int width, int height);   /* from the HUD: the name of the pl
 #define PLAYERS_CHOICE_MASK 0xffff0000u
 void char_menu_install(void);
 int  char_menu_open(void);     /* the F2 menu is up: this PC's player gets no input */
+u8  *hud_solid(u16 argb1555, const char *name);   /* an 8x8 texture of one color (kept until Oni exits) */
+void hud_rect(u8 *texture, int x, int y, int w, int h, u32 alpha);   /* stretched over the rectangle, from the HUD */
 void char_menu_frame(void);    /* every frame, after the update: keys and mouse */
 void char_menu_draw(int width, int height);   /* from the HUD */
 u32  char_menu_record_word(void);             /* this PC's choice, for word 11 of its records */
@@ -311,6 +355,12 @@ u32  players_respawn_ticks(void);             /* [multiplayer] respawn_delay, in
 void players_set_respawn_ticks(u32 ticks);    /* the network host's, on the joiner */
 void players_reset_scores(void);              /* and the class choices: the match starts */
 void players_tick_record(const u32 *record);  /* in the tick: Konoko's record (its choice word) */
+/* A network match's limits (net.c): on from the match's start (0 ticks / score 0: none); a
+ * negative score limit is reached going down (suicides). Checked in ticks, so rollback corrects it. */
+void players_set_limits(int on, u32 ticks, int score);
+u32  players_over_tick(void);                 /* tick + 1 in which a limit was reached, 0: not over */
+int  players_time_left(void);                 /* ticks, -1: no time limit */
+int  players_winner(void);                    /* 0, 1, or -1 for a draw */
 int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
 int  multiplayer_map(void);                   /* two or more Player-flagged characters (spawn points) */
 
@@ -330,6 +380,7 @@ void items_set_default_ticks(u32 ticks);    /* the network host's, on the joiner
 void live_menu_install(void);
 int  live_menu_open(void);     /* the pause menu is open and the game runs behind it */
 void live_menu_request(void);  /* open it after this frame's update */
+void live_menu_close(void);    /* end every live dialog (as Esc does), before a level reload */
 /* WMrDialog_ModalBegin for every dialog (lockstep.c wraps the calls): in a multiplayer game a
  * dialog outside a tick runs with the game going on behind it, one inside a tick isn't shown */
 u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick);

@@ -69,7 +69,9 @@
  * respawning. A player
  * who comes back as another class gets the health the map gives its own player (the maximum,
  * +0x3c, Konoko or player 2 had when spawned with the placement's class; current health +0x38
- * set to it too), so every character is as tough as the map's Konoko.
+ * set to it too), so every character is as tough as the map's Konoko. On a multiplayer map that
+ * health is MP_HEALTH (100) for every player and class, set at each spawn; the in-place class
+ * change (0x4d7c30) doesn't touch health, so it stays.
  *
  * Arklite.ini [players]: p2=0 turns it off, p2_pad (0..3), p2_aim_speed (8: aim per tick at
  * full right stick), p2_invert_y. [multiplayer] respawn_delay (1.5 seconds). The camera follows
@@ -126,6 +128,7 @@ typedef unsigned long long u64;
 #define CHR_POS(c)      ((float *)((c) + 0x148))
 #define CHR_HEALTH(c)   (*(int *)((c) + 0x38))
 #define CHR_MAX_HEALTH(c) (*(int *)((c) + 0x3c))
+#define MP_HEALTH       100   /* every player's health on a multiplayer map */
 #define CHR_DEATH_TICK(c) (*(u32 *)((c) + 0x1638))
 
 __declspec(dllimport) HANDLE WINAPI LoadLibraryA(const char *);
@@ -169,6 +172,10 @@ static int g_as[2] TICK_STATE = { -1, -1 };      /* the class each player's char
 static u8 *g_map_class[2] TICK_STATE;            /* the ONCC each player was last spawned as with the map's class */
 static int g_hit_by[2] TICK_STATE = { -1, -1 };
 static u32 g_hit_tick[2] TICK_STATE;
+/* The network match's limits (net.c, the host's Host dialog): see "Score" below */
+static int g_limits_on, g_limit_score;
+static u32 g_limit_ticks, g_limit_start;
+static u32 g_over_tick TICK_STATE;               /* tick + 1 in which a limit was reached, 0: not yet */
 /* Attack buttons in the input state (record bits 29 punch, 30 kick; 38-40 fire1-3) */
 #define ATTACK_LO       0x60000000u
 #define ATTACK_HI       0x1c0u
@@ -497,7 +504,8 @@ static u8 ONI_FC spawn_player(u8 *obj, u32 *seen)
 		const float *avoid = g_p1_point >= 0 ? (const float *)OBJ_POS(g_spawn[g_p1_point]) : 0;
 		int point = choose_spawn(&avoid, avoid ? 1 : 0, 2);
 		if (spawn_at(obj, point, 1, &index)) {
-			g_base_health[1] = CHR_MAX_HEALTH(character(index));
+			CHR_HEALTH(character(index)) = CHR_MAX_HEALTH(character(index)) = MP_HEALTH;
+			g_base_health[1] = MP_HEALTH;
 			g_map_class[1] = CHR_CLASS(character(index));
 			g_as[1] = -1;
 			log_msg("players: spawned %s at spawn point %d", OBJ_NAME(obj), point);
@@ -544,6 +552,8 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 	g_map_class[0] = g_map_class[1] = 0;
 	g_as[0] = g_as[1] = -1;
 	if (GS_PLAYER(ONgGameState)) {
+		if (multiplayer_map())
+			CHR_HEALTH(GS_PLAYER(ONgGameState)) = CHR_MAX_HEALTH(GS_PLAYER(ONgGameState)) = MP_HEALTH;
 		g_base_health[0] = CHR_MAX_HEALTH(GS_PLAYER(ONgGameState));
 		g_map_class[0] = CHR_CLASS(GS_PLAYER(ONgGameState));
 	}
@@ -587,8 +597,10 @@ static int make_player(int who, int point)
 	}
 	if (!ok) return -1;
 	c = character(index);
+	if (multiplayer_map()) g_base_health[who] = MP_HEALTH;
 	if (!cls) {
-		g_base_health[who] = CHR_MAX_HEALTH(c);
+		if (!multiplayer_map()) g_base_health[who] = CHR_MAX_HEALTH(c);
+		else CHR_HEALTH(c) = CHR_MAX_HEALTH(c) = MP_HEALTH;
 		g_map_class[who] = CHR_CLASS(c);
 	} else if (g_base_health[who] > 0) CHR_HEALTH(c) = CHR_MAX_HEALTH(c) = g_base_health[who];
 	g_as[who] = cls ? g_class[who] : -1;
@@ -635,13 +647,18 @@ static void change_class(int who, u8 *c)
  * reports each hit on a character here. A player who dies (the dead flag appears in a tick)
  * within KILL_CREDIT ticks of a hit by the other player gives that player a kill; any other
  * death (a fall, their own grenade) is a suicide and costs the dead player a point. All of it
- * happens in ticks, so every PC counts the same. */
+ * happens in ticks, so every PC counts the same.
+ *
+ * A network match has limits (net.c, from the host's Host dialog): a score (reached going up, or
+ * going down when it's negative) and a time in ticks from the match's start. The tick that reaches
+ * one marks the match over (g_over_tick, tick state, so a rollback that changes the score changes
+ * it too) and the score stops counting; net.c ends the match once that tick ran with real inputs. */
 
 static u8 *player_char(int who)
 {
 	u8 *gs = ONgGameState;
 	if (!gs) return 0;
-	if (who == 0) return GS_PLAYER(gs);
+	if (who == 0) return net_swapped_konoko() ? net_swapped_konoko() : GS_PLAYER(gs);   /* (the joiner's display has player 2 there) */
 	return player2_valid() ? character(g_p2) : 0;
 }
 
@@ -671,6 +688,33 @@ int players_enabled(void) { return g_enabled; }
 u32 players_respawn_ticks(void) { return g_respawn_ticks; }
 void players_set_respawn_ticks(u32 ticks) { g_respawn_ticks = ticks; }
 
+void players_set_limits(int on, u32 ticks, int score)
+{
+	g_limits_on = on;
+	g_limit_ticks = ticks;
+	g_limit_score = score;
+	g_limit_start = ONgGameState ? GS_TICK(ONgGameState) : 0;
+	g_over_tick = 0;
+}
+
+u32 players_over_tick(void) { return g_limits_on ? g_over_tick : 0; }
+
+int players_time_left(void)
+{
+	u32 played;
+	if (!g_limits_on || !g_limit_ticks || !ONgGameState) return -1;
+	played = GS_TICK(ONgGameState) - g_limit_start;
+	return played >= g_limit_ticks ? 0 : (int)(g_limit_ticks - played);
+}
+
+/* Who won: nearest the score limit (the lowest score with a negative one), -1 for a draw */
+int players_winner(void)
+{
+	int d = g_score[0] - g_score[1];
+	if (g_limit_score < 0) d = -d;
+	return d > 0 ? 0 : d < 0 ? 1 : -1;
+}
+
 void players_reset_scores(void)
 {
 	for (int who = 0; who < 2; who++) {
@@ -683,8 +727,17 @@ void players_reset_scores(void)
 	}
 }
 
+static int limit_reached(void)
+{
+	u32 played = GS_TICK(ONgGameState) - g_limit_start;
+	for (int who = 0; who < 2 && g_limit_score; who++)
+		if (g_limit_score > 0 ? g_score[who] >= g_limit_score : g_score[who] <= g_limit_score) return 1;
+	return g_limit_ticks && played >= g_limit_ticks;
+}
+
 static void score_tick(void)
 {
+	if (g_over_tick) return;   /* the match is over: the score stays as it ended */
 	for (int who = 0; who < 2; who++) {
 		u8 *c = player_char(who);
 		int dead = c && (CHR_FLAGS(c) & CHR_INUSE) && (CHR_FLAGS(c) & CHR_DEAD);
@@ -700,6 +753,10 @@ static void score_tick(void)
 			g_hit_by[who] = -1;
 		}
 		g_was_dead[who] = dead;
+	}
+	if (g_limits_on && limit_reached()) {
+		g_over_tick = GS_TICK(ONgGameState) + 1;
+		log_msg("players: the match is over at tick %d (%d : %d)", GS_TICK(ONgGameState), g_score[0], g_score[1]);
 	}
 }
 

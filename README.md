@@ -109,11 +109,14 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `delay` | 0 | 0: no input delay; the other player's input is predicted and the game corrects itself when the real one arrives (rollback). 1 or more: the input delay in ticks (1/60 s each), and the game waits for the other player's input instead. The host's value is used on both PCs |
 | `[host]` | `name` | New Oni multiplayer game | The server's name in other players' Join list (the Host dialog saves it) |
 | | `max_players`, `max_spectators` | 8, 0 | The Host dialog's last values. For now a game has 2 players and no spectators |
+| | `time_limit` | 10 | Minutes a match lasts; 0: no time limit (the Host dialog saves it) |
+| | `score_limit` | 20 | Points that win a match; 0: no score limit. Below 0, e.g. -5: the first player whose score goes down to it wins, by suicides (the Host dialog saves it) |
 | `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by Add and Remove |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
-| | `characters` | 14 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
+| | `characters` | 18 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
 | | `name` | Player | Your name in multiplayer games. You can also change it in the **F2** menu, which saves it here |
+| `[chat]` | `fade` | 10 | Seconds a chat message stays on screen while the chat is closed; 0: they stay |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 
@@ -146,6 +149,18 @@ this PC or your local network by itself (those aren't saved unless you edit thei
 says about itself (name, players connected, spectators, map) and **Play** to join it; you need the
 same map in your `CustomLevels`. **Add** makes a new entry: type its address (`192.168.1.10`, a
 name, and `:port` if it isn't 27777) in **Address**. **Remove** deletes the selected one.
+
+**Chat**: in a network game (the lobby and the match), press **Enter** to chat. A text field
+opens in the lower left, under the messages, both on a light dark background; type and press
+**Enter** to send (you hear a locked door) and close it, or **Shift+Enter** to send and keep
+typing. **Esc** closes it without sending what you typed, and so does **Enter** with nothing
+typed. While you type, the keyboard only goes to the chat, but the mouse still turns, aims and
+attacks. **Up**/**Down** (or the mouse wheel, **Page Up**/**Page
+Down** a page at a time) scroll the messages; **Left**/**Right** move the cursor, and selecting
+and deleting text works as in the menus' text fields. When the other player writes, you hear the
+game-saved sound, and their message shows over their head (above their name, in a bubble, at
+most two lines) for a few seconds. With the chat closed, messages stay on screen for 10 seconds, then fade
+(`fade` in `[chat]`).
 
  Custom levels don't need a unique level number: each one
 gets a free number (31 or lower) when you pick it (a joiner takes the host's). Put each level in its own folder:
@@ -204,8 +219,8 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
 - **F2 picks your character**: a menu over the running game shows a picture of every character
   you can play. Pick one with the arrow keys or the mouse and choose it with Enter or a click
   (F2 or Esc closes the menu). You change at once, wherever you are, keeping your health,
-  weapons and items; if you're dead, you come back as that character when you respawn. Every character gets the health the map gives
-  Konoko, so a Thug is as tough as a Muro. Your player stands still while the menu is open. The list can be changed
+  weapons and items; if you're dead, you come back as that character when you respawn. Every player has 100 health,
+  whatever the character, so a Thug is as tough as a Muro. Your player stands still while the menu is open. The list can be changed
   with `characters` in `[multiplayer]`.
 - **Variations**: most characters have other versions of themselves (Konoko's outfits, the
   Strikers' colors, the thug gangs). Press Q/E (or Page Up/Down), or click the `<  2 / 7  >` line
@@ -217,6 +232,8 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
 - **Free for all**: players can hit, shoot and throw each other, though they're all on Konoko's
   team. AI characters keep their usual teams.
 - **Damage is x1.25**: every hit on a character does a quarter more (rounded).
+- **Unlimited taunts**: taunt whenever you like, not only right after a kill. Every player
+  hears the same taunt line, and a new taunt cuts off your last one instead of waiting for it.
 - **Overhealing drains a quarter faster**: health above the maximum (from a hypo) goes down
   1 point every 8.8 ticks instead of every 11.
 
@@ -226,8 +243,8 @@ Every character with the IsPlayer flag is a spawn point. The first one is Konoko
 player 2; a third, fourth and so on (`player3`, `player4`...) aren't spawned, they only mark more
 spawn points. Each player starts at a random spawn point and respawns at one that no other living
 player is near (the farthest one if every point has someone close). The pick is the same on
-every PC and in every replay. A spawn point gives the position and the facing; the class, team,
-health and weapon come from the player's own placement.
+every PC and in every replay. A spawn point gives the position and the facing; the class, team
+and weapon come from the player's own placement, and every player starts with 100 health.
 
 The `[players]` settings are in [Settings](#settings).
 
@@ -264,8 +281,11 @@ that file or folder from one PC to the other and join again.
 When only the map folder differs, the joiner downloads the host's version instead: the level
 reloads, and its loading box shows `Downloading (files left/files in the map)` and the current
 file's progress and speed. Esc cancels. The joiner's old files go to
-`GameDataFolder/CustomLevels.backup/<map>`. This works for maps in `CustomLevels`, and the joiner
-must already have the map's folder. Arklite counts as the same when it
+`GameDataFolder/CustomLevels.backup/<map>`. A joiner who doesn't have the map at all gets it the
+same way: the Join list says `You don't have its map (<map>): Play downloads it.`, and Play
+downloads it into `GameDataFolder/CustomLevels/<map>` before the level starts. If that download
+fails or you press Esc, you're back in the Join list, which says why. This works for maps in
+`CustomLevels`, not for the original levels. Arklite counts as the same when it
 was built from the same source: a release download and your own build of that release's commit
 can play together. The joiner uses the host's
 `respawn_delay` and `item_respawn`.
@@ -291,7 +311,18 @@ still) while they wait. Press **F3** to be ready ("Press F3 to be ready" turns f
 F3 again to be unready). When at least two players are there and more than half of them are
 ready, a 7-second countdown starts (it stops if someone unreadies). At 0 the level reloads on
 every PC and the match begins, with everyone in step. The score (kills; dying on your own
-costs a point) is in the top right corner during the match.
+costs a point) is in the top right corner during the match, with the time left under it.
+
+A match ends at the host's **Time limit** or **Score limit** (the Host dialog; 0 means none of
+that limit). A negative score limit is reached going down, so the players race to kill
+themselves. When it ends, the game stands still and shows who won; press **fire** (the left
+mouse button) to go back. When everyone did, or after 30 seconds, the level reloads on every PC
+into the lobby, where F3 starts the next match.
+
+**F1** opens the help screen as usual, with the game still running. In a multiplayer game its
+first tab is the **Scoreboard**: every player's name, score and ping, the time left and the
+score limit. Tick **Mute** next to a player to hide their chat messages (until you untick it or
+close Oni). The **Objective** tab says in one sentence how to win the match.
 The host needs UDP port 27777 open (forwarded through the router for a game over the internet).
 The joiner's camera, sound, HUD, laser sight and crosshair follow player 2.
 

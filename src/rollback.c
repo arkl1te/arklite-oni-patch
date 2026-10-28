@@ -31,6 +31,7 @@ __declspec(dllimport) int    WINAPI CloseHandle(HANDLE);
 
 #define ONgGameState        (*(u8 **)0x5ece7c)
 #define GS_TICK(gs)         (*(u32 *)((gs) + 0x144))
+#define GS_TIME_BASE(gs)    (*(u32 *)((gs) + 0x140))   /* wall clock (1/60 s) the server time was last moved to */
 #define GS_STATE_SIZE       0x46b6e0          /* with char_limit.c's 255 characters */
 
 #define MEM_COMMIT          0x1000
@@ -320,6 +321,24 @@ void rollback_tick_end(void)
  * again. Player 2's gamepad input isn't recorded per tick: leave it alone. */
 
 #define ONgCrtHeap       (*(HANDLE *)0x6d9200)
+/* SS2, Oni's sound system: its globals, the ambient play table (*0x5eb728, *0x5eb720 entries of
+ * 0x58 bytes: +0 play id, +4 state (0 free, 7 stopping), +0xc/+0x10 its channels) and the
+ * next play id. The sound thread mixes from these, so they are never put back. */
+#define SSgGlobalsLo         0x5eb700
+#define SSgGlobalsHi         0x5eb760
+#define SSgAmbientNextId     (*(volatile u32 *)0x5eb70c)
+#define SSgAmbientCount      (*(u32 *)0x5eb720)
+#define SSgAmbients          (*(u32 **)0x5eb728)
+#define SSrAmbient_Stop      ((void (ONI_FC *)(u32))0x4823c0)   /* ECX play id */
+#define SSgChannels1         (*(u8 **)0x5eb74c)   /* sound channels (made by 0x4830c0), *0x63f390 of them */
+#define SSgChannels2         (*(u8 **)0x5eb750)   /* and *0x63f388 more */
+#define SSgChannelCount1     (*(u32 *)0x63f390)
+#define SSgChannelCount2     (*(u32 *)0x63f388)
+#define SS_CHANNEL_SIZE      0x10c
+#define SSgLock              (*(u8 **)0x63f394)   /* SS2's lock: a CRITICAL_SECTION in Oni's heap (0x487040) */
+#define SSgPlaying           (*(u32 **)0x5eb7ec)  /* the channels the sound thread mixes: Oni's array {size, count, grow, capacity, items} */
+#define SSrLock              ((void (ONI_FC *)(void *))0x487070)
+#define SSrUnlock            ((void (ONI_FC *)(void *))0x487060)
 #define RB_SLOTS         12               /* snapshots: ticks t-11..t */
 #define RB_BACK          8                /* the test rewinds this far */
 #define RB_MAX_PAGES     2048             /* pages a snapshot holds (8 MB) */
@@ -333,7 +352,10 @@ void rollback_tick_end(void)
 #define PF_PROT          4                /* write-protected now */
 #define PF_EXEC          8                /* executable (restore EXECUTE_READWRITE) */
 #define PF_WATCH         16               /* PAGE_NOACCESS between ticks, to catch other threads */
-#define PF_SHARED        32               /* known, but another thread uses it: left alone */
+#define PF_SHARED        32               /* known, but another thread uses it: put back only where ticks alone write (omask) */
+#define RB_LEARN         60               /* ticks a shared page is watched before it's put back */
+#define RB_MAX_EXCL      1024             /* ranges never put back (SS2's sound state, open ACM streams) */
+#define RB_MAX_NOTES     48               /* pages that became shared, logged from the main thread */
 #define RB_WATCH_EVERY   10
 #define RB_WATCH_FIRST   120
 
@@ -379,6 +401,19 @@ typedef struct {
 	u32 samples_wanted, samples_done, next_sample, total_bad, ticks_protected, last_runs, nshared;
 	u32 fault_page, fault_tid, fault_repeat, forced;   /* a fault that keeps coming back */
 	volatile u32 body_serial, in_fault;   /* rb_watchdog: ticks begun; the main thread is in rb_fault */
+	volatile long learn_lock;      /* rb_learn from the main thread, another thread and the watchdog */
+	u8 *omask;                     /* by place in pages[]: 128 bytes, the dwords seen changing between ticks */
+	u8 *endc;                      /* by place in pages[]: shared pages as the last tick ended */
+	u16 learn[RB_MAX_PAGES];       /* ticks a shared page has been watched (RB_LEARN: put back from then on) */
+	u32 endc_ok;                   /* endc holds the last tick's end (no restore since) */
+	u32 amb_lo[RB_SLOTS], amb_hi[RB_SLOTS];   /* SS2 ambient play ids the slot's tick started: (lo, hi] */
+	u32 ex_lo[RB_MAX_EXCL], ex_hi[RB_MAX_EXCL], nex;
+	u32 note_page[RB_MAX_NOTES], note_tid[RB_MAX_NOTES], nnotes, notes_logged;
+	u32 amb_stopped;
+	u32 acm_hits, acm_logs;        /* rb_acm_guard: ACM memory found in known pages */
+	u32 grow, grown, grow_logs;    /* rb_grow: Oni took memory the snapshots don't cover; pages added; logged */
+	u32 freed, freed_logs;         /* rb_forget: pages of allocations Oni gave back */
+	u32 plist_logs, plist_cuts;    /* rb_particles_check */
 	u32 stack_top, rescues, rescue_learned;
 	HANDLE main_thread;
 	u8 mask[1024];                 /* rb_lock_mask: dwords of live critical sections */
@@ -393,7 +428,10 @@ typedef struct {
 static Engine *g_e;
 
 static void rb_unwatch(void);
+static void rb_unprotect(void);
 static int rb_kept(u32 p);
+static void rb_globals_near(u32 p, char *out_buf);
+static void rb_sound_before_restore(u32 tick);
 
 /* Still committed and writable (a tick may have freed it) */
 static int page_writable(u32 p)
@@ -495,10 +533,31 @@ static void rb_learn(u32 p)
 {
 	Engine *e = g_e;
 	u32 i = e->npages++;
-	e->pages[i] = p;
-	e->index[p] = (u16)(i + 1);
+	e->learn[i] = 0;
+	memset(e->omask + i * 128, 0, 128);
 	for (u32 s = 0; s < RB_SLOTS; s++)   /* not written in a tick since any of them */
 		if (e->slot_valid[s]) memcpy(slot_page(s, i), (const void *)(p << PAGE_SHIFT), 0x1000);
+	e->pages[i] = p;
+	e->index[p] = (u16)(i + 1);
+}
+
+static void rb_lock(void)
+{
+	while (__sync_lock_test_and_set(&g_e->learn_lock, 1))
+		;
+}
+
+static void rb_unlock(void) { __sync_lock_release(&g_e->learn_lock); }
+
+/* A page another thread uses: noted for the log (the main thread writes it at the tick's end) */
+static void rb_note(u32 p, u32 tid)
+{
+	Engine *e = g_e;
+	if (e->nnotes < RB_MAX_NOTES) {
+		e->note_page[e->nnotes] = p;
+		e->note_tid[e->nnotes] = tid;
+		e->nnotes++;
+	}
 }
 
 static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid);
@@ -508,7 +567,10 @@ static long WINAPI rb_fault(EXCEPTION_POINTERS *ep)
 	Engine *e = g_e;
 	u32 tid = GetCurrentThreadId();
 	long r;
-	if (!e) return 0;
+	/* the match's snapshots are off (rb_reset opened every page): any fault now is someone
+	 * else's. Handled, a real crash during the next level's load looped here forever (the Windows
+	 * joiner froze going back to the lobby after a match) */
+	if (!e || !e->active) return 0;
 	if (tid != e->main_tid) return rb_fault_main(ep, tid);
 	e->in_fault = 1;
 	r = rb_fault_main(ep, tid);
@@ -526,12 +588,13 @@ static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid)
 	p = r->info[1] >> PAGE_SHIFT;
 	if (p >= PAGES || !(e->flag[p] & PF_CAND)) return 0;
 	if (p == e->fault_page && tid == e->fault_tid) {
+		if (e->fault_repeat > 4 + 4) return 0;   /* opening it didn't help: not ours, let it crash */
 		if (++e->fault_repeat > 4) {   /* never loop: open it for good */
 			e->flag[p] |= PF_FOREIGN | PF_SHARED;
 			VirtualProtect((void *)(p << PAGE_SHIFT), 0x1000, e->flag[p] & PF_EXEC ? 0x40 : 0x04, &old);
 			e->flag[p] &= ~(PF_WATCH | PF_PROT);
 			e->forced++;
-			e->fault_repeat = 0;
+			e->fault_repeat = 4 + 4 + 1;   /* the next fault here in a row goes on to the other handlers */
 			return -1;
 		}
 	} else {
@@ -543,6 +606,7 @@ static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid)
 		if (tid != e->main_tid && !(e->flag[p] & PF_SHARED)) {
 			e->flag[p] |= PF_SHARED;
 			e->nshared++;
+			rb_note(p, tid);
 		}
 		VirtualProtect((void *)(p << PAGE_SHIFT), 0x1000, e->flag[p] & PF_EXEC ? 0x40 : 0x04, &old);
 		e->flag[p] &= ~PF_WATCH;
@@ -551,7 +615,20 @@ static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid)
 	if (!(e->flag[p] & PF_PROT)) return rb_open_now(p) ? -1 : 0;   /* another thread just opened it */
 	if (r->info[0] != 1) return 0;
 	if (tid == e->main_tid && e->in_body && e->npages < RB_MAX_PAGES) {
+		rb_lock();
 		rb_learn(p);
+		rb_unlock();
+	} else if (tid != e->main_tid && e->npages < RB_MAX_PAGES) {
+		/* another thread writes it in a tick: known and shared, so the dwords only ticks write are
+		 * still put back once it has been watched (pages left out made particles come apart) */
+		rb_lock();
+		if (!e->index[p] && e->npages < RB_MAX_PAGES) {
+			rb_learn(p);
+			e->flag[p] |= PF_SHARED;
+			e->nshared++;
+			rb_note(p, tid);
+		}
+		rb_unlock();
 	} else {
 		if (tid == e->main_tid) e->overflow++;
 		else e->nforeign_pages++;
@@ -602,6 +679,10 @@ static void rb_start(void)
 			}
 	e->npages = e->overflow = 0;
 	for (u32 s = 0; s < RB_SLOTS; s++) e->slot_valid[s] = 0;
+	e->endc_ok = 0;
+	e->nnotes = e->notes_logged = 0;
+	e->amb_stopped = e->acm_hits = e->acm_logs = 0;
+	e->grow = e->grown = e->grow_logs = e->plist_logs = e->plist_cuts = e->freed = e->freed_logs = 0;
 	e->main_tid = GetCurrentThreadId();
 	if (!e->main_thread) e->main_thread = OpenThread(0x1fffff /* THREAD_ALL_ACCESS */, 0, e->main_tid);
 	__asm__ volatile("movl %%fs:4, %0" : "=r"(e->stack_top));
@@ -616,7 +697,10 @@ static void rb_reset(const char *why)
 {
 	if (!g_e->active) return;
 	rb_unwatch();
-	log_msg("rollback: snapshots off (%s); %d pages were known", why, g_e->npages);
+	if (g_e->nruns) rb_unprotect();
+	log_msg("rollback: snapshots off (%s); %d pages were known, %d KB taken during the match followed, %d KB given back "
+	        "dropped, %d broken particle lists cut, ACM memory in known pages %d times", why, g_e->npages, g_e->grown * 4, g_e->freed * 4,
+	        g_e->plist_cuts, g_e->acm_hits);
 	g_e->active = 0;
 }
 
@@ -625,8 +709,19 @@ static void rb_snapshot(u32 tick, const void *action)
 	Engine *e = g_e;
 	u32 s = tick % RB_SLOTS;
 
+	/* shared pages: the dwords that changed since the last tick ended weren't the ticks' */
+	for (u32 i = 0; e->endc_ok && i < e->npages; i++) {
+		u32 p = e->pages[i];
+		if (!(e->flag[p] & PF_SHARED) || !page_writable(p)) continue;
+		const u32 *now = (const u32 *)(p << PAGE_SHIFT), *was = (const u32 *)(e->endc + i * 0x1000);
+		u8 *m = e->omask + i * 128;
+		for (u32 k = 0; k < 1024; k++)
+			if (now[k] != was[k]) m[k >> 3] |= (u8)(1 << (k & 7));
+		if (e->learn[i] < 0xffff) e->learn[i]++;
+	}
 	for (u32 i = 0; i < e->npages; i++)
-		if (rb_kept(e->pages[i])) memcpy(slot_page(s, i), (const void *)(e->pages[i] << PAGE_SHIFT), 0x1000);
+		if ((e->flag[e->pages[i]] & PF_CAND) && page_writable(e->pages[i]))
+			memcpy(slot_page(s, i), (const void *)(e->pages[i] << PAGE_SHIFT), 0x1000);
 	e->slot_tick[s] = tick;
 	e->slot_valid[s] = 1;
 	e->has_action[s] = action != 0;
@@ -636,8 +731,9 @@ static void rb_snapshot(u32 tick, const void *action)
 
 /* Readable now. Asked of the system, not of the region list made at the engine's start: memory
  * freed since then (a heap shrinking) made a restore read a decommitted page and crash. The last
- * few readable regions are cached for one page's scan (rb_lock_mask clears them). */
-#define RB_RD_CACHE 4
+ * few readable regions are cached for one restore or comparison (rb_rd_forget clears them:
+ * nothing is freed while the main thread is in there). */
+#define RB_RD_CACHE 16
 static u32 g_rd_lo[RB_RD_CACHE], g_rd_hi[RB_RD_CACHE], g_rd_next;
 
 static int rb_readable(u32 a)
@@ -653,35 +749,62 @@ static int rb_readable(u32 a)
 	return 1;
 }
 
+static void rb_rd_forget(void)
+{
+	memset(g_rd_hi, 0, sizeof g_rd_hi);
+}
+
 /* g_e->mask[k] = 1 for the dwords of the page that belong to a live critical section: its
  * DebugInfo (+0) points to a debug record whose CriticalSection field (+4) points back */
 static void rb_lock_mask(u32 p)
 {
 	const u32 *page = (const u32 *)(p << PAGE_SHIFT);
 	memset(g_e->mask, 0, sizeof g_e->mask);
-	memset(g_rd_hi, 0, sizeof g_rd_hi);   /* forget what was readable before */
 	for (u32 k = 0; k < 1024; k++) {
 		u32 d = page[k];
-		if ((d & 3) || d < 0x10000 || !rb_readable(d) || !rb_readable(d + 7)) continue;
+		if ((d & 3) || d < 0x10000 || k + 3 >= 1024) continue;
+		/* it must look like one: a free/held LockCount, a small RecursionCount, the owner a
+		 * thread id or 0. A two-way list node ({next, prev}) passes the pointer test below, so
+		 * 24 bytes of every such node were never put back and the lists came apart. Tested
+		 * first, from the page alone: the pointer test is a system call, and floats that look
+		 * like pointers made a restore cost tens of thousands of them (a visible hitch) */
+		int lock = (int)page[k + 1];
+		if (lock < -0x10000 || lock > 0x10000 || page[k + 2] > 0x10000 || page[k + 3] > 0x100000) continue;
+		if (!rb_readable(d) || !rb_readable(d + 7)) continue;
 		if (*(const u32 *)(d + 4) != (u32)(page + k)) continue;
+		if (*(const u16 *)d != 0) continue;   /* debug record Type: RTL_CRITSECT_TYPE */
 		for (u32 n = k; n < k + 6 && n < 1024; n++) g_e->mask[n] = 1;   /* 24 bytes */
 	}
 }
 
-static void rb_restore_page(u32 p, const u8 *from)
+static void rb_restore_page(u32 i, const u8 *from)
 {
-	u32 *page = (u32 *)(p << PAGE_SHIFT);
+	Engine *e = g_e;
+	u32 p = e->pages[i], a = p << PAGE_SHIFT;
+	u32 *page = (u32 *)a;
 	const u32 *src = (const u32 *)from;
 	rb_lock_mask(p);
+	if (e->flag[p] & PF_SHARED) {
+		const u8 *m = e->omask + i * 128;
+		for (u32 k = 0; k < 1024; k++)
+			if (m[k >> 3] & (1 << (k & 7))) e->mask[k] = 1;
+	}
+	for (u32 x = 0; x < e->nex; x++) {   /* SS2's sound state */
+		if (e->ex_hi[x] <= a || e->ex_lo[x] >= a + 0x1000) continue;
+		u32 lo = e->ex_lo[x] > a ? (e->ex_lo[x] - a) / 4 : 0, hi = e->ex_hi[x] < a + 0x1000 ? (e->ex_hi[x] - a + 3) / 4 : 1024;
+		for (u32 k = lo; k < hi; k++) e->mask[k] = 1;
+	}
 	for (u32 k = 0; k < 1024; k++)
-		if (!g_e->mask[k]) page[k] = src[k];
+		if (!e->mask[k]) page[k] = src[k];
 }
 
 static void rb_restore(u32 slot)
 {
 	Engine *e = g_e;
+	rb_rd_forget();
 	for (u32 i = 0; i < e->npages; i++)
-		if (rb_kept(e->pages[i])) rb_restore_page(e->pages[i], slot_page(slot, i));
+		if (rb_kept(e->pages[i])) rb_restore_page(i, slot_page(slot, i));
+	e->endc_ok = 0;
 }
 
 /* The page differs from a copy, live critical sections left out */
@@ -689,6 +812,7 @@ static int rb_page_differs(u32 p, const u8 *want)
 {
 	const u32 *now = (const u32 *)(p << PAGE_SHIFT), *w = (const u32 *)want;
 	if (!memcmp_pages((const u8 *)now, want)) return 0;
+	rb_rd_forget();
 	rb_lock_mask(p);
 	for (u32 k = 0; k < 1024; k++)
 		if (!g_e->mask[k] && now[k] != w[k]) return 1;
@@ -741,7 +865,7 @@ static void rb_watch(void)
 	u32 old;
 	for (u32 i = 0; i < e->npages; i++) {
 		u32 p = e->pages[i];
-		if (e->flag[p] & (PF_SHARED | PF_WATCH)) continue;
+		if ((e->flag[p] & (PF_SHARED | PF_WATCH)) || !(e->flag[p] & PF_CAND)) continue;
 		e->flag[p] |= PF_WATCH;
 		if (!VirtualProtect((void *)(p << PAGE_SHIFT), 0x1000, 0x01 /* PAGE_NOACCESS */, &old)) e->flag[p] &= ~PF_WATCH;
 	}
@@ -760,7 +884,299 @@ static void rb_unwatch(void)
 }
 
 /* A known page that is copied, put back and compared */
-static int rb_kept(u32 p) { return !(g_e->flag[p] & PF_SHARED) && page_writable(p); }
+static int rb_kept(u32 p)
+{
+	Engine *e = g_e;
+	if (!(e->flag[p] & PF_CAND)) return 0;   /* Oni freed it (rb_forget) */
+	if ((e->flag[p] & PF_SHARED) && (!e->index[p] || e->learn[e->index[p] - 1] < RB_LEARN)) return 0;
+	return page_writable(p);
+}
+
+/* ---- Memory Oni takes during a match ------------------------------------------------------ *
+ * The candidates were the pages committed when the engine started. Memory the game commits
+ * later (a heap growing into its reserved space, a new heap segment, a new small-block region)
+ * was never protected, learned or put back, so it stayed in the future through every rollback.
+ * Particles live in 50000-byte malloc'd blocks (0x455d00) added as a match needs more, and a
+ * rewound class list (*0x65c5b0) meeting particles left in the future looped forever in the
+ * particle update (0x45cc70): the Windows joiner froze at tick 249. Oni.exe's imports of
+ * HeapAlloc, HeapReAlloc and VirtualAlloc are wrapped: memory the main thread gets in pages
+ * that aren't candidates adds its allocation to Oni's, and before the next tick rb_grow makes
+ * every committed page of those allocations a candidate. Pages taken in the tick before are
+ * learned with their content then; older snapshots get that content too, but at those ticks
+ * the game's own tables (rewound with them) didn't use that memory yet. */
+#define IAT_HeapAlloc     0x529160
+#define IAT_HeapReAlloc   0x52915c
+#define IAT_VirtualAlloc  0x529060
+#define IAT_HeapFree      0x529164
+#define IAT_VirtualFree   0x52906c
+
+static void *(WINAPI *g_heap_alloc)(HANDLE, u32, u32);
+static void *(WINAPI *g_heap_realloc)(HANDLE, u32, void *, u32);
+static void *(WINAPI *g_virtual_alloc)(void *, u32, u32, u32);
+static int (WINAPI *g_heap_free)(HANDLE, u32, void *);
+static int (WINAPI *g_virtual_free)(void *, u32, u32);
+static u32 rb_alloc_of(const void *p);
+static void rb_freed(u32 base);
+
+static void rb_new_memory(const void *p, u32 n)
+{
+	Engine *e = g_e;
+	if (!p || !n || !e || !e->active || GetCurrentThreadId() != e->main_tid) return;
+	if ((e->flag[(u32)p >> PAGE_SHIFT] & PF_CAND) && (e->flag[((u32)p + n - 1) >> PAGE_SHIFT] & PF_CAND)) return;
+	rb_add_oni(p);
+	e->grow = 1;
+}
+
+static void *WINAPI rb_heap_alloc(HANDLE h, u32 flags, u32 n)
+{
+	void *p = g_heap_alloc(h, flags, n);
+	rb_new_memory(p, n);
+	return p;
+}
+
+static void *WINAPI rb_heap_realloc(HANDLE h, u32 flags, void *old, u32 n)
+{
+	u32 base = rb_alloc_of(old);
+	void *p = g_heap_realloc(h, flags, old, n);
+	rb_freed(base);
+	rb_new_memory(p, n);
+	return p;
+}
+
+static void *WINAPI rb_virtual_alloc(void *at, u32 n, u32 type, u32 protect)
+{
+	void *p = g_virtual_alloc(at, n, type, protect);
+	if (type & MEM_COMMIT) rb_new_memory(p, n);
+	return p;
+}
+
+/* An allocation of Oni's that was freed: its pages stop being the game's at once. The address
+ * can be handed to anything next: a large decode buffer (its own region under Wine) freed after
+ * a long sound, then reused for a piece of Wine's process heap, was kept being put back, and the
+ * rewound heap crashed the Linux host in acmStreamOpen. */
+static void rb_forget(u32 base)
+{
+	Engine *e = g_e;
+	u32 k = 0, n = 0;
+	while (k < e->noni && e->oni[k] != base) k++;
+	if (k == e->noni) return;
+	e->oni[k] = e->oni[--e->noni];
+	for (u32 i = 0; i < e->nregs; i++) {
+		Region *r = &e->regs[i];
+		if (r->alloc != base || !r->size) continue;
+		memset(e->flag + (r->base >> PAGE_SHIFT), 0, r->size >> PAGE_SHIFT);
+		n += r->size >> PAGE_SHIFT;
+		r->size = 0;
+	}
+	e->freed += n;
+	if (n && e->freed_logs++ < 8)
+		log_msg("rollback: tick %d: Oni gave back %d KB at %08x; out of the snapshots (%d KB so far)",
+		        e->last_tick, n * 4, base, e->freed * 4);   /* not the game state's tick: unloading frees it */
+}
+
+/* Still an allocation with that base. Its first page needn't be committed: on Windows some
+ * live ones start reserved, and taking that for freed dropped 16 MB of the joiner's game state
+ * at tick 0 (a desync at tick 1740) */
+static int rb_alloc_alive(u32 base)
+{
+	MEMORY_BASIC_INFORMATION m;
+	return VirtualQuery((const void *)base, &m, sizeof m) == sizeof m && m.State != 0x10000 /* MEM_FREE */ &&
+	       (u32)m.AllocationBase == base;
+}
+
+/* The allocation p is in, if the snapshots follow it */
+static u32 rb_alloc_of(const void *p)
+{
+	MEMORY_BASIC_INFORMATION m;
+	Engine *e = g_e;
+	if (!p || !e || !e->active || GetCurrentThreadId() != e->main_tid || !(e->flag[(u32)p >> PAGE_SHIFT] & PF_CAND)) return 0;
+	if (VirtualQuery(p, &m, sizeof m) != sizeof m) return 0;
+	return (u32)m.AllocationBase;
+}
+
+static void rb_freed(u32 base)
+{
+	if (base && !rb_alloc_alive(base)) rb_forget(base);
+}
+
+static int WINAPI rb_heap_free(HANDLE h, u32 flags, void *p)
+{
+	u32 base = rb_alloc_of(p);
+	int r = g_heap_free(h, flags, p);
+	rb_freed(base);
+	return r;
+}
+
+static int WINAPI rb_virtual_free(void *p, u32 n, u32 type)
+{
+	u32 base = rb_alloc_of(p);
+	int r = g_virtual_free(p, n, type);
+	rb_freed(base);
+	return r;
+}
+
+/* Allocations another thread freed, or freed in ways not seen above */
+static void rb_check_allocs(void)
+{
+	Engine *e = g_e;
+	for (u32 k = e->noni; k-- > 0; )
+		if (!rb_alloc_alive(e->oni[k])) rb_forget(e->oni[k]);
+}
+
+static void rb_hook_iat(u32 slot, const u8 *site, void *hook, void **orig)
+{
+	if (!code_matches((u32)site, (const u8[]){ 0xff, 0x15 }, 2) || *(const u32 *)(site + 2) != slot) {
+		log_msg("rollback: Oni.exe's import at 0x%x isn't called at 0x%x: memory it gives isn't followed", slot, (u32)site);
+		return;
+	}
+	*orig = *(void **)slot;
+	patch_write(slot, &hook, 4);
+}
+
+static void rb_hook_alloc(void)
+{
+	static int done;
+	if (done++) return;
+	rb_hook_iat(IAT_HeapAlloc, (const u8 *)0x51fc90, (void *)rb_heap_alloc, (void **)&g_heap_alloc);
+	rb_hook_iat(IAT_HeapReAlloc, (const u8 *)0x51fd88, (void *)rb_heap_realloc, (void **)&g_heap_realloc);
+	rb_hook_iat(IAT_VirtualAlloc, (const u8 *)0x524515, (void *)rb_virtual_alloc, (void **)&g_virtual_alloc);
+	rb_hook_iat(IAT_HeapFree, (const u8 *)0x51fc1c, (void *)rb_heap_free, (void **)&g_heap_free);
+	if (code_matches(0x5240aa, (const u8[]){ 0x8b, 0x3d }, 2) && *(const u32 *)0x5240ac == IAT_VirtualFree) {
+		g_virtual_free = *(void **)IAT_VirtualFree;
+		void *hook = (void *)rb_virtual_free;
+		patch_write(IAT_VirtualFree, &hook, 4);
+	} else {
+		log_msg("rollback: Oni.exe's VirtualFree import isn't where it was: memory it frees is dropped a tick late");
+	}
+}
+
+/* Every committed page of Oni's allocations becomes a candidate (protected from this tick on) */
+static void rb_grow(void)
+{
+	Engine *e = g_e;
+	MEMORY_BASIC_INFORMATION m;
+	u32 added = 0, first = 0;
+
+	e->grow = 0;
+	for (u32 k = 0; k < e->noni; k++) {
+		u32 base = e->oni[k];
+		for (u32 a = base; a < 0x7ff00000u && VirtualQuery((const void *)a, &m, sizeof m) == sizeof m &&
+		     (u32)m.AllocationBase == base && m.RegionSize; a = (u32)m.BaseAddress + m.RegionSize) {
+			if (!writable(&m) || m.Type == MEM_MAPPED) continue;
+			u32 p = (u32)m.BaseAddress >> PAGE_SHIFT, end = p + (m.RegionSize >> PAGE_SHIFT);
+			while (p < end) {
+				while (p < end && (e->flag[p] & PF_CAND)) p++;
+				u32 q = p;
+				while (q < end && !(e->flag[q] & PF_CAND)) q++;
+				if (q > p && e->nregs < MAX_REGIONS) {
+					Region *r = &e->regs[e->nregs++];
+					r->base = p << PAGE_SHIFT;
+					r->size = (q - p) << PAGE_SHIFT;
+					r->alloc = base;
+					r->type = m.Type;
+					r->protect = m.Protect;
+					memset(e->flag + p, PF_CAND | (m.Protect & 0xf0 ? PF_EXEC : 0), q - p);
+					if (!first) first = p << PAGE_SHIFT;
+					added += q - p;
+				}
+				p = q;
+			}
+		}
+	}
+	e->grown += added;
+	if (added && e->grow_logs++ < 8)
+		log_msg("rollback: tick %d: Oni took %d KB more (from %08x); in the snapshots now (%d KB since the match began)",
+		        e->last_tick, added * 4, first, e->grown * 4);
+}
+
+/* ---- Particle lists ------------------------------------------------------------------------ *
+ * Each particle class (0x65c520 + i * 0x98, *0x6a8666 of them) keeps its live particles in a
+ * list at +0x90, linked through +0x34. One that loops or points at unreadable memory freezes or
+ * crashes the particle update, so at each tick's start every list is checked: a broken one is
+ * logged with the pages its particles are on (whether the snapshots cover them) and cut, so
+ * the game goes on (both PCs' particles may differ from then on). */
+#define P3gClassCount  (*(volatile u16 *)0x6a8666)
+#define P3gClasses     0x65c520
+#define P3_CLASS_SIZE  0x98
+#define P3_MAX_CLASSES 2048
+
+static int rb_node_ok(u32 n) { return !(n & 3) && rb_readable(n) && rb_readable(n + 0x37); }
+static u32 rb_next(u32 n) { return *(const u32 *)(n + 0x34); }
+
+static void rb_page_desc(u32 a, char *buf)
+{
+	Engine *e = g_e;
+	u32 p = a >> PAGE_SHIFT;
+	u8 f = p < PAGES ? e->flag[p] : 0;
+	u16 ix = p < PAGES ? e->index[p] : 0;
+	fmt(buf, " %08x (%s%s%s)", a, !(f & PF_CAND) ? "not in the snapshots" : ix ? "known" : "never written in a tick",
+	    f & PF_SHARED ? ", shared" : "", f & PF_FOREIGN ? ", foreign" : "");
+}
+
+static void rb_particles_check(u32 tick)
+{
+	Engine *e = g_e;
+	u32 n = P3gClassCount;
+	if (n > P3_MAX_CLASSES) n = P3_MAX_CLASSES;
+	rb_rd_forget();
+	for (u32 c = 0; c < n; c++) {
+		u32 *head = (u32 *)(P3gClasses + c * P3_CLASS_SIZE + 0x90);
+		u32 power = 1, lam = 1, tort = *head, prev = 0, hare = 0, bad = 0;
+		if (!tort) continue;
+		if (!rb_node_ok(tort)) {
+			bad = tort;
+			*head = 0;
+		} else {
+			prev = tort;
+			hare = rb_next(tort);
+			while (hare && hare != tort) {
+				if (!rb_node_ok(hare)) {
+					bad = hare;
+					*(u32 *)(prev + 0x34) = 0;
+					break;
+				}
+				if (power == lam) {
+					tort = hare;
+					power <<= 1;
+					lam = 0;
+				}
+				prev = hare;
+				hare = rb_next(hare);
+				lam++;
+			}
+			if (!bad && !hare) continue;
+		}
+		e->plist_cuts++;
+		if (e->plist_logs >= 6) continue;
+		e->plist_logs++;
+		if (bad) {
+			char d[96];
+			rb_page_desc(bad, d);
+			log_msg("rollback: tick %d: particle class %d's list points at unreadable memory%s; cut there", tick, c, d);
+			continue;
+		}
+		/* a loop of lam particles: find where it starts, cut it before it comes round again */
+		u32 a = *head, b = *head, desc_len = 0;
+		char desc[400];
+		for (u32 i = 0; i < lam; i++) b = rb_next(b);
+		while (a != b) {
+			a = rb_next(a);
+			b = rb_next(b);
+		}
+		desc[0] = 0;
+		b = a;
+		for (u32 i = 0; i + 1 < lam; i++) {
+			if (i < 4) {
+				rb_page_desc(b, desc + desc_len);
+				while (desc[desc_len]) desc_len++;
+			}
+			b = rb_next(b);
+		}
+		*(u32 *)(b + 0x34) = 0;
+		log_msg("rollback: tick %d: particle class %d's list loops (%d particles round, from %08x); cut. Particles:%s",
+		        tick, c, lam, a, desc);
+	}
+}
 
 /* ---- The game state the rewind must reproduce ----------------------------------------------- *
  * Every character and its active data as the network check sees them (net_char_image: without
@@ -861,6 +1277,7 @@ static void rb_out_diff(u32 p, const u8 *want)
 			break;
 		}
 	rb_globals_near(p, near);
+	rb_rd_forget();
 	rb_lock_mask(p);
 	while (off < 0x1000 && (g_e->mask[off / 4] || *(const u32 *)(want + off) == *(const u32 *)(now + off))) off += 4;
 	u32 lo = off >= 8 ? off - 8 : 0;
@@ -887,7 +1304,10 @@ static void rb_rewind_test(u32 tick, void (*body)(void *))
 	}
 
 	rb_game_capture();
+	if (SSgLock) SSrLock(SSgLock);
+	rb_sound_before_restore(back);
 	rb_restore(back % RB_SLOTS);
+	if (SSgLock) SSrUnlock(SSgLock);
 	for (u32 t = back; t < tick; t++) {
 		memcpy(e->tmp_action, e->action[t % RB_SLOTS], 0x30);
 		body(e->has_action[t % RB_SLOTS] ? e->tmp_action : 0);
@@ -952,6 +1372,9 @@ int rollback_test_tick(void *action, void (*body)(void *))
 		rb_start();
 		e->next_sample = tick + 60;
 	}
+	rb_check_allocs();
+	if (e->grow) rb_grow();
+	rb_particles_check(tick);
 	rb_snapshot(tick, action);
 	if (e->samples_done < e->samples_wanted && tick >= e->next_sample) {
 		e->next_sample = tick + SURVEY_EVERY;
@@ -960,10 +1383,23 @@ int rollback_test_tick(void *action, void (*body)(void *))
 	if (e->ticks_protected < 3) log_msg("rollback: tick %d: protecting %d known pages' neighbours", tick, e->npages);
 	rb_protect();
 	e->body_serial++;
+	e->amb_lo[e->cur] = SSgAmbientNextId;
 	e->in_body = 1;
 	body(action);
 	e->in_body = 0;
+	e->amb_hi[e->cur] = SSgAmbientNextId;
 	rb_unprotect();
+	for (u32 i = 0; i < e->npages; i++)
+		if ((e->flag[e->pages[i]] & PF_SHARED) && page_writable(e->pages[i]))
+			memcpy(e->endc + i * 0x1000, (const void *)(e->pages[i] << PAGE_SHIFT), 0x1000);
+	e->endc_ok = 1;
+	while (e->notes_logged < e->nnotes) {
+		u32 k = e->notes_logged++;
+		char near[160];
+		rb_globals_near(e->note_page[k], near);
+		log_msg("rollback: page %08x is shared with thread %d (another thread uses it); Oni.exe globals near:%s",
+		        e->note_page[k] << PAGE_SHIFT, e->note_tid[k], near[0] ? near : " none");
+	}
 	e->ticks_protected++;
 	if (e->rescues && e->ticks_protected <= 3)
 		log_msg("rollback: tick %d finished after the watchdog stepped in", tick);
@@ -993,8 +1429,9 @@ static int rb_learn_at(u32 a)
 	Engine *e = g_e;
 	u32 p = a >> PAGE_SHIFT, old;
 	if (p >= PAGES || !(e->flag[p] & PF_PROT) || e->index[p] || (e->flag[p] & PF_FOREIGN)) return 0;
-	if (e->npages >= RB_MAX_PAGES) return 0;
+	if (e->npages >= RB_MAX_PAGES || __sync_lock_test_and_set(&e->learn_lock, 1)) return 0;
 	rb_learn(p);
+	rb_unlock();
 	VirtualProtect((void *)(p << PAGE_SHIFT), 0x1000, e->flag[p] & PF_EXEC ? 0x40 : 0x04, &old);
 	e->flag[p] &= ~PF_PROT;
 	return 1;
@@ -1102,10 +1539,13 @@ static int rb_alloc(void)
 	g_e->regs = alloc_own(MAX_REGIONS * sizeof(Region));
 	g_e->gimg = alloc_own(RB_MAX_CHARS * NET_CHAR_IMAGE_SIZE);
 	g_e->gnow = alloc_own(NET_CHAR_IMAGE_SIZE);
-	if (!g_e->flag || !g_e->index || !g_e->regs || !g_e->gimg || !g_e->gnow) return 0;
+	g_e->omask = alloc_own(RB_MAX_PAGES * 128);
+	g_e->endc = alloc_own(RB_MAX_PAGES * 0x1000);
+	if (!g_e->flag || !g_e->index || !g_e->regs || !g_e->gimg || !g_e->gnow || !g_e->omask || !g_e->endc) return 0;
 	for (u32 s = 0; s < RB_SLOTS; s++)
 		if (!(g_e->slot[s] = alloc_own(RB_MAX_PAGES * 0x1000))) return 0;
 	CreateThread(0, 0x10000, rb_watchdog, 0, 0, 0);
+	rb_hook_alloc();
 	return AddVectoredExceptionHandler(1, (void *)rb_fault) != 0;
 }
 
@@ -1146,14 +1586,149 @@ void rollback_net_end(void)
 	if (g_e) g_e->start_now = 0;
 }
 
+/* The sound a rollback must not rewind. Ambient sounds (loops) the ticks being taken back
+ * started are stopped: the game forgets their play ids, and before this they played on forever
+ * (the SMG's firing loop). The re-run ticks start them again (rollback_impulses keeps one-shot
+ * sounds, which end by themselves, from playing twice). SS2's tables and the channels they
+ * point at go on the exclusion list, so the restore leaves them as the sound thread has them. */
+static void rb_add_excl(u32 lo, u32 hi)
+{
+	Engine *e = g_e;
+	if (e->nex < RB_MAX_EXCL && hi > lo) {
+		e->ex_lo[e->nex] = lo;
+		e->ex_hi[e->nex] = hi;
+		e->nex++;
+	}
+}
+
+/* An open ACM stream: its memory is msacm32's and its driver's, never the game's, but under
+ * Wine nothing keeps it out of a page that was Oni's once (a freed block's address reused).
+ * Put back, the sound thread converted through a stream whose driver data was gone: the Linux
+ * host, a call to 0x273 and then to 0 in acmStreamConvert (0x48500c); Wine's ADPCM converter
+ * calls through its instance data (aad->convert). The stream is left out of restores and logged
+ * when it lies in a known page; under Wine (WINE_ACMSTREAM: +0 type 0x5eed0003, +8 the driver,
+ * +0xc drvInst, whose dwDriver at +0x2c is the converter's data and has at +0x30 the stream
+ * itself) so are its driver and the converter's data. */
+#define WINE_ACMOBJ_STREAM 0x5eed0003
+
+static void rb_acm_range(u32 lo, u32 n, const char *what)
+{
+	Engine *e = g_e;
+	if (!lo || !rb_readable(lo) || !rb_readable(lo + n - 1)) return;
+	rb_add_excl(lo, lo + n);
+	for (u32 p = lo >> PAGE_SHIFT; p <= (lo + n - 1) >> PAGE_SHIFT; p++) {
+		if (!e->index[p]) continue;
+		e->acm_hits++;
+		if (e->acm_logs++ < 8)
+			log_msg("rollback: tick %d: an open ACM %s (%08x) lies in snapshot page %08x; left out of the restore",
+			        e->last_tick, what, lo, p << PAGE_SHIFT);
+	}
+}
+
+static void rb_acm_guard(u32 h)
+{
+	if (!h || !rb_readable(h)) return;
+	rb_acm_range(h, 0x80, "stream");
+	if (!rb_readable(h + 0x33)) return;
+	const u32 *w = (const u32 *)h;
+	if (w[0] != WINE_ACMOBJ_STREAM || w[12] != h) {   /* not Wine's (Windows has its own layout) */
+		static int said;
+		if (!said++) log_msg("rollback: an ACM stream (%08x) isn't Wine's layout (%08x, has %08x): only the stream is kept out", h, w[0], w[12]);
+		return;
+	}
+	rb_acm_range(w[2], 0x40, "driver");
+	rb_acm_range(w[11], 0x40, "converter's data");
+}
+
+static void rb_sound_before_restore(u32 tick)
+{
+	Engine *e = g_e;
+	u32 *t = SSgAmbients, n = SSgAmbientCount;
+
+	e->nex = 0;
+	rb_add_excl(SSgGlobalsLo, SSgGlobalsHi);
+	/* both channel arrays whole: a channel holds its DirectSound buffer (+0x58) and ACM stream
+	 * (+0xb0, opened and closed by 0x484b70); one put back held a stream closed since, and
+	 * opening the next one crashed in the heap (the Linux host at tick 18208) */
+	if (SSgChannels1 && SSgChannelCount1 < 4096) rb_add_excl((u32)SSgChannels1, (u32)SSgChannels1 + SSgChannelCount1 * SS_CHANNEL_SIZE);
+	if (SSgChannels2 && SSgChannelCount2 < 4096) rb_add_excl((u32)SSgChannels2, (u32)SSgChannels2 + SSgChannelCount2 * SS_CHANNEL_SIZE);
+	for (u32 i = 0; SSgChannels1 && i < SSgChannelCount1 && i < 4096; i++) rb_acm_guard(*(u32 *)(SSgChannels1 + i * SS_CHANNEL_SIZE + 0xb0));
+	for (u32 i = 0; SSgChannels2 && i < SSgChannelCount2 && i < 4096; i++) rb_acm_guard(*(u32 *)(SSgChannels2 + i * SS_CHANNEL_SIZE + 0xb0));
+	/* SS2's lock and its list of playing channels (added at 0x4844f1, removed at 0x485a75): the
+	 * lock put back from a snapshot let the sound thread and the main thread in at once, and the
+	 * list put back didn't match the channels; the sound thread converted with an ACM stream the
+	 * main thread had just closed (the Linux host, a call to 0 in acmStreamConvert at tick 64318).
+	 * rb_lock_mask misses a lock it can't prove live (no debug record, or across two pages) */
+	if (SSgLock) rb_add_excl((u32)SSgLock, (u32)SSgLock + 24);
+	{
+		u32 *l = SSgPlaying;
+		if (l && rb_readable((u32)l) && rb_readable((u32)l + 0x13)) {
+			rb_add_excl((u32)l, (u32)l + 0x14);
+			if (l[4] && l[0] <= 64 && l[3] < 4096) rb_add_excl(l[4], l[4] + l[0] * l[3]);
+		}
+	}
+	if (!t || n > 4096 || !rb_readable((u32)t)) return;
+	rb_add_excl((u32)t, (u32)t + n * 0x58);
+	for (u32 i = 0; i < n; i++) {
+		u32 *a = t + i * 0x16;
+		if (!a[1]) continue;
+		for (u32 s = 0; s < RB_SLOTS; s++) {
+			if (!e->slot_valid[s] || e->slot_tick[s] < tick) continue;
+			if (a[0] - e->amb_lo[s] - 1 < e->amb_hi[s] - e->amb_lo[s]) {   /* lo < id <= hi */
+				SSrAmbient_Stop(a[0]);
+				e->amb_stopped++;
+				break;
+			}
+		}
+	}
+	for (u32 i = 0; i < n; i++) {   /* the channels, stopped ones included */
+		u32 *a = t + i * 0x16;
+		if (a[3]) rb_add_excl(a[3], a[3] + 0x80);
+		if (a[4]) rb_add_excl(a[4], a[4] + 0x80);
+	}
+}
+
+u32 rollback_ambients_stopped(void) { return g_e ? g_e->amb_stopped : 0; }
+
+/* One-shot sounds off (0) while ticks run again, on (1) after: SS2's impulse players
+ * (0x47ff50, 0x480440, 0x480560) read Arklite's zero byte in place of the "sound driver" byte
+ * *0x5eb757, which ambients (and stopping them) still read. 0x480440's read is lockstep.c's
+ * sound seed call when that's in (the patch below then skips it), muted with
+ * lockstep_impulses_mute. */
+static const u8 g_zero_byte;
+static const u32 g_impulse_sites[] = { 0x47ff50, 0x480443, 0x480560 };
+
+void rollback_impulses(int on)
+{
+	static int muted;
+	u8 want[5] = { 0xa0 }, now[5] = { 0xa0 };
+	u32 to = on ? 0x5eb757 : (u32)&g_zero_byte, from = on ? (u32)&g_zero_byte : 0x5eb757;
+	if (muted == !on) return;
+	lockstep_impulses_mute(!on);
+	memcpy(now + 1, &from, 4);
+	memcpy(want + 1, &to, 4);
+	for (u32 i = 0; i < sizeof g_impulse_sites / sizeof g_impulse_sites[0]; i++)
+		if (code_matches(g_impulse_sites[i], now, 5)) patch_write(g_impulse_sites[i], want, 5);
+	muted = !on;
+}
+
 /* Put the game back to the start of tick, if it's still kept: 1 done, 0 not kept */
 int rollback_restore_tick(u32 tick)
 {
 	Engine *e = g_e;
 	u32 s = tick % RB_SLOTS;
 	if (!e || !e->active || !e->slot_valid[s] || e->slot_tick[s] != tick) return 0;
+	/* The wall-clock base isn't game state: put back, 0x4fbeb0 would count the rewound ticks as
+	 * time that passed and run them once more, so each rollback pushed this PC's clock ahead */
+	u32 base = GS_TIME_BASE(ONgGameState);
 	rb_unwatch();
+	/* the sound thread waits until the restore is done: it reads memory being put back */
+	u8 *lock = SSgLock;
+	if (lock) SSrLock(lock);
+	rb_sound_before_restore(tick);
 	rb_restore(s);
+	if (lock) SSrUnlock(lock);
+	GS_TIME_BASE(ONgGameState) = base;
 	e->last_tick = tick;   /* not "the level restarted" */
 	return 1;
 }

@@ -20,7 +20,7 @@
  * on every PC with the same game files (net.c compares level0's hash).
  *
  * Roster: Arklite.ini [multiplayer] characters = class names separated by commas (level0 ONCC
- * names, e.g. konoko_generic); the default is 14 of the game's characters. Classes that aren't
+ * names, e.g. konoko_generic); the default is 18 of the game's characters. Classes that aren't
  * loaded or don't have the 19-part biped body are left out.
  *
  * Variations: each character also offers the game's other versions of it (Konoko's outfits, the
@@ -149,7 +149,8 @@ __declspec(dllimport) u32  WINAPI GetTickCount(void);
 
 static const char g_default_roster[] =
 	"konoko_generic,griffin_generic,muro_generic,barabus,ninja_med_1,striker_med_1,tanker_med_1,"
-	"comguy_1,elite_med_1,red_med_1,TCTF_swat_1,Cop_generic,thug_wh_1,sniper_generic";
+	"comguy_1,elite_med_1,red_med_1,TCTF_swat_1,TCTF_lite_1,Cop_generic,CopfemA1,thug_wh_1,mad_bomber,"
+	"ninjabot,sniper_generic";
 static const char *const g_labels[][2] = {
 	{ "konoko_generic", "Konoko" }, { "griffin_generic", "Griffin" }, { "muro_generic", "Muro" },
 	{ "barabus", "Barabas" }, { "SH_generic", "Shinatama" },
@@ -157,28 +158,42 @@ static const char *const g_labels[][2] = {
 	{ "comguy_1", "Comguy" }, { "elite_med_1", "Elite" }, { "red_med_1", "Red" },
 	{ "TCTF_swat_1", "TCTF SWAT" }, { "Cop_generic", "Cop" }, { "thug_wh_1", "Thug" },
 	{ "sniper_generic", "Sniper" }, { "security_guard_1", "Security Guard" },
+	{ "TCTF_lite_1", "TCTF Trooper" }, { "CopfemA1", "Female Cop" }, { "mad_bomber", "Mad Bomber" },
+	{ "ninjabot", "Ninjabot" }, { "Shinzom_generic", "Hasegawa" }, { "bd_1", "Scientist" },
+	{ "bdfem_1", "Female Scientist" }, { "generic_male_1", "Civilian" },
+	{ "generic_female_1", "Female Civilian" },
 };
 
-/* The game's versions of a character: the first name is the one in the roster */
+/* The game's versions of a character: the first name is the one in the roster. A family shares
+ * one animation collection (ONCC Animations), so its versions fight with the same moves: those
+ * with another collection are families of their own, e.g. mad_bomber (comguy's, not thug's),
+ * ninjabot (comguy's with its own groin hit, not ninja's), Shinzom_generic (Hasegawa, not
+ * Shinatama's), the TCTF lite troopers and male cops (comguy's), the female cops (Konoko's). */
 static const char *const g_families[] = {
 	"konoko_generic|k3|k4_A|k4_F|k4_G|k4_K|k4_L",
 	"griffin_generic|griffin_swat",
 	"muro_generic",
-	"SH_generic|SH_dream_lab|Shinzom_generic",
-	"ninja_easy_1|ninja_easy_2|ninja_easy_3|ninja_med_1|ninja_med_2|ninja_med_3|ninja_hard_1|ninja_hard_2|ninja_hard_3|super_ninja_1|ninjabot",
+	"SH_generic|SH_dream_lab",
+	"Shinzom_generic",
+	"ninja_easy_1|ninja_easy_2|ninja_easy_3|ninja_med_1|ninja_med_2|ninja_med_3|ninja_hard_1|ninja_hard_2|ninja_hard_3|super_ninja_1",
+	"ninjabot",
 	"striker_easy_1|striker_easy_2|striker_easy_3|striker_med_1|striker_med_2|striker_med_3|striker_hard_1|striker_hard_2|striker_hard_3",
 	"tanker_easy_1|tanker_med_1|tanker_hard_1",
 	"comguy_1|comguy_2|comguy_3",
 	"elite_easy_1|elite_easy_2|elite_easy_3|elite_med_1|elite_med_2|elite_med_3|elite_hard_1|elite_hard_2|elite_hard_3",
 	"red_easy_1|red_easy_2|red_easy_3|red_med_1|red_med_2|red_med_3|red_hard_1|red_hard_2|red_hard_3",
-	"TCTF_swat_1|TCTF_lite_1|TCTF_swat_blackops_1|TCTF_lite_blackops_1",
-	"Cop_generic|CopmaleA1|CopmaleA2|CopmaleA3|CopmaleA4|CopfemA1|CopfemA2",
+	"TCTF_swat_1|TCTF_swat_blackops_1",
+	"TCTF_lite_1|TCTF_lite_blackops_1",
+	"Cop_generic|CopmaleA1|CopmaleA2|CopmaleA3|CopmaleA4",
+	"CopfemA1|CopfemA2",
 	"thug_wh_1|thug_wh_2|thug_wh_3|thug_wh_4|thug_wh_5|thug_mfg_1|thug_mfg_2|thug_mfg_3|thug_mfg_4|thug_mfg_5|"
 	"thug_air_1|thug_air_2|thug_air_3|thug_air_4|thug_air_5|thug_neuro_1|thug_neuro_2|thug_neuro_3|thug_neuro_4|"
-	"thug_neuro_5|thug_pow_1|thug_pow_2|thug_pow_3|thug_pow_4|thug_pow_5|mad_bomber",
+	"thug_neuro_5|thug_pow_1|thug_pow_2|thug_pow_3|thug_pow_4|thug_pow_5",
+	"mad_bomber",
 	"security_guard_1|security_guard_2",
-	"bd_1|bd_2|bd_3|bd_4|bd_5|bdfem_1|bdfem_2|bdfem_3|bdfem_4",
-	"generic_male_1|generic_male_2|generic_male_3|generic_male_4|generic_male_5|generic_male_6|"
+	"bd_1|bd_2|bd_3|bd_4|bd_5",
+	"bdfem_1|bdfem_2|bdfem_3|bdfem_4",
+	"generic_male_1|generic_male_2|generic_male_3|generic_male_4|generic_male_5|generic_male_6",
 	"generic_female_1|generic_female_2|generic_female_3|generic_female_4|generic_female_5|generic_female_6|"
 	"generic_female_7|generic_female_8|generic_female_9",
 };
@@ -768,7 +783,7 @@ void char_menu_tag(u32 count, void *actions)
 static int allowed(void)
 {
 	return ONgGameState && ONrLevel_GetCurrent() && multiplayer_active() && multiplayer_map() &&
-	       !live_menu_open();
+	       !live_menu_open() && !chat_blocking();
 }
 
 static void close_menu(void)
@@ -913,6 +928,10 @@ static void rect(u8 *t, int x, int y, int w, int h, u32 alpha)
 	float at[4] = { (float)x, (float)y, 0.5f, 2.0f };
 	if (t && w > 0 && h > 0) M3rDraw_Bitmap(t, at, (u32)w, (u32)h, 0xffffffffu, alpha);
 }
+
+/* For chat.c and mp_names.c (one color only: M3rDraw_Bitmap repeats a texture past its size) */
+u8 *hud_solid(u16 argb1555, const char *name) { return solid(argb1555, name); }
+void hud_rect(u8 *texture, int x, int y, int w, int h, u32 alpha) { rect(texture, x, y, w, h, alpha); }
 
 /* "Striker" or "Striker 2/10": the label of entry i with variation v */
 static void label(char *out, int i, int v)

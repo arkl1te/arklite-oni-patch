@@ -25,7 +25,8 @@
  *     (UUrMachineTime_Sixtieths) and then pick sounds with the game RNG, as does the sound
  *     permutation pick (0x47f8d0) they use, so an ambient sound one frame earlier or later
  *     shifted the RNG for the AI. The weighted sound pick (0x480040) does the same with the
- *     local RNG inside ticks. All 10 calls now draw from Arklite's own sound RNG.
+ *     local RNG inside ticks. All 10 calls now draw from Arklite's own sound RNG, and a
+ *     sound started in a tick picks from a seed made from that tick (sound seeds below).
  *   - The local RNG (UUrLocalRandom, 0x426e30, seed 0x5326d8) is for effects, and drawing
  *     reseeds it (0x41e500, from the draw state setup 0x41e340, in draw code that also reads
  *     the wall clock). But the particle update (0x45c830 -> 0x45d610) runs inside the tick and
@@ -208,12 +209,138 @@ __attribute__((no_caller_saved_registers)) static u32 local_random(void)
 	return g_tick_local_seed >> 16;
 }
 
+/* The sound RNG. Out of the ticks (ambient timing on the wall clock) it's one stream per PC.
+ * A sound the game starts in a tick picks its sound from a seed both PCs agree on: a hash of
+ * the tick, the sound's place among the tick's sound starts and the game RNG seed then (a
+ * character's taunt or speech line sounded different on each PC before this). A stream can't
+ * do it: the pick only runs when the PC's sound card has a free channel, a rollback's re-run
+ * ticks don't play one-shot sounds, and speech lines (SS2 ambients) pick in the sound update
+ * (0x480c20), when the sound card is ready.
+ *   - one-shot sounds (impulses, 0x480440): the start sets the tick stream's seed
+ *   - ambients (0x4821f0): the start gives its play id (*0x5eb70c + 1) a seed; the ambient's
+ *     state machine (0x480c20, ECX the ambient, 5 calls) draws from it */
+#define SSiImpulse_DriverRead   0x480443   /* mov al,[0x5eb757]: the impulse player's first test */
+#define SSiAmbient_DriverRead   0x4821f3   /* the same in the ambient start */
+#define SSrAmbient_Update       ((void (ONI_FC *)(u8 *, u32))0x480c20)
+#define SSgDriverOn             (*(u8 *)0x5eb757)
+#define SSgAmbientPlayID        (*(u32 *)0x5eb70c)   /* the last play id given */
+
+__declspec(dllimport) u32 WINAPI GetCurrentThreadId(void);
+
 static u32 g_sound_seed = 0xfded;
+static u32 g_tick_tid;            /* the thread running the tick */
+static u32 g_tick_sounds;         /* sounds started so far in this tick */
+static u32 g_tick_sound_seed;
+static u32 g_ambient_seed[256];   /* by play id */
+static u8 *g_ambient;             /* the ambient whose state machine runs, and its thread */
+static u32 g_ambient_tid;
+static u8 g_impulses_muted;       /* rollback's re-run ticks (rollback_impulses) */
+
+static int sound_in_tick(void)
+{
+	return g_in_tick && GetCurrentThreadId() == g_tick_tid;
+}
+
+static u32 tick_sound_seed(void)
+{
+	u32 h = GS_TICK(ONgGameState) * 0x9e3779b1u ^ g_tick_sounds * 0x85ebca77u ^ UUgRandomSeed;
+	h ^= h >> 16; h *= 0x7feb352du;
+	h ^= h >> 15; h *= 0x846ca68bu;
+	return h ^ h >> 16;
+}
 
 __attribute__((no_caller_saved_registers)) static u32 sound_random(void)
 {
-	g_sound_seed = g_sound_seed * 0x19660d + 0x3c6ef35f;
-	return g_sound_seed >> 16;
+	u32 tid = GetCurrentThreadId(), *s = &g_sound_seed;
+	if (g_ambient && g_ambient_tid == tid) s = &g_ambient_seed[*(u32 *)g_ambient & 0xff];
+	else if (g_in_tick && tid == g_tick_tid) s = &g_tick_sound_seed;
+	*s = *s * 0x19660d + 0x3c6ef35f;
+	return *s >> 16;
+}
+
+static u32 impulse_start(void)
+{
+	if (sound_in_tick()) {
+		g_tick_sounds++;
+		g_tick_sound_seed = tick_sound_seed();
+	}
+	return g_impulses_muted ? 0 : SSgDriverOn;
+}
+
+static u32 ambient_start(void)
+{
+	u32 id = SSgAmbientPlayID + 1, seed;
+	if (id == 0xffffffffu) id = 0;   /* as 0x4821f0 counts */
+	if (sound_in_tick()) {
+		g_tick_sounds++;
+		seed = tick_sound_seed();
+	} else {
+		seed = g_sound_seed = g_sound_seed * 0x19660d + 0x3c6ef35f;
+	}
+	g_ambient_seed[id & 0xff] = seed;
+	return SSgDriverOn;
+}
+
+/* In place of the 5-byte mov al,[0x5eb757]: AL as it would read, every other register kept */
+#define DRIVER_READ_STUB(name, fn) \
+	__attribute__((naked)) static void name(void) \
+	{ \
+		__asm__ volatile( \
+			"pushl %%ecx\n\t" \
+			"pushl %%edx\n\t" \
+			"call %c0\n\t" \
+			"popl %%edx\n\t" \
+			"popl %%ecx\n\t" \
+			"ret\n" :: "i"(fn)); \
+	}
+
+DRIVER_READ_STUB(impulse_start_stub, impulse_start)
+DRIVER_READ_STUB(ambient_start_stub, ambient_start)
+
+static void ONI_FC ambient_update(u8 *ambient, u32 edx)
+{
+	u8 *was = g_ambient;
+	u32 was_tid = g_ambient_tid;
+	g_ambient_tid = GetCurrentThreadId();
+	g_ambient = ambient;
+	SSrAmbient_Update(ambient, edx);
+	g_ambient = was;
+	g_ambient_tid = was_tid;
+}
+
+void lockstep_impulses_mute(int muted)
+{
+	g_impulses_muted = (u8)muted;
+}
+
+static void sound_seeds_install(void)
+{
+	static const u8 read[5] = { 0xa0, 0x57, 0xb7, 0x5e, 0x00 };
+	static const u32 updates[] = { 0x480c04, 0x481dfb, 0x48237d, 0x48379d, 0x483dc7 };
+	const u32 n = sizeof updates / sizeof updates[0];
+	u8 b[5] = { 0xe8 };
+	u32 rel;
+
+	for (u32 i = 0; i < n; i++) {
+		const u8 *p = (const u8 *)updates[i];
+		if (p[0] != 0xe8 || updates[i] + 5 + *(u32 *)(p + 1) != (u32)SSrAmbient_Update) {
+			log_msg("sound seeds: 0x%x changed, skipped (sounds pick differently on each PC)", updates[i]);
+			return;
+		}
+	}
+	if (!code_matches(SSiImpulse_DriverRead, read, 5) || !code_matches(SSiAmbient_DriverRead, read, 5)) {
+		log_msg("sound seeds: 0x%x/0x%x changed, skipped (sounds pick differently on each PC)",
+		        SSiImpulse_DriverRead, SSiAmbient_DriverRead);
+		return;
+	}
+	rel = (u32)impulse_start_stub - (SSiImpulse_DriverRead + 5);
+	memcpy(b + 1, &rel, 4);
+	patch_write(SSiImpulse_DriverRead, b, 5);
+	rel = (u32)ambient_start_stub - (SSiAmbient_DriverRead + 5);
+	memcpy(b + 1, &rel, 4);
+	patch_write(SSiAmbient_DriverRead, b, 5);
+	for (u32 i = 0; i < n; i++) patch_call(updates[i], (u32)SSrAmbient_Update, (u32)ambient_update);
+	log_msg("sound seeds: sounds started in a tick pick the same on every PC");
 }
 
 static void sound_rng_install(void)
@@ -1071,6 +1198,9 @@ static void session_begin(u32 level)
 static void tick_body(void *action)
 {
 	players_tick_record(action);   /* Konoko's F2 choice */
+	g_tick_tid = GetCurrentThreadId();
+	g_tick_sounds = 0;
+	g_tick_sound_seed = tick_sound_seed();
 	ONrGameState_Tick(action);
 	if (g_frame_particles) P3rUpdate(GS_TICK(ONgGameState) + 1, 0);   /* as the tick's own (0x4fa9bd) */
 }
@@ -1172,6 +1302,7 @@ void lockstep_install(void)
 	int update_ok = u[0] == 0xe8 && ONcGameState_UpdateCall + 5 + *(u32 *)(u + 1) == (u32)ONrGameState_Update;
 
 	sound_rng_install();
+	sound_seeds_install();
 	speech_install();
 	visited_install();
 	col_install();

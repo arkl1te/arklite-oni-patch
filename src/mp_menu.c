@@ -4,10 +4,12 @@
  *                 "Start a NEW custom game, or JOIN one through the network!", New, Join, Cancel.
  *                 New is custom_game.c's level list.
  *   Host Game     the Options dialog (152) with its controls hidden and its three frames laid out
- *                 again: Server (Map, Server name, Port), Players (Max players, Max spectators, a
- *                 message line) and the third frame holding Host and Dedicate; Cancel where Close
- *                 was. The values are the last ones used (Arklite.ini [host] name, max_players,
- *                 max_spectators and [net] port). Dedicate (a server without a window) isn't built.
+ *                 again: Server (Map, Server name, Port), Match (Max players, Max spectators, Time
+ *                 limit in minutes, Score limit, a message line; 0 is no limit, a negative score
+ *                 limit is reached by suicides) and the third frame holding Host and Dedicate;
+ *                 Cancel under it. The values are the last ones used (Arklite.ini [host] name,
+ *                 max_players, max_spectators, time_limit, score_limit and [net] port). Dedicate
+ *                 (a server without a window) isn't built.
  *   Join Game     the Load Game dialog (151): its frame holds the bookmarked servers in three
  *                 columns (Ping, Name, Players); a second frame under it the selected one's Address
  *                 (typed) and what the server says: Name, Connected, Spectating, its map. Play, Add,
@@ -211,9 +213,10 @@ WMtWindow *ui_label(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, const
 /* ---- Edit fields ---------------------------------------------------------------------------- */
 
 #define MAX_FIELDS 8
+enum { FIELD_TEXT, FIELD_NUMBER, FIELD_SIGNED };   /* signed: a '-' may start it */
 typedef struct {
 	WMtWindow *w;
-	int numbers, lo, hi;   /* a number field and its range (applied on Enter) */
+	int numbers, lo, hi;   /* FIELD_*, and a number field's range (applied on Enter) */
 	int max;               /* characters */
 	int anchor;            /* the selection runs from here to the cursor */
 } UiField;
@@ -287,12 +290,15 @@ static void edit_text(WMtWindow *e, char *buf, u32 size)
 static int edit_number(WMtWindow *e, int *out)
 {
 	char text[16];
-	int v = 0, any = 0;
+	int v = 0, any = 0, minus;
+	const char *s;
 
 	edit_text(e, text, sizeof text);
-	for (const char *s = skip_space(text); *s >= '0' && *s <= '9'; s++, any = 1)
+	s = skip_space(text);
+	if ((minus = *s == '-')) s++;
+	for (; *s >= '0' && *s <= '9'; s++, any = 1)
 		if ((v = v * 10 + (*s - '0')) > 1000000) return 0;
-	*out = v;
+	*out = minus ? -v : v;
 	return any;
 }
 
@@ -495,7 +501,10 @@ static void ONI_FC edit_key(WMtWindow *w, u32 key)
 		}
 		return;
 	}
-	if (f->numbers && (key < '0' || key > '9')) return;
+	if (f->numbers && (key < '0' || key > '9') &&
+	    !(key == '-' && f->numbers == FIELD_SIGNED && (sel ? lo : cursor) == 0 && (text[0] != '-' || (sel && lo == 0 && hi > 0))))
+		return;
+	if (f->numbers && key != '-' && !sel && cursor == 0 && text[0] == '-') return;   /* a digit before the '-' */
 	ins[0] = (char)key;
 	ins[1] = 0;
 	if (sel) field_replace(f, text, lo, hi, ins);
@@ -731,7 +740,7 @@ int mp_menu_choose(void)
 /* ---- Host ----------------------------------------------------------------------------------- */
 
 enum { ID_HOST_GO = 1, ID_HOST_CANCEL = 2, ID_HOST_DEDICATE = 3,
-       ID_HOST_NAME = 120, ID_HOST_PORT, ID_HOST_PLAYERS, ID_HOST_SPECTATORS };
+       ID_HOST_NAME = 120, ID_HOST_PORT, ID_HOST_PLAYERS, ID_HOST_SPECTATORS, ID_HOST_TIME, ID_HOST_SCORE };
 #define MAX_PLAYERS_SETTING 64
 #define HOST_NOTE "A game has 2 players for now."
 
@@ -791,35 +800,46 @@ static void host_init(WMtWindow *dialog)
 	ui_label(dialog, row, row, g_hostMap, 90, 62, 205, 20, UI_LEFT);
 	ui_label(dialog, row, row, "Server name:", 25, 86, 150, 20, UI_LEFT);
 	GetPrivateProfileStringA("host", "name", "New Oni multiplayer game", name, sizeof name, ini_path());
-	add_field(dialog, row, row, ID_HOST_NAME, 25, 108, 270, NET_SERVER_NAME_MAX - 1, name, 0, 0, 0);
+	add_field(dialog, row, row, ID_HOST_NAME, 25, 108, 270, NET_SERVER_NAME_MAX - 1, name, FIELD_TEXT, 0, 0);
 	ui_label(dialog, row, row, "Port:", 25, 134, 60, 20, UI_LEFT);
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("net", "port", NET_DEFAULT_PORT, ini_path()), 1, 65535));
-	add_field(dialog, row, row, ID_HOST_PORT, 90, 134, 80, 5, number, 1, 1, 65535);
+	add_field(dialog, row, row, ID_HOST_PORT, 90, 134, 80, 5, number, FIELD_NUMBER, 1, 65535);
 
-	/* Players: the two limits and the message line */
-	ui_set_frame(frame[1], 5, 187, 300, 105);   /* the frame art needs 93 px (52 + 41 corners) */
-	ui_label(dialog, row, header, "Players", 50, 172, 150, 20, UI_LEFT);
-	ui_label(dialog, row, row, "Max players:", 25, 202, 120, 20, UI_LEFT);
+	/* Match: the player limits, the match's time and score limits (0: none; a negative score
+	 * limit is reached by suicides) and the message line */
+	ui_set_frame(frame[1], 5, 187, 300, 133);   /* the frame art needs 93 px (52 + 41 corners) */
+	ui_label(dialog, row, header, "Match", 50, 172, 150, 20, UI_LEFT);
+	ui_label(dialog, row, row, "Max players:", 25, 199, 120, 20, UI_LEFT);
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_players", 8, ini_path()), 2, MAX_PLAYERS_SETTING));
-	add_field(dialog, row, row, ID_HOST_PLAYERS, 150, 202, 60, 2, number, 1, 2, MAX_PLAYERS_SETTING);
-	ui_label(dialog, row, row, "Max spectators:", 25, 227, 120, 20, UI_LEFT);
+	add_field(dialog, row, row, ID_HOST_PLAYERS, 150, 199, 60, 2, number, FIELD_NUMBER, 2, MAX_PLAYERS_SETTING);
+	ui_label(dialog, row, row, "Max spectators:", 25, 222, 120, 20, UI_LEFT);
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_spectators", 0, ini_path()), 0, MAX_PLAYERS_SETTING));
-	add_field(dialog, row, row, ID_HOST_SPECTATORS, 150, 227, 60, 2, number, 1, 0, MAX_PLAYERS_SETTING);
-	g_hostStatus = ui_label(dialog, row, row, HOST_NOTE, 25, 252, 270, 20, UI_LEFT);
+	add_field(dialog, row, row, ID_HOST_SPECTATORS, 150, 222, 60, 2, number, FIELD_NUMBER, 0, MAX_PLAYERS_SETTING);
+	ui_label(dialog, row, row, "Time limit:", 25, 245, 120, 20, UI_LEFT);
+	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "time_limit", 10, ini_path()), 0, NET_TIME_LIMIT_MAX));
+	add_field(dialog, row, row, ID_HOST_TIME, 150, 245, 60, 3, number, FIELD_NUMBER, 0, NET_TIME_LIMIT_MAX);
+	ui_label(dialog, row, row, "minutes", 218, 245, 77, 20, UI_LEFT);
+	ui_label(dialog, row, row, "Score limit:", 25, 268, 120, 20, UI_LEFT);
+	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "score_limit", 20, ini_path()), -NET_SCORE_LIMIT_MAX,
+	                        NET_SCORE_LIMIT_MAX));
+	add_field(dialog, row, row, ID_HOST_SCORE, 150, 268, 60, 4, number, FIELD_SIGNED, -NET_SCORE_LIMIT_MAX, NET_SCORE_LIMIT_MAX);
+	ui_label(dialog, row, row, "points", 218, 268, 77, 20, UI_LEFT);
+	g_hostStatus = ui_label(dialog, row, row, HOST_NOTE, 25, 291, 270, 20, UI_LEFT);
 
-	/* The third frame: Host and Dedicate, full size */
-	ui_set_frame(frame[2], 5, 297, 300, 100);
+	/* The third frame: Host and Dedicate, full size; Cancel under it */
+	ui_set_frame(frame[2], 5, 325, 300, 95);
 	/* after "Quality:" like everything else: a window after a frame in the child list is drawn
 	 * under the frame's dark fill and looks disabled */
-	ui_add(dialog, row, close, 0, ~0u, "Host", ID_HOST_GO, 17, 327, BUTTON_W, BUTTON_H);
-	ui_add(dialog, row, close, 0, 0x30000, "Dedicate", ID_HOST_DEDICATE, 163, 327, BUTTON_W, BUTTON_H);
+	ui_add(dialog, row, close, 0, ~0u, "Host", ID_HOST_GO, 17, 352, BUTTON_W, BUTTON_H);
+	ui_add(dialog, row, close, 0, 0x30000, "Dedicate", ID_HOST_DEDICATE, 163, 352, BUTTON_W, BUTTON_H);
 	ui_set_text(close, "Cancel");
+	ui_set_frame(close, WIN_X(close), 430, BUTTON_W, BUTTON_H);
 
 	for (u32 i = 0; i < n; i++) WMrWindow_SetVisible(hidden[i], 0);
 }
 
 /* The fields, checked and saved; 0 (and why, on the dialog) if one isn't right */
-static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32 *spectators)
+static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32 *spectators, u32 *minutes, int *score)
 {
 	char value[16];
 	int v;
@@ -841,6 +861,16 @@ static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32
 		return 0;
 	}
 	*spectators = (u32)v;
+	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_TIME), &v) || v < 0 || v > NET_TIME_LIMIT_MAX) {
+		host_status("Time limit: 0 (none) to 999 minutes.");
+		return 0;
+	}
+	*minutes = (u32)v;
+	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_SCORE), &v) || v < -NET_SCORE_LIMIT_MAX || v > NET_SCORE_LIMIT_MAX) {
+		host_status("Score limit: -999 to 999 (0: none).");
+		return 0;
+	}
+	*score = v;
 	host_status(HOST_NOTE);
 
 	WritePrivateProfileStringA("host", "name", name, ini_path());
@@ -850,6 +880,10 @@ static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32
 	WritePrivateProfileStringA("host", "max_players", value, ini_path());
 	fmt(value, "%d", *spectators);
 	WritePrivateProfileStringA("host", "max_spectators", value, ini_path());
+	fmt(value, "%d", *minutes);
+	WritePrivateProfileStringA("host", "time_limit", value, ini_path());
+	fmt(value, "%d", *score);
+	WritePrivateProfileStringA("host", "score_limit", value, ini_path());
 	return 1;
 }
 
@@ -857,7 +891,8 @@ static u8 ONI_FC host_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 {
 	u32 id = p1 & 0xffff, code = p1 >> 16;
 	char name[NET_SERVER_NAME_MAX];
-	u32 port, players, spectators;
+	u32 port, players, spectators, minutes;
+	int score;
 
 	if (msg == WMcMessage_InitDialog) {
 		host_init(dialog);
@@ -866,11 +901,11 @@ static u8 ONI_FC host_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	if (msg != WMcMessage_Command) return 0;
 	if (code != WMcNotify_Click) return 1;
 	if (id == ID_HOST_GO) {
-		if (!host_read(dialog, name, &port, &players, &spectators)) return 1;
-		net_menu_host(port, name, players, spectators);
+		if (!host_read(dialog, name, &port, &players, &spectators, &minutes, &score)) return 1;
+		net_menu_host(port, name, players, spectators, minutes, score);
 		WMrDialog_ModalEnd(dialog, 1);
 	} else if (id == ID_HOST_DEDICATE) {
-		if (!host_read(dialog, name, &port, &players, &spectators)) return 1;
+		if (!host_read(dialog, name, &port, &players, &spectators, &minutes, &score)) return 1;
 		host_status("Dedicated servers aren't built yet.");
 		log_msg("host: Dedicate clicked; dedicated servers aren't built yet");
 	} else if (id == ID_HOST_CANCEL) {
@@ -951,6 +986,7 @@ static u32 g_joinFolderSize, *g_joinLevel;
 static u32 g_resolving;            /* the token whose address net.c's thread is looking up, 0: none */
 static u32 g_lastBroadcast;
 static u32 g_ignored[MAX_IGNORED]; /* found servers removed in this dialog (server ids) */
+static char g_failedFolder[64], g_failedWhy[96];   /* the last map download that stopped, and why */
 static int g_nignored;
 
 static void bookmark_reset(Bookmark *b)
@@ -1053,10 +1089,17 @@ static int join_status(const Bookmark *b, u32 now, char *text)
 		str_cpy(text, TEXT_MAX, "It runs another version of Arklite.");
 		return 0;
 	}
-	if (!b->have_map) {
+	if (!b->have_map && !b->info.folder[0]) {   /* an original level: nothing to download */
 		str_cpy(text, TEXT_MAX, "You don't have its map: ");
-		str_cpy(text + str_len(text), TEXT_MAX - str_len(text), b->info.folder[0] ? b->info.folder : b->info.map);
+		str_cpy(text + str_len(text), TEXT_MAX - str_len(text), b->info.map);
 		return 0;
+	}
+	if (!b->have_map) {   /* a custom level: Play downloads it (net_map_fetch) */
+		if (g_failedWhy[0] && str_ieq_n(g_failedFolder, b->info.folder, sizeof g_failedFolder))
+			fmt(text, "Download failed (%s). Play tries again.", g_failedWhy);
+		else
+			fmt(text, "You don't have its map (%s): Play downloads it.", b->info.folder);
+		return 1;
 	}
 	if (b->info.players >= b->info.max_players) {
 		str_cpy(text, TEXT_MAX, "The server is full.");
@@ -1276,7 +1319,7 @@ static void join_init(WMtWindow *dialog)
 	for (int i = 0; i < 4; i++) {
 		int y = 302 + i * 21;
 		ui_label(dialog, lb, play, rows[i], 140, y, 105, 20, UI_LEFT);
-		if (i == 0) g_address = add_field(dialog, lb, play, ID_JOIN_ADDRESS, 250, y, 265, ADDRESS_MAX - 1, "", 0, 0, 0);
+		if (i == 0) g_address = add_field(dialog, lb, play, ID_JOIN_ADDRESS, 250, y, 265, ADDRESS_MAX - 1, "", FIELD_TEXT, 0, 0);
 		else values[i] = ui_label(dialog, lb, play, "-", 250, y, 265, 20, UI_LEFT);
 	}
 	g_infoName = values[1];
@@ -1360,6 +1403,12 @@ static u8 ONI_FC join_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 		WMrDialog_ModalEnd(dialog, 0);
 	}
 	return 1;
+}
+
+void mp_menu_join_failed(const char *folder, const char *why)
+{
+	str_cpy(g_failedFolder, sizeof g_failedFolder, folder);
+	str_cpy(g_failedWhy, sizeof g_failedWhy, why);
 }
 
 int mp_menu_join(char *folder, u32 folder_size, u32 *level)
