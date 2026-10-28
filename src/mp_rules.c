@@ -30,7 +30,21 @@
  *   0x4e9afa  its caller's hostile check on the character found (EBX self, EAX other)
  * On a multiplayer map each call goes through a stub that answers hostile (2) when both
  * characters are players (charType +0x1e8 == 0) and asks 0x48b2c0 otherwise, so the AIs keep
- * their teams. */
+ * their teams.
+ *
+ * Taunts: the taunt check (0x4f80d0, ESI the character) lets the player (gs+0xac) taunt only
+ * until gs+0x110, a time 0x4fdba0 moves later (after a kill); other characters always can. On a
+ * multiplayer map the read of gs+0x110 (mov ecx,[eax+0x110] at 0x4f8249, then cmp ecx,edx with
+ * the game tick in EDX) gives the last tick there is, so taunting is unlimited.
+ *
+ * Taunt lines: an animation's start (0x4e97a0) says its vocalization line with 0x48ba60 (ECX
+ * the character, EDX the line type, 0 taunt; one stack argument, ret 4; call at 0x4e97fb),
+ * which rolls the class's chance and asks the speech system (0x516940) with the type's priority
+ * (0x52a584[type], 4 for a taunt). A line of no higher priority than the one being said
+ * (character +0x15fc) waits in the one-line queue (+0x1614), so taunting during a taunt queued
+ * the next line. On a multiplayer map a player's taunt line takes over: the playing line's
+ * priority reads 0 during the call, so 0x516940 stops it, empties the queue and starts the new
+ * one. If the chance roll says nothing, the priority is put back and the old line goes on. */
 #include "arklite.h"
 
 void *memset(void *, int, unsigned);
@@ -153,6 +167,74 @@ __attribute__((naked)) static void drain_stub(void)
 		"ret\n" :: "i"(overheal_drain));
 }
 
+#define ONcTaunt_UntilRead  0x4f8249
+
+/* For mov ecx,[eax+0x110] (EAX the game state): every register but ECX kept */
+__attribute__((naked)) static void taunt_until(void)
+{
+	__asm__ volatile(
+		"pushl %%eax\n\t"
+		"pushl %%edx\n\t"
+		"call %c0\n\t"
+		"testl %%eax, %%eax\n\t"
+		"popl %%edx\n\t"
+		"popl %%eax\n\t"
+		"jz 1f\n\t"
+		"movl $0xffffffff, %%ecx\n\t"
+		"ret\n"
+		"1:\n\t"
+		"movl 0x110(%%eax), %%ecx\n\t"
+		"ret\n" :: "i"(multiplayer_map));
+}
+
+static void taunt_install(void)
+{
+	static const u8 read[6] = { 0x8b, 0x88, 0x10, 0x01, 0x00, 0x00 };
+	u8 b[6] = { 0xe8, 0, 0, 0, 0, 0x90 };
+	u32 rel = (u32)taunt_until - (ONcTaunt_UntilRead + 5);
+
+	if (!code_matches(ONcTaunt_UntilRead, read, sizeof read)) {
+		log_msg("mp rules: 0x%x changed, taunts stay limited", ONcTaunt_UntilRead);
+		return;
+	}
+	memcpy(b + 1, &rel, 4);
+	patch_write(ONcTaunt_UntilRead, b, sizeof b);
+	log_msg("mp rules: unlimited taunts on multiplayer maps");
+}
+
+#define ONrCharacter_SayLine    ((u8 (ONI_FC *)(u8 *, u32, u32))0x48ba60)
+#define ONcAnimLine_SayCall     0x4e97fb
+#define ONgLinePriority         ((const u32 *)0x52a584)   /* by line type */
+#define LINE_TAUNT              0
+#define CHR_SPEAKING(c)         (*(u8 *)((u8 *)(c) + 0x15f0))
+#define CHR_LINE_PRIORITY(c)    (*(u32 *)((u8 *)(c) + 0x15fc))
+
+static u8 ONI_FC say_anim_line(u8 *c, u32 type, u32 forced)
+{
+	u32 was;
+	u8 r;
+
+	if (type != LINE_TAUNT || CHR_TYPE(c) != 0 || !CHR_SPEAKING(c) ||
+	    CHR_LINE_PRIORITY(c) > ONgLinePriority[type] || !multiplayer_map())
+		return ONrCharacter_SayLine(c, type, forced);
+	was = CHR_LINE_PRIORITY(c);
+	CHR_LINE_PRIORITY(c) = 0;
+	r = ONrCharacter_SayLine(c, type, forced);
+	if (CHR_LINE_PRIORITY(c) == 0) CHR_LINE_PRIORITY(c) = was;   /* nothing said */
+	return r;
+}
+
+static void taunt_line_install(void)
+{
+	const u8 *p = (const u8 *)ONcAnimLine_SayCall;
+	if (p[0] != 0xe8 || ONcAnimLine_SayCall + 5 + *(u32 *)(p + 1) != (u32)ONrCharacter_SayLine) {
+		log_msg("mp rules: 0x%x changed, taunt lines still wait for the last one", ONcAnimLine_SayCall);
+		return;
+	}
+	patch_call(ONcAnimLine_SayCall, (u32)ONrCharacter_SayLine, (u32)say_anim_line);
+	log_msg("mp rules: a player's taunt line cuts off the one before on multiplayer maps");
+}
+
 void mp_rules_install(void)
 {
 	static const u8 entry[5] = { 0x83, 0xec, 0x2c, 0x53, 0x55 };
@@ -173,6 +255,8 @@ void mp_rules_install(void)
 	}
 
 	free_for_all_install();
+	taunt_install();
+	taunt_line_install();
 
 	if (code_matches(ONcHypoTick_Drain, drain, sizeof drain)) {
 		memset(b, 0x90, sizeof b);

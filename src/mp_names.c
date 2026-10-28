@@ -26,7 +26,17 @@
  * cleared by 0x41aab0), so a wall the camera shows through doesn't hide a name. The name is
  * drawn over the head, and NAME_HOLD_MS after the player leaves the zone, so it doesn't flicker. The camera is Motoko's, *0x631004: +0x08
  * position, +0x14 view direction, +0x20 up, +0x38 vertical field of view (radians), +0x3c
- * aspect (0x41b4a0 and 0x41b3b0 read and set them). */
+ * aspect (0x41b4a0 and 0x41b3b0 read and set them).
+ *
+ * Chat (chat.c): what another player said shows over their head for SAY_MS, above their name
+ * (drawn then too, faced or not), wherever they are on screen within SAY_RANGE with no wall in
+ * between. It's wrapped to the width of SAY_WIDTH_TEXT in the HUD's chat font (the user's pick),
+ * at most SAY_LINES lines; longer messages end in "...". It sits half a line over the name, on a
+ * pill (a rectangle whose ends are half circles as tall as it) of 10% black. M3rDraw_Bitmap
+ * (0x41f4a0) draws a texture one texel per pixel and repeats it past its size (u = width /
+ * texture width), so only a one-color texture can be drawn at any size: the ends are drawn a row
+ * of pixels at a time with the solid one, the edge pixel of each row at the share of it the
+ * circle covers, so they're smooth and no pixel is covered twice. */
 #include "arklite.h"
 
 
@@ -54,6 +64,12 @@
 #define ZONE_X              (3.0f / 11)   /* half the zone's width, of the half screen */
 #define ZONE_BOTTOM         (-0.2f)       /* 3/5 of the height down from the top: -1 bottom, 1 top */
 #define NAME_ABOVE          4.0f     /* units over the head */
+#define SAY_MS              6000
+#define SAY_RANGE           1000.0f
+#define SAY_LINES           2
+#define SAY_WIDTH_TEXT      "This width is allowed"
+#define SAY_SHADE           26       /* 10% black */
+#define SAY_COLOR           0xffc8e6ffu
 
 #define GWL_WNDPROC         (-4)
 #define WM_CHAR             0x102
@@ -74,6 +90,9 @@ static WNDPROC g_old_proc;
 static void *g_hwnd;
 static u8 *g_target;               /* the player the name is over */
 static u32 g_target_seen;
+static char g_say[2][CHAT_MAX];    /* chat: the last message of each player, and when */
+static u32 g_say_at[2];
+static u8 *g_pill;
 
 /* ---- Names -------------------------------------------------------------------------------- */
 
@@ -225,33 +244,128 @@ static int other_player(u8 *c, u8 *me)
 
 typedef struct { const float *pos; float f[3], right[3], u[3], t, aspect; u8 *collision; } View;
 
-/* On screen in the zone (ndc x, y: -1..1, y up), and no wall between it and the camera */
-static int in_zone(const View *v, const float *p)
+/* In the screen rectangle (ndc x: -zx..zx, y: bottom..1, y up) within range, and no wall between
+ * it and the camera */
+static int in_view(const View *v, const float *p, float zx, float bottom, float range)
 {
 	float rel[3];
 	for (int k = 0; k < 3; k++) rel[k] = p[k] - v->pos[k];
 	float z = dot(rel, v->f);
-	if (z < 1.0f || dot(rel, rel) > NAME_RANGE * NAME_RANGE) return 0;
+	if (z < 1.0f || dot(rel, rel) > range * range) return 0;
 	float x = dot(rel, v->right) / (z * v->t * v->aspect), y = dot(rel, v->u) / (z * v->t);
-	if (x < -ZONE_X || x > ZONE_X || y < ZONE_BOTTOM || y > 1.0f) return 0;
+	if (x < -zx || x > zx || y < bottom || y > 1.0f) return 0;
 	return !v->collision || !AKrCollision_Ray(v->collision, v->pos, rel, QUAD_SKIP | QUAD_SEE_THROUGH, 1);
 }
 
-static int facing(const View *v, u8 *c)
+/* Its feet, middle or head */
+static int seen(const View *v, u8 *c, float zx, float bottom, float range)
 {
 	float head[3], mid[3];
 	ONrCharacter_GetHead(c, head);
 	for (int k = 0; k < 3; k++) mid[k] = (head[k] + CHR_POS(c)[k]) * 0.5f;
-	return in_zone(v, head) || in_zone(v, mid) || in_zone(v, CHR_POS(c));
+	return in_view(v, head, zx, bottom, range) || in_view(v, mid, zx, bottom, range) ||
+	       in_view(v, CHR_POS(c), zx, bottom, range);
+}
+
+/* In the zone players look at */
+static int facing(const View *v, u8 *c) { return seen(v, c, ZONE_X, ZONE_BOTTOM, NAME_RANGE); }
+
+void mp_names_say(int who, const char *text)
+{
+	if (who < 0 || who > 1) return;
+	str_cpy(g_say[who], sizeof g_say[who], text);
+	g_say_at[who] = GetTickCount() | 1;
+}
+
+/* ---- What a player said, over their name ---------------------------------------------------- */
+
+/* A pill: the middle from x + h/2 to x + w - h/2, half circles of radius h/2 at both ends */
+static void draw_pill(int x, int top, int w, int h, u32 alpha)
+{
+	float R = h * 0.5f;
+	int r = h / 2, cl = x + r, cr = x + w - r;   /* the ends' centers */
+
+	hud_rect(g_pill, cl, top, cr - cl, h, alpha);
+	for (int j = 0; j < h; j++) {
+		float dy = j + 0.5f - R, hw = R * R - dy * dy > 0 ? fsqrt(R * R - dy * dy) : 0;
+		int full = (int)hw;   /* whole pixels the circle covers out from the center on this row */
+		u32 edge = (u32)((hw - full) * alpha + 0.5f);
+		hud_rect(g_pill, cl - full, top + j, full, 1, alpha);
+		hud_rect(g_pill, cr, top + j, full, 1, alpha);
+		if (edge) {
+			hud_rect(g_pill, cl - full - 1, top + j, 1, 1, edge);
+			hud_rect(g_pill, cr + full, top + j, 1, 1, edge);
+		}
+	}
+}
+
+/* text cut to at most SAY_LINES lines of SAY_WIDTH_TEXT's width, the last ending in "..." if it
+ * had to be cut; lines[i] gets each line */
+static int say_lines(const char *text, char lines[SAY_LINES][CHAT_MAX + 4], int max_w)
+{
+	int starts[SAY_LINES + 1], len = str_len(text);
+	int n = chat_wrap(text, max_w, starts, SAY_LINES + 1), cut = n > SAY_LINES;
+
+	if (cut) n = SAY_LINES;
+	for (int l = 0; l < n; l++) {
+		int a = starts[l], b = l + 1 < n ? starts[l + 1] : len, k;
+		while (b > a && text[b - 1] == ' ') b--;
+		for (k = a; k < b; k++) lines[l][k - a] = text[k];
+		lines[l][b - a] = 0;
+		if (cut && l == n - 1) {   /* the rest goes: as much of this line as fits with "..." */
+			int m = b - a;
+			for (;;) {
+				lines[l][m] = '.'; lines[l][m + 1] = '.'; lines[l][m + 2] = '.'; lines[l][m + 3] = 0;
+				if (!m || mp_hud_text_width(lines[l], -1) <= max_w) break;
+				m--;
+				while (m && lines[l][m - 1] == ' ') m--;
+			}
+		}
+	}
+	return n;
+}
+
+/* Centered on x, its bottom half a line over the name line at y */
+static void draw_say(const char *text, int x, int y)
+{
+	char lines[SAY_LINES][CHAT_MAX + 4];
+	int lh = mp_hud_line_height(), max_w = mp_hud_text_width(SAY_WIDTH_TEXT, -1), w = 0;
+	int n = say_lines(text, lines, max_w);
+
+	if (!n || lh <= 0) return;
+	for (int l = 0; l < n; l++) {
+		int lw = mp_hud_text_width(lines[l], -1);
+		if (lw > w) w = lw;
+	}
+	int step = lh + 2, pad_y = lh / 3, h = n * step - 2 + 2 * pad_y, r = h / 2;
+	int bottom = y - lh / 2, top = bottom - h;   /* half a line between it and the name */
+	int mid_w = w + lh - 2 * r > 0 ? w + lh - 2 * r : 0;   /* the text and a little room fit between the ends' centers */
+	int left = x - mid_w / 2 - r;
+	if (top < 0) return;
+	draw_pill(left, top, mid_w + 2 * r, h, SAY_SHADE);
+	for (int l = 0; l < n; l++) mp_hud_text(lines[l], x, top + pad_y + l * step, MP_CENTER, SAY_COLOR);
+}
+
+/* Where the name line over c's head goes (its top center); 0 if off screen */
+static int name_point(const View *v, u8 *c, int width, int height, int *x, int *y)
+{
+	float head[3], rel[3];
+	ONrCharacter_GetHead(c, head);
+	head[1] += NAME_ABOVE;
+	for (int k = 0; k < 3; k++) rel[k] = head[k] - v->pos[k];
+	float z = dot(rel, v->f);
+	if (z < 1.0f) return 0;
+	*x = (int)(width * 0.5f * (1 + dot(rel, v->right) / (z * v->t * v->aspect)));
+	*y = (int)(height * 0.5f * (1 - dot(rel, v->u) / (z * v->t))) - mp_hud_line_height();
+	return *x >= 0 && *x < width && *y >= 0 && *y < height;
 }
 
 void mp_names_draw(int width, int height)
 {
 	u8 *gs = ONgGameState, *cam = M3gActiveCamera, *me;
-	float up[3], head[3], rel[3];
+	float up[3];
 	u32 now = GetTickCount();
 	View v;
-	int who;
 
 	if (!gs || !cam || !(me = GS_PLAYER(gs)) || char_menu_open() || live_menu_open()) {
 		g_target = 0;
@@ -281,20 +395,21 @@ void mp_names_draw(int width, int height)
 				break;
 			}
 		}
-	if (!g_target || now - g_target_seen > NAME_HOLD_MS || (who = other_player(g_target, me)) < 0) {
-		g_target = 0;
-		return;
-	}
+	if (g_target && (now - g_target_seen > NAME_HOLD_MS || other_player(g_target, me) < 0)) g_target = 0;
 
-	ONrCharacter_GetHead(g_target, head);
-	head[1] += NAME_ABOVE;
-	for (int k = 0; k < 3; k++) rel[k] = head[k] - v.pos[k];
-	float z = dot(rel, v.f);
-	if (z < 1.0f) return;
-	int x = (int)(width * 0.5f * (1 + dot(rel, v.right) / (z * v.t * v.aspect)));
-	int y = (int)(height * 0.5f * (1 - dot(rel, v.u) / (z * v.t))) - mp_hud_line_height();
-	if (x < 0 || x >= width || y < 0 || y >= height) return;
-	mp_hud_text(mp_name(who), x, y, MP_CENTER, 0xffffffffu);
+	if (!g_pill) g_pill = hud_solid(0x8000, "arklite_say_pill");
+
+	/* the name of the one faced, and of anyone talking, with what they said over it */
+	for (int i = 0; i < 2; i++) {
+		u8 *c = players_char(i);
+		int who = other_player(c, me), x, y, talking;
+		if (who < 0) continue;
+		talking = g_say_at[who] && now - g_say_at[who] < SAY_MS && seen(&v, c, 1.0f, -1.0f, SAY_RANGE);
+		if ((c != g_target && !talking) || !name_point(&v, c, width, height, &x, &y)) continue;
+		mp_hud_text(mp_name(who), x, y, MP_CENTER, 0xffffffffu);
+		if (!talking) continue;
+		draw_say(g_say[who], x, y);
+	}
 }
 
 void mp_names_install(void)

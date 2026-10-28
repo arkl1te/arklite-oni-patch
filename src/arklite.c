@@ -163,5 +163,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	live_menu_install();
 	char_menu_install();
 	mp_names_install();
+	chat_install();
+	mp_board_install();
 	return 1;
 }

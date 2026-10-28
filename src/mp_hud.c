@@ -18,8 +18,11 @@
  * Lobby: "Press F3 to be ready" in red, or "Press F3 to be unready" in green, and under it who
  * is ready or the countdown, until the match starts; in red under that, what keeps a joiner out
  * (the two PCs' files differ, net.c). Match (or a two-player game on one PC): the score in the
- * top right corner with the players' names (mp_names.c), this PC's player in yellow, the name of
- * the player this PC's player faces over their head, and "Out of sync" when a state check failed. The F2 character menu
+ * top right corner with the players' names (mp_names.c), this PC's player in yellow, the match's
+ * time left under it when it has a time limit (red in the last 30 s), the result once a limit
+ * was reached ("Press fire to go back to the lobby"), the name of
+ * the player this PC's player faces over their head, and "Out of sync" when a state check failed. The chat
+ * (chat.c) in the lower left, in the lobby too. The F2 character menu
  * (char_menu.c) is drawn last, over all of it. */
 #include "arklite.h"
 
@@ -89,7 +92,7 @@ static void text(const char *s, int x, int y, int align, u32 color)
 		at[0] = (short)(x + off);
 		at[1] = (short)(y + off + g_line_height / TEXT_SCALE);
 		TSrContext_SetColor(ctx, pass ? color : SHADOW);
-		TSrContext_Draw(ctx, s, 0xff, 0, at);
+		TSrContext_Draw(ctx, s, color >> 24, 0, at);   /* the color's alpha: chat.c fades lines */
 	}
 	g_scaling = 0;
 }
@@ -97,6 +100,25 @@ static void text(const char *s, int x, int y, int align, u32 color)
 /* For char_menu.c, while it draws from the HUD below */
 void mp_hud_text(const char *s, int x, int y, int align, u32 color) { text(s, x, y, align, color); }
 int  mp_hud_line_height(void) { return g_line_height; }
+
+/* The width text() gives the first n characters of s (n < 0: all). Measured with a '|' after
+ * them, less the '|' alone, so trailing spaces count (the caret goes after them). */
+int mp_hud_text_width(const char *s, int n)
+{
+	void *ctx = ONgTextContext;
+	char buf[256];
+	short rect[4] = { 0 }, bar[4] = { 0 };
+	int k = 0;
+
+	if (!ctx) return 0;
+	while (s[k] && k != n && k < (int)sizeof buf - 2) { buf[k] = s[k]; k++; }
+	if (!k) return 0;
+	buf[k] = '|';
+	buf[k + 1] = 0;
+	TSrContext_Measure(ctx, buf, rect);
+	TSrContext_Measure(ctx, "|", bar);
+	return ((rect[2] - rect[0]) - (bar[2] - bar[0])) * TEXT_SCALE;
+}
 
 static void draw_lobby(const NetHud *h, int width, int height)
 {
@@ -136,13 +158,38 @@ static void draw_problem(const NetHud *h, int width, int height)
 static void draw_score(int local, int width)
 {
 	char line[64];
-	int x = width - 24, y = 24;
+	int x = width - 24, y = 24, left = players_time_left();
 
 	for (int who = 0; who < 2; who++) {
 		fmt(line, local == who ? "%s (you)   %d" : "%s   %d", mp_name(who), players_score(who));
 		text(line, x, y, RIGHT, local == who ? YELLOW : WHITE);
 		y += g_line_height + 2;
 	}
+	if (left >= 0) {   /* the match's time limit */
+		left = (left + 59) / 60;
+		fmt(line, "%d:%02d", left / 60, left % 60);
+		text(line, x, y, RIGHT, left <= 30 ? RED : WHITE);
+	}
+}
+
+/* The match is over: the result until everyone pressed fire (net.c) */
+static void draw_over(const NetHud *h, int width, int height)
+{
+	char line[96];
+	int x = width / 2, y = height / 5, w = players_winner();
+
+	if (w < 0) str_cpy(line, sizeof line, "Match over: a draw!");
+	else if (w == h->local_player) str_cpy(line, sizeof line, "Match over: you win!");
+	else fmt(line, "Match over: %s wins!", mp_name(w));
+	text(line, x, y, CENTER, w < 0 ? WHITE : w == h->local_player ? GREEN : RED);
+	y += g_line_height + 4;
+	fmt(line, "%s %d : %d %s", mp_name(0), players_score(0), players_score(1), mp_name(1));
+	text(line, x, y, CENTER, WHITE);
+	y += g_line_height + 4;
+	if (h->over_ready) fmt(line, "Waiting for the others (%d of %d ready, %d s)", h->over_ready_count, h->over_players,
+	                       (h->over_left_ms + 999) / 1000);
+	else fmt(line, "Press fire to go back to the lobby (%d s)", (h->over_left_ms + 999) / 1000);
+	text(line, x, y, CENTER, h->over_ready ? GREEN : YELLOW);
 }
 
 /* The other PC went quiet or is gone */
@@ -184,8 +231,10 @@ static void ONI_FC timer_display(void *timer)
 	else draw_score(h.state == NETHUD_MATCH ? h.local_player : -1, width);
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) draw_problem(&h, width, height);
 	if (h.state != NETHUD_LOBBY && h.state != NETHUD_STARTING) mp_names_draw(width, height);
+	chat_draw(width, height);
 	if (h.desynced) text("Out of sync with the other PC (see Arklite.log)", width / 2, 24, CENTER, RED);
-	if (h.state == NETHUD_MATCH) draw_connection(&h, width, height);
+	if (h.state == NETHUD_MATCH && h.over) draw_over(&h, width, height);
+	else if (h.state == NETHUD_MATCH) draw_connection(&h, width, height);
 	char_menu_draw(width, height);
 
 	TSrContext_SetColor(ctx, color);

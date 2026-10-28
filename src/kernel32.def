@@ -24,10 +24,13 @@ EXPORTS
   VirtualFree@12
   GetProcAddress@8
   GetTickCount@0
+  QueryPerformanceCounter@4
+  QueryPerformanceFrequency@4
   GetPrivateProfileSectionA@16
   GetCurrentProcessId@0
   CreateDirectoryA@8
   MoveFileExA@12
+  RemoveDirectoryA@4
   DeleteFileA@4
   SetFilePointer@16
   Sleep@4

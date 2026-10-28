@@ -24,6 +24,8 @@ void *memset(void *, int, unsigned);
 #define MAX_LEVEL_FILES 8
 #define ITEM_CUSTOM     0x200     /* listbox item data: ITEM_CUSTOM + index; < 127 = level number */
 #define ID_CUSTOM_GAME  105
+#define ONrLevel_GetCurrent ((u16 (ONI_FC *)(void))0x5054c0)
+#define ONgQuitting         (*(u8 *)0x630ffd)   /* set by Quit (0x4d3017), the main loop then ends */
 
 typedef struct {
 	char folder[64];
@@ -38,7 +40,8 @@ typedef struct {
 static CustomLevel g_custom[MAX_CUSTOM];
 static int  g_ncustom;
 static char g_dataDir[MAX_PATH];               /* absolute, ends with '\' */
-static char g_igmdFormat[256] = "IGMD\\%s";
+static char g_igmdFormat[256] = "IGMD\\%s";   /* the loading level's script folder (open_level_file_hook) */
+static char g_mountedIgmd[256];               /* the mounted level's script folder */
 static int  g_slot = -1;
 static char g_mountedIni[MAX_PATH];           /* level.ini of the level mounted in g_slot */
 static char g_mountedDir[MAX_PATH];           /* its folder, ends with '\' */
@@ -241,22 +244,35 @@ static int mount_custom_level(const CustomLevel *cl)
 
 	fmt(path, "%sCustomLevels\\%s\\IGMD", g_dataDir, cl->folder);
 	if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
-		fmt(g_igmdFormat, "CustomLevels\\%s\\IGMD\\%%s", cl->folder);
+		fmt(g_mountedIgmd, "CustomLevels\\%s\\IGMD\\%%s", cl->folder);
 	else
-		str_cpy(g_igmdFormat, sizeof g_igmdFormat, "IGMD\\%s");
-	log_msg("mount: scripts from %s", g_igmdFormat);
+		str_cpy(g_mountedIgmd, sizeof g_mountedIgmd, "IGMD\\%s");
+	log_msg("mount: scripts from %s", g_mountedIgmd);
 	return 1;
 }
 
-/* A mounted file was built for another level number, so its instance headers carry that
+/* The engine opens a level's files (TMrLevel_Load) before its scripts (0x50fe50, from the
+ * level load 0x5059d0), so the level being opened decides where its scripts come from. Any
+ * other level, however it was started (Load Game, New Game, the pause menu), gets IGMD again;
+ * the custom level's folder would have no scripts for it, or a custom copy's (level 1's
+ * EnvWarehouse: without the stock script, Konoko stays in Combat Training).
+ *
+ * A mounted file was built for another level number, so its instance headers carry that
  * number's file index. Rewrite them to the slot's index before the engine resolves them. */
 static u16 ONI_FC open_level_file_hook(char *ref, void **out)
 {
 	u16 error = TMrLevel_OpenFile(ref, out);
 
-	if (error || g_slot < 0 || !*out) return error;
+	if (g_slot < 0) return error;
 	for (u32 i = 0; i < TMgLevelFileCount; i++) {
-		if (TMgLevelFiles[i].ref != ref || (TMgLevelFiles[i].file_index >> 25) != (u32)g_slot) continue;
+		u32 slot = TMgLevelFiles[i].file_index >> 25;
+		if (TMgLevelFiles[i].ref != ref || slot == 0) continue;
+		if (slot != (u32)g_slot) {
+			str_cpy(g_igmdFormat, sizeof g_igmdFormat, "IGMD\\%s");
+			break;
+		}
+		str_cpy(g_igmdFormat, sizeof g_igmdFormat, g_mountedIgmd);
+		if (error || !*out) break;
 
 		u32 index = TMgLevelFiles[i].file_index, n = TMmFile_InstanceCount(*out), fixed = 0;
 		u32 *desc = TMmFile_Descriptors(*out);
@@ -652,7 +668,6 @@ static void start_selection(WMtWindow *main_menu, u32 selection)
 		sp = prepare_save_point(cl, level, g_startSavePoint);
 		g_startSavePoint = 0;
 	} else {
-		str_cpy(g_igmdFormat, sizeof g_igmdFormat, "IGMD\\%s");
 		level = selection;
 	}
 	log_msg("starting level %d at save point %d", level, (int)sp);
@@ -673,8 +688,10 @@ static u32 custom_game_menu(void)
 	u32 level, selection;
 
 	if (g_autostart[0]) return run_level_list();   /* the test path: networking as the environment says */
+	int choice = MPMENU_CANCEL;
+
 	for (;;) {
-		int choice = mp_menu_choose();
+		if (choice != MPMENU_JOIN) choice = mp_menu_choose();   /* a failed download: the Join list again */
 		if (choice == MPMENU_NEW) {
 			selection = run_level_list();
 			if (!selection) continue;   /* Back */
@@ -682,11 +699,27 @@ static u32 custom_game_menu(void)
 			return selection;
 		}
 		if (choice != MPMENU_JOIN) return 0;
-		if (!mp_menu_join(folder, sizeof folder, &level)) continue;
+		if (!mp_menu_join(folder, sizeof folder, &level)) {
+			choice = MPMENU_CANCEL;   /* Back: the popup */
+			continue;
+		}
 		if (!folder[0]) return level;   /* a numbered level: both have it in the same slot */
 		scan_custom_levels();
 		int i = find_folder(folder);
-		if (i < 0) return 0;   /* mp_menu_join checked it's here */
+		if (i < 0) {   /* the host's map isn't here: from the host first */
+			const char *why;
+			if (net_map_fetch(folder, level)) {
+				scan_custom_levels();
+				i = find_folder(folder);
+				why = "it came without a level*.dat";
+			} else {
+				why = net_map_fetch_error();
+			}
+			if (i < 0) {
+				mp_menu_join_failed(folder, why);
+				continue;
+			}
+		}
 		g_forceSlot = (int)level;
 		return ITEM_CUSTOM + i;
 	}
@@ -715,7 +748,13 @@ static u8 ONI_FC main_menu_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	}
 
 	u8 handled = original(dialog, msg, p1, p2);
-	if (msg == WMcMessage_InitDialog) add_custom_game_button(dialog);
+	/* Esc in a level opens this dialog too (the pause menu), so opening it isn't leaving. Quit
+	 * ends the program, and the goodbye at exit fails (Winsock is gone): tell the other PC now */
+	if (ONgQuitting) net_main_menu();
+	if (msg == WMcMessage_InitDialog) {
+		if (!ONrLevel_GetCurrent()) net_main_menu();   /* the title screen: out of any match */
+		add_custom_game_button(dialog);
+	}
 	return handled;
 }
 
