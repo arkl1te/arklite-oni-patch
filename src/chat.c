@@ -27,12 +27,14 @@
  * released, so the key doesn't reach the game.
  *
  * Sending plays the locked-door sound (impulse door_fail, what Oni plays when a door won't
- * open); a message from the other player plays the game-saved sound (impulse autosave). Both are
+ * open); a message from another player plays the game-saved sound (impulse autosave). Both are
  * level 0 impulses found by name (0x4801f0, ECX the name) and played without a position
  * (0x480440: ECX impulse, EDX 0, three 0s; what a menu button's click does), outside any tick,
  * so they draw from this PC's own sound RNG stream (lockstep.c) and can't desync anything.
  * Messages go through net.c (PKT_CHAT, resent until acknowledged); they're only shown, never
- * game state. Another player's message also shows over their head (mp_names.c). */
+ * game state. Another player's message also shows over their head (mp_names.c). The server's
+ * lines ("Name entered the game", "Name left the game", chat_server) come from the host the same
+ * way, without a name, in green and without a sound. */
 #include "arklite.h"
 
 void *memcpy(void *, const void *, unsigned);
@@ -89,11 +91,12 @@ __declspec(dllimport) long WINAPI CallWindowProcA(WNDPROC, void *, u32, u32, lon
 #define WHITE           0xffffffffu
 #define YELLOW          0xffffe040u   /* this PC's player, as in the score */
 #define ORANGE          0xffffa040u   /* the others */
+#define GREEN           0xff90e090u   /* the server's lines: who entered or left */
 
 typedef struct {
 	char line[MP_NAME_MAX + 2 + CHAT_MAX];   /* "Name: text" */
-	int name_len;                            /* "Name:" */
-	int self;
+	int name_len;                            /* "Name:" (0: a server line) */
+	int self, server;
 	u32 at;
 	int wrap_w, nlines, starts[WRAP_MAX];    /* wrapped for this width (0: not yet) */
 } Message;
@@ -112,13 +115,13 @@ static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; 
 
 /* ---- Messages ----------------------------------------------------------------------------- */
 
-static void play(const char *impulse)
+void mp_sound(const char *impulse)
 {
 	u8 *s = SSrImpulse_GetByName(impulse);
 	if (s) SSrImpulse_Play(s, 0, 0, 0, 0);
 }
 
-static void add(int who, int self, const char *text)
+static Message *new_message(void)
 {
 	Message *m;
 	if (g_nmsg == CHAT_KEEP) {
@@ -126,11 +129,18 @@ static void add(int who, int self, const char *text)
 		g_nmsg--;
 	}
 	m = &g_msg[g_nmsg++];
+	m->at = GetTickCount();
+	m->wrap_w = 0;
+	m->self = m->server = 0;
+	return m;
+}
+
+static void add(int who, int self, const char *text)
+{
+	Message *m = new_message();
 	fmt(m->line, "%s: %s", mp_name(who), text);
 	m->name_len = str_len(mp_name(who)) + 1;
 	m->self = self;
-	m->at = GetTickCount();
-	m->wrap_w = 0;
 	log_msg("chat: %s", m->line);
 }
 
@@ -173,20 +183,26 @@ void chat_set_muted(int who, int on)
 	log_msg("chat: %s %s", name, on ? "muted" : "no longer muted");
 }
 
-void chat_receive(const char *text)
+void chat_receive(int who, const char *text)
 {
 	char t[CHAT_MAX];
-	NetHud h;
-	int who;
 
 	clean(t, text);
 	if (!*t) return;
-	net_hud(&h);
-	who = 1 - h.local_player;
 	if (chat_muted(who)) return;
 	add(who, 0, t);
 	mp_names_say(who, t);
-	play("autosave");
+	mp_sound("autosave");
+}
+
+/* net.c: the server's line (someone entered or left), no name, in its own color */
+void chat_server(const char *text)
+{
+	Message *m = new_message();
+	str_cpy(m->line, sizeof m->line, text);
+	m->name_len = 0;
+	m->server = 1;
+	log_msg("chat: (server) %s", m->line);
 }
 
 static void send(void)
@@ -199,7 +215,7 @@ static void send(void)
 	net_hud(&h);
 	add(h.local_player, 1, t);
 	if (!net_chat_send(t)) log_msg("chat: nobody else is here to read it");
-	play("door_fail");
+	mp_sound("door_fail");
 }
 
 /* ---- Opening and closing ------------------------------------------------------------------ */
@@ -426,7 +442,7 @@ static void piece(const char *s, int a, int b, int x, int y, u32 color)
 static void draw_line(const Message *m, int l, int x, int y, u32 alpha)
 {
 	int a = m->starts[l], b = l + 1 < m->nlines ? m->starts[l + 1] : str_len(m->line);
-	u32 text = (WHITE & 0xffffff) | alpha << 24, name = ((m->self ? YELLOW : ORANGE) & 0xffffff) | alpha << 24;
+	u32 text = ((m->server ? GREEN : WHITE) & 0xffffff) | alpha << 24, name = ((m->self ? YELLOW : ORANGE) & 0xffffff) | alpha << 24;
 
 	if (a < m->name_len) {   /* the name, in its color */
 		int e = b < m->name_len ? b : m->name_len;

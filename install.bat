@@ -28,7 +28,7 @@ if "%AE:~-1%"=="\" set "AE=%AE:~0,-1%"
 if not exist "%AE%\Oni.exe" ( echo error: "%AE%" has no Oni.exe; give the AE folder ^(Oni\AE^), not Oni\ & goto fail )
 if not exist "%AE%\realbink.dll" if not exist "%AE%\bink_orig.dll" ( echo error: "%AE%" has no realbink.dll; give the AE folder ^(Oni\AE^), and install Anniversary Edition if it isn't there & goto fail )
 if not exist "%AE%\binkw32.dll" ( echo error: "%AE%" has no binkw32.dll; install Anniversary Edition first, it brings the Daodan DLL & goto fail )
-certutil -hashfile "%AE%\Oni.exe" SHA256 2>nul | findstr /i /c:"%ONI_SHA256%" >nul || echo warning: AE\Oni.exe is not the one Arklite was made for; patches that don't match will be skipped ^(see AE\Arklite.log^)
+certutil -hashfile "%AE%\Oni.exe" SHA256 2>nul | findstr /i /c:"%ONI_SHA256%" >nul || echo warning: AE\Oni.exe is not the one Arklite was made for; patches that don't match will be skipped ^(see the newest log in AE\logs^)
 
 rem Keep AE's original realbink.dll (Bink) as bink_orig.dll. When realbink.dll is not Arklite's
 rem loader, it is the original: a first install, or the AE Installer put it back. The loader is
@@ -50,7 +50,7 @@ copy /y "%HERE%Arklite.dll" "%AE%\Arklite.dll" >nul || goto denied
 copy /y "%HERE%realbink.dll" "%AE%\realbink.dll" >nul || goto denied
 if not exist "%AE%\GameDataFolder\CustomLevels" mkdir "%AE%\GameDataFolder\CustomLevels"
 echo Arklite installed into "%AE%".
-echo Start Oni as usual; AE\Arklite.log lists what was patched.
+echo Start Oni as usual; the newest log in AE\logs lists what was patched.
 goto end
 
 :denied

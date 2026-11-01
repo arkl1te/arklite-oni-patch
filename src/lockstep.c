@@ -221,7 +221,7 @@ __attribute__((no_caller_saved_registers)) static u32 local_random(void)
  *     state machine (0x480c20, ECX the ambient, 5 calls) draws from it */
 #define SSiImpulse_DriverRead   0x480443   /* mov al,[0x5eb757]: the impulse player's first test */
 #define SSiAmbient_DriverRead   0x4821f3   /* the same in the ambient start */
-#define SSrAmbient_Update       ((void (ONI_FC *)(u8 *, u32))0x480c20)
+#define SSiImpulse_PlayDriverRead 0x480560 /* and in the group player every one-shot sound starts in */
 #define SSgDriverOn             (*(u8 *)0x5eb757)
 #define SSgAmbientPlayID        (*(u32 *)0x5eb70c)   /* the last play id given */
 
@@ -258,13 +258,70 @@ __attribute__((no_caller_saved_registers)) static u32 sound_random(void)
 	return *s >> 16;
 }
 
+static int g_play_hooked;          /* impulse_play decides which one-shot sounds re-run ticks play */
+
 static u32 impulse_start(void)
 {
 	if (sound_in_tick()) {
 		g_tick_sounds++;
 		g_tick_sound_seed = tick_sound_seed();
 	}
-	return g_impulses_muted ? 0 : SSgDriverOn;
+	return g_impulses_muted && !g_play_hooked ? 0 : SSgDriverOn;
+}
+
+/* One-shot sounds in rollback's re-run ticks. Every one-shot sound starts in 0x480560 (ECX the
+ * sound group, 8th argument the impulse when 0x480440 calls it). Muting them all while
+ * ticks re-ran lost every sound only the corrected run has: the other player's input arrives
+ * a few ticks late, so their taunt, shot or hit first runs in a re-run tick (the Mercury Bow's
+ * shot, the taunt heard only when the guess "still held" was right). Now each tick remembers
+ * the sounds its runs started (group and impulse, in order), and a re-run plays a sound only
+ * when it starts more of it than the tick's runs before did: a little late, not twice. Which
+ * sounds play is never game state (the sound card decides as much), so the PCs stay in sync. */
+#define PLAYED_TICKS 64
+#define PLAYED_MAX   32
+typedef struct { u32 tick, n, sig[PLAYED_MAX]; } Played;
+static Played g_played[PLAYED_TICKS];
+static u32 g_play_tick;              /* the tick running, and the sounds this run of it started */
+static u32 g_run_sig[PLAYED_MAX], g_run_n;
+
+static void played_tick_begin(u32 tick)
+{
+	Played *p = &g_played[tick % PLAYED_TICKS];
+	g_play_tick = tick;
+	g_run_n = 0;
+	if (!g_impulses_muted || p->tick != tick) {   /* the tick's first run */
+		p->tick = tick;
+		p->n = 0;
+	}
+}
+
+static u32 impulse_play(u32 group, u32 impulse)
+{
+	Played *p = &g_played[g_play_tick % PLAYED_TICKS];
+	u32 sig = group * 0x9e3779b1u ^ impulse, before = 0, played = 0;
+	if (!SSgDriverOn) return 0;
+	if (!sound_in_tick()) return !g_impulses_muted;
+	for (u32 k = 0; k < g_run_n; k++) before += g_run_sig[k] == sig;
+	if (g_run_n < PLAYED_MAX) g_run_sig[g_run_n++] = sig;
+	for (u32 k = 0; k < p->n; k++) played += p->sig[k] == sig;
+	if (played > before) return 0;   /* an earlier run of the tick played it */
+	if (p->n < PLAYED_MAX) p->sig[p->n++] = sig;
+	return 1;
+}
+
+/* In place of 0x480560's mov al,[0x5eb757]: ECX, EDX kept */
+__attribute__((naked)) static void impulse_play_stub(void)
+{
+	__asm__ volatile(
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"pushl 0x2c(%%esp)\n\t"   /* the impulse (8th argument, past our and the caller's returns) */
+		"pushl %%ecx\n\t"         /* the sound group */
+		"call %c0\n\t"
+		"addl $8, %%esp\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
+		"ret\n" :: "i"(impulse_play));
 }
 
 static u32 ambient_start(void)
@@ -297,20 +354,26 @@ static u32 ambient_start(void)
 DRIVER_READ_STUB(impulse_start_stub, impulse_start)
 DRIVER_READ_STUB(ambient_start_stub, ambient_start)
 
-static void ONI_FC ambient_update(u8 *ambient, u32 edx)
+/* What the 5 calls went to before (0x480c20, or volume.c's wrapper of it, installed first) */
+static u32 (ONI_FC *g_ambient_next)(u8 *, u32);
+
+static u32 ONI_FC ambient_update(u8 *ambient, u32 edx)
 {
 	u8 *was = g_ambient;
-	u32 was_tid = g_ambient_tid;
+	u32 was_tid = g_ambient_tid, r;
 	g_ambient_tid = GetCurrentThreadId();
 	g_ambient = ambient;
-	SSrAmbient_Update(ambient, edx);
+	r = g_ambient_next(ambient, edx);
 	g_ambient = was;
 	g_ambient_tid = was_tid;
+	return r;
 }
 
-void lockstep_impulses_mute(int muted)
+/* 1: impulse_play decides per sound, nothing more to patch */
+int lockstep_impulses_mute(int muted)
 {
 	g_impulses_muted = (u8)muted;
+	return g_play_hooked;
 }
 
 static void sound_seeds_install(void)
@@ -321,13 +384,19 @@ static void sound_seeds_install(void)
 	u8 b[5] = { 0xe8 };
 	u32 rel;
 
+	u32 next = 0;
+
+	/* volume.c wraps the same 5 calls (one wrapper for all); chain to whatever they call */
 	for (u32 i = 0; i < n; i++) {
 		const u8 *p = (const u8 *)updates[i];
-		if (p[0] != 0xe8 || updates[i] + 5 + *(u32 *)(p + 1) != (u32)SSrAmbient_Update) {
+		u32 to = updates[i] + 5 + *(u32 *)(p + 1);
+		if (p[0] != 0xe8 || (next && to != next)) {
 			log_msg("sound seeds: 0x%x changed, skipped (sounds pick differently on each PC)", updates[i]);
 			return;
 		}
+		next = to;
 	}
+	g_ambient_next = (u32 (ONI_FC *)(u8 *, u32))next;
 	if (!code_matches(SSiImpulse_DriverRead, read, 5) || !code_matches(SSiAmbient_DriverRead, read, 5)) {
 		log_msg("sound seeds: 0x%x/0x%x changed, skipped (sounds pick differently on each PC)",
 		        SSiImpulse_DriverRead, SSiAmbient_DriverRead);
@@ -339,8 +408,15 @@ static void sound_seeds_install(void)
 	rel = (u32)ambient_start_stub - (SSiAmbient_DriverRead + 5);
 	memcpy(b + 1, &rel, 4);
 	patch_write(SSiAmbient_DriverRead, b, 5);
-	for (u32 i = 0; i < n; i++) patch_call(updates[i], (u32)SSrAmbient_Update, (u32)ambient_update);
+	for (u32 i = 0; i < n; i++) patch_call(updates[i], next, (u32)ambient_update);
 	log_msg("sound seeds: sounds started in a tick pick the same on every PC");
+	if (code_matches(SSiImpulse_PlayDriverRead, read, 5)) {
+		rel = (u32)impulse_play_stub - (SSiImpulse_PlayDriverRead + 5);
+		memcpy(b + 1, &rel, 4);
+		patch_write(SSiImpulse_PlayDriverRead, b, 5);
+		g_play_hooked = 1;
+		log_msg("sound seeds: rollback's re-run ticks play the one-shot sounds their first run didn't");
+	}
 }
 
 static void sound_rng_install(void)
@@ -739,6 +815,51 @@ static void speech_install(void)
 	patch_call(ONcSpeech_UpdateCall, (u32)SSrPlayID_Update, (u32)speech_sound_update);
 	patch_write(ONcSpeech_PlayFailedJne, jmp, 2);
 	log_msg("speech: lines end after their length in ticks, not when the sound stops");
+}
+
+/* ---- SS2's extra unlock ------------------------------------------------------------------ *
+ * A channel starting a compressed sound (0x484b70) opens an ACM stream for it; when
+ * acmFormatSuggest, acmStreamOpen or acmStreamSize fails it calls LeaveCriticalSection on SS2's
+ * lock (*0x63f394, at 0x484cbb) and returns 0, though it never entered it: its callers
+ * (0x47ff50, 0x480560, through 0x47f8d0) hold the lock and leave it themselves. The first leave
+ * frees the lock early; if the sound thread (0x4864e0, which holds the lock while it mixes)
+ * takes it then, the caller's own leave frees it under the mixer, and the main thread can close
+ * a channel's stream while the sound thread converts with it: the Linux host's crashes in
+ * acmStreamConvert (0x48500c, a call to 0, 0x273 or 0xd006c), every time on the sound thread.
+ * The extra leave now goes to channel_open_failed, which logs the sound's format instead. */
+#define SSiChannel_FailLeave   0x484cba   /* push eax; call [LeaveCriticalSection] */
+
+static void channel_open_failed(const u8 *channel)
+{
+	static volatile u32 n;
+	const u8 *sound = *(const u8 * const *)(channel + 0x24);
+	if (n++ >= 8) return;
+	log_msg("sound: a channel couldn't open an ACM stream for format %d (%d channels, %d Hz, block %d); the sound doesn't play, SS2's lock is kept",
+	        *(const u16 *)(sound + 4), *(const u16 *)(sound + 6), *(const u32 *)(sound + 8), *(const u16 *)(sound + 0x10));
+}
+
+/* called as LeaveCriticalSection(lock) (stdcall), EBP the channel */
+__attribute__((naked)) static void channel_open_failed_stub(void)
+{
+	__asm__ volatile(
+		"pushl %%ebp\n\t"
+		"call %c0\n\t"
+		"addl $4, %%esp\n\t"
+		"ret $4\n" :: "i"(channel_open_failed));
+}
+
+static void *const g_channel_open_failed = (void *)channel_open_failed_stub;
+
+static void channel_unlock_install(void)
+{
+	static const u8 site[] = { 0x50, 0xff, 0x15, 0xec, 0x90, 0x52, 0x00 };
+	void *const *to = &g_channel_open_failed;
+	if (!code_matches(SSiChannel_FailLeave, site, sizeof site)) {
+		log_msg("sound: 0x%x changed, a failed ACM open still frees SS2's lock", SSiChannel_FailLeave);
+		return;
+	}
+	patch_write(SSiChannel_FailLeave + 3, &to, 4);
+	log_msg("sound: a failed ACM open no longer frees SS2's lock under the sound thread");
 }
 
 static int rng_trace_install(void)
@@ -1201,6 +1322,7 @@ static void tick_body(void *action)
 	g_tick_tid = GetCurrentThreadId();
 	g_tick_sounds = 0;
 	g_tick_sound_seed = tick_sound_seed();
+	played_tick_begin(GS_TICK(ONgGameState));
 	ONrGameState_Tick(action);
 	if (g_frame_particles) P3rUpdate(GS_TICK(ONgGameState) + 1, 0);   /* as the tick's own (0x4fa9bd) */
 }
@@ -1304,6 +1426,7 @@ void lockstep_install(void)
 	sound_rng_install();
 	sound_seeds_install();
 	speech_install();
+	channel_unlock_install();
 	visited_install();
 	col_install();
 	/* the tick hook tells the local RNG when a tick is running, so it's always in */

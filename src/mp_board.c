@@ -19,10 +19,20 @@
  *     area's bottom, or at its top when there are none.
  * The page state is the dialog's data, 0x5ed0f8 (+0 the page, 1..5; +0x10 the objectives).
  *
- * Scoreboard: Player, Score, Ping (the last round trip, match only) and a Mute box (chat.c) for
- * every other player of a network game; under it the time left, the score limit, and the result
- * once the match is over. This PC's player in white, the others orange. */
+ *   - msg 0x2b (paint): the stock paint (0x502ef0) colors tabs 101..105 every frame, white for
+ *     the stock page and the one under the mouse (0x46b530), orange otherwise (blinking for a
+ *     page with news). After it the Scoreboard tab gets the same rule, and while the Scoreboard
+ *     is up the stock page's tab (still Objective's, say) goes orange.
+ *
+ * Scoreboard: on top, the time left (in the lobby the time limit) and the score limit on one
+ * row; then Player (the host marked), Score, Ping (each player's last round trip to the host,
+ * match only; on a joiner the host's row has its own) and a Mute box (chat.c) for every other
+ * player of a network game, players who left in blue; under them the result once the match is
+ * over. This PC's player in white, the others orange. */
 #include "arklite.h"
+
+void *memset(void *, int, unsigned);
+void *memcpy(void *, const void *, unsigned);
 
 #define ONcHelp_ProcPush        0x501932   /* push 0x501990 */
 #define ONrHelp_Proc            0x501990
@@ -32,11 +42,13 @@
 #define DCrSetTextAlign         ((void (ONI_FC *)(u32))0x46a5b0)
 #define DCrSetFont              ((void (ONI_FC *)(const void *))0x46a570)
 #define DCrFont_Ascent          ((u32 (ONI_FC *)(void))0x46a350)
+#define WMrButton_IsHighlighted ((u8 (ONI_FC *)(WMtWindow *))0x46b530)   /* under the mouse */
 #define ONgHelpPage             (*(u32 *)0x5ed0f8)
 #define ONgHelpObjectives       (*(void **)(0x5ed0f8 + 0x10))
 #define ONgObjectiveCount       (*(short *)0x5ecfb0)
 
 #define WMcMessage_Destroy      0x13
+#define WMcMessage_Paint        0x2b
 #define WMcMessage_OwnerDraw    0x36
 enum { ID_BOARD = 100, ID_OBJECTIVE, ID_ITEMS, ID_WEAPONS, ID_DIARY, ID_HELP, ID_MAIN_PREV, ID_MAIN_NEXT,
        ID_MAIN_AREA = 110, ID_SUB_AREA, ID_SUB_PREV, ID_SUB_NEXT, ID_SUB_OUTLINE = 120, ID_MUTE = 200 };
@@ -46,7 +58,8 @@ enum { ID_BOARD = 100, ID_OBJECTIVE, ID_ITEMS, ID_WEAPONS, ID_DIARY, ID_HELP, ID
 #define AREA_W          310
 #define AREA_H          260
 #define ROW_H           22
-#define ROWS_Y          24         /* the first player's row, under the header */
+#define HEADER_Y        30         /* the column names, under the limits' row */
+#define ROWS_Y          54         /* the first player's row, under the header */
 #define COL_SCORE       195        /* right edges */
 #define COL_PING        245
 #define COL_MUTE        255        /* the Mute box's left */
@@ -55,7 +68,7 @@ enum { ID_BOARD = 100, ID_OBJECTIVE, ID_ITEMS, ID_WEAPONS, ID_DIARY, ID_HELP, ID
 
 static WMtDialogProc g_stock;
 static int g_board;                /* the Scoreboard tab is up */
-static WMtWindow *g_mute[2];
+static WMtWindow *g_mute[PLAYERS_MAX];
 
 static int board_wanted(void)
 {
@@ -64,10 +77,11 @@ static int board_wanted(void)
 	return h.state != NETHUD_OFF || (multiplayer_active() && multiplayer_map());
 }
 
-/* The players listed: this PC's, and the other one when it's there */
+/* The players listed: a network game's (those who left too, in a match), or the ones on this PC */
 static int listed(const NetHud *h, int who)
 {
-	return h->state == NETHUD_OFF || who == h->local_player || h->peer_present;
+	if (h->state == NETHUD_OFF) return players_char(who) != 0;
+	return who == h->local_player || ((h->present | h->gone) >> who & 1);
 }
 
 /* The match's goal in one sentence */
@@ -134,6 +148,31 @@ static int text_wrapped(const char *s, int y, u32 color, int draw)
 	return lines;
 }
 
+/* The limits' row: the time left (the lobby: the time limit) on the left, the score limit on the right */
+static void draw_limits(const NetHud *h)
+{
+	char line[64];
+	int left, w;
+
+	if (h->state == NETHUD_OFF) {
+		text_at("No score or time limit on one PC.", 0, 0, UI_LEFT, UI_ORANGE, AREA_W);
+		return;
+	}
+	if (h->state == NETHUD_LOBBY || h->state == NETHUD_STARTING) {
+		if (!h->time_limit) str_cpy(line, sizeof line, "Time limit: none");
+		else fmt(line, "Time limit: %d min", h->time_limit);
+	} else if ((left = players_time_left()) < 0) {
+		str_cpy(line, sizeof line, "Time left: no limit");
+	} else {
+		fmt(line, "Time left: %d:%02d", (left + 59) / 60 / 60, (left + 59) / 60 % 60);
+	}
+	w = ui_text_width(line);
+	text_at(line, 0, 0, UI_LEFT, UI_ORANGE, AREA_W / 2);
+	if (!h->score_limit) str_cpy(line, sizeof line, "Score limit: none");
+	else fmt(line, h->score_limit < 0 ? "Score limit: %d (by suicides)" : "Score limit: %d", h->score_limit);
+	text_at(line, AREA_W, 0, UI_RIGHT, UI_ORANGE, AREA_W - (w < AREA_W / 2 ? w : AREA_W / 2) - 12);
+}
+
 static void draw_board(void)
 {
 	NetHud h;
@@ -141,23 +180,33 @@ static void draw_board(void)
 	int row = 0, y;
 
 	net_hud(&h);
-	text_at("Player", 0, 0, UI_LEFT, UI_BLUE, 150);
-	text_at("Score", COL_SCORE, 0, UI_RIGHT, UI_BLUE, 60);
+	draw_limits(&h);
+	text_at("Player", 0, HEADER_Y, UI_LEFT, UI_BLUE, 150);
+	text_at("Score", COL_SCORE, HEADER_Y, UI_RIGHT, UI_BLUE, 60);
 	if (h.state != NETHUD_OFF) {
-		text_at("Ping", COL_PING, 0, UI_RIGHT, UI_BLUE, 45);
-		text_at("Chat", COL_MUTE, 0, UI_LEFT, UI_BLUE, AREA_W - COL_MUTE);
+		text_at("Ping", COL_PING, HEADER_Y, UI_RIGHT, UI_BLUE, 45);
+		text_at("Chat", COL_MUTE, HEADER_Y, UI_LEFT, UI_BLUE, AREA_W - COL_MUTE);
 	}
-	for (int who = 0; who < 2; who++) {
+	for (int who = 0; who < PLAYERS_MAX; who++) {
 		WMtWindow *box = g_mute[who];
 		int show = 0;
 		if (listed(&h, who)) {
-			u32 color = h.state != NETHUD_OFF && who == h.local_player ? WHITE : UI_ORANGE;
+			u32 color = h.state != NETHUD_OFF && who == h.local_player ? WHITE : (h.gone >> who & 1) ? UI_BLUE : UI_ORANGE;
 			y = ROWS_Y + row * ROW_H;
-			text_at(mp_name(who), 0, y, UI_LEFT, color, COL_SCORE - 60);
+			if (h.state != NETHUD_OFF && who == 0) {   /* the host plays player 1 */
+				static const char tag[] = "(host)";
+				char fit[64];
+				int tw = ui_text_width(tag);
+				ui_fit(fit, sizeof fit, mp_name(who), COL_SCORE - 60 - tw - 6);
+				text_at(fit, 0, y, UI_LEFT, color, COL_SCORE - 60);
+				text_at(tag, ui_text_width(fit) + 6, y, UI_LEFT, UI_BLUE, tw);
+			} else {
+				text_at(mp_name(who), 0, y, UI_LEFT, color, COL_SCORE - 60);
+			}
 			fmt(line, "%d", players_score(who));
 			text_at(line, COL_SCORE, y, UI_RIGHT, color, 60);
 			if (h.state != NETHUD_OFF) {
-				if (who != h.local_player && h.ping_ms >= 0) fmt(line, "%d", h.ping_ms);
+				if (who != h.local_player && h.ping_ms[who] >= 0) fmt(line, "%d", h.ping_ms[who]);
 				else str_cpy(line, sizeof line, "-");
 				text_at(line, COL_PING, y, UI_RIGHT, color, 45);
 				if (box && who != h.local_player) {
@@ -171,32 +220,17 @@ static void draw_board(void)
 		if (box && (WIN_VISIBLE(box) != 0) != show) WMrWindow_SetVisible(box, show);
 	}
 
-	y = ROWS_Y + 2 * ROW_H + 14;
+	y = ROWS_Y + (row > 2 ? row : 2) * ROW_H + 14;
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) {
 		text_wrapped("Warm-up: the match starts when enough players are ready (F3).", y, WHITE, 1);
 		return;
 	}
-	if (h.state == NETHUD_OFF) {
-		text_at("No score or time limit on one PC.", 0, y, UI_LEFT, UI_ORANGE, AREA_W);
-		return;
-	}
-	if (h.over) {
-		int w = players_winner();
+	if (h.state != NETHUD_OFF && h.over) {
+		int w = players_winner(h.present);
 		if (w < 0) str_cpy(line, sizeof line, "Match over: a draw!");
 		else fmt(line, "Match over: %s wins!", mp_name(w));
 		text_at(line, 0, y, UI_LEFT, WHITE, AREA_W);
-		y += ROW_H;
 	}
-	{
-		int left = players_time_left();
-		if (left < 0) str_cpy(line, sizeof line, "Time left: no limit");
-		else fmt(line, "Time left: %d:%02d", (left + 59) / 60 / 60, (left + 59) / 60 % 60);
-	}
-	text_at(line, 0, y, UI_LEFT, UI_ORANGE, AREA_W);
-	y += ROW_H;
-	if (!h.score_limit) str_cpy(line, sizeof line, "Score limit: none");
-	else fmt(line, h.score_limit < 0 ? "Score limit: %d (by suicides)" : "Score limit: %d", h.score_limit);
-	text_at(line, 0, y, UI_LEFT, UI_ORANGE, AREA_W);
 }
 
 static void draw_goal(void)
@@ -225,6 +259,28 @@ static void hide_stock_page_parts(WMtWindow *dialog)
 	}
 }
 
+/* A tab's text color, as the stock paint sets it (font info +8) */
+static void tab_shade(WMtWindow *w, u32 shade)
+{
+	u32 info[4];
+	if (!w || ((u32 *)WIN_FONTINFO(w))[2] == shade) return;
+	memcpy(info, WIN_FONTINFO(w), sizeof info);
+	info[2] = shade;
+	WMrWindow_SetFontInfo(w, info);
+}
+
+/* After the stock paint: the Scoreboard tab white while it's up or under the mouse, and the
+ * stock page's tab orange while the Scoreboard hides that page */
+static void board_tab_colors(WMtWindow *dialog)
+{
+	WMtWindow *board = WMrDialog_GetItemByID(dialog, ID_BOARD), *page;
+	if (!board) return;
+	tab_shade(board, g_board || WMrButton_IsHighlighted(board) ? WHITE : UI_ORANGE);
+	if (g_board && ONgHelpPage >= 1 && ONgHelpPage <= 5 && (page = WMrDialog_GetItemByID(dialog, ID_BOARD + ONgHelpPage)) &&
+	    !WMrButton_IsHighlighted(page))
+		tab_shade(page, UI_ORANGE);
+}
+
 static void board_show(WMtWindow *dialog)
 {
 	g_board = 1;
@@ -245,7 +301,7 @@ static void board_init(WMtWindow *dialog)
 	/* after Objective, which comes before the frames in the child list (a window after a frame is
 	 * drawn under its dark fill) */
 	ui_add(dialog, objective, objective, 0, ~0u, "Scoreboard", ID_BOARD, 25, 15, 130, 40);
-	for (int who = 0; who < 2; who++) {
+	for (int who = 0; who < PLAYERS_MAX; who++) {
 		g_mute[who] = ui_add(dialog, objective, objective, WMcClass_CheckBox, 0x10000, "Mute", ID_MUTE + who,
 		                     AREA_X + COL_MUTE, AREA_Y + ROWS_Y, MUTE_W, 20);
 		if (g_mute[who]) WMrWindow_SetVisible(g_mute[who], 0);
@@ -255,7 +311,7 @@ static void board_init(WMtWindow *dialog)
 
 static void mute_hide(void)
 {
-	for (int who = 0; who < 2; who++)
+	for (int who = 0; who < PLAYERS_MAX; who++)
 		if (g_mute[who]) WMrWindow_SetVisible(g_mute[who], 0);
 }
 
@@ -266,14 +322,14 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 
 	if (msg == WMcMessage_InitDialog) {
 		g_board = 0;
-		g_mute[0] = g_mute[1] = 0;
+		memset(g_mute, 0, sizeof g_mute);
 		r = g_stock(dialog, msg, p1, p2);
 		if (board_wanted()) board_init(dialog);
 		return r;
 	}
 	if (msg == WMcMessage_Destroy) {
 		g_board = 0;
-		g_mute[0] = g_mute[1] = 0;
+		memset(g_mute, 0, sizeof g_mute);
 		return g_stock(dialog, msg, p1, p2);
 	}
 	if (msg == WMcMessage_Command && code == WMcNotify_Click) {
@@ -281,7 +337,7 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 			board_show(dialog);
 			return 1;
 		}
-		if (id >= ID_MUTE && id < ID_MUTE + 2) {
+		if (id >= ID_MUTE && id < ID_MUTE + PLAYERS_MAX) {
 			chat_set_muted((int)(id - ID_MUTE), !chat_muted((int)(id - ID_MUTE)));
 			return 1;
 		}
@@ -292,6 +348,11 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 			WMrDialog_CheckRadio(dialog, ID_BOARD, ID_HELP, id);
 			return r;
 		}
+	}
+	if (msg == WMcMessage_Paint) {
+		r = g_stock(dialog, msg, p1, p2);
+		if (board_wanted()) board_tab_colors(dialog);
+		return r;
 	}
 	if (msg == WMcMessage_OwnerDraw && p2 && *(const u16 *)(p2 + 8) == ID_MAIN_AREA && board_wanted()) {
 		WMtWindow *area = *(WMtWindow *const *)(p2 + 4);

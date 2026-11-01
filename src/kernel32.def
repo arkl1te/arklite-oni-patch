@@ -26,6 +26,7 @@ EXPORTS
   GetTickCount@0
   QueryPerformanceCounter@4
   QueryPerformanceFrequency@4
+  ExitProcess@4
   GetPrivateProfileSectionA@16
   GetCurrentProcessId@0
   CreateDirectoryA@8
@@ -44,3 +45,5 @@ EXPORTS
   SuspendThread@4
   ResumeThread@4
   GetThreadContext@8
+  GetLocalTime@4
+  TerminateProcess@8

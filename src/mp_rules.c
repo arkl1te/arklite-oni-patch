@@ -131,7 +131,7 @@ static void free_for_all_install(void)
 /* Who hit whom, for the score (players.c) */
 static void ONI_FC note_hit(u8 *victim, u32 owner)
 {
-	if (owner) players_note_hit(victim, ONrOwner_Character(owner));
+	if (owner) players_note_hit(victim, ONrOwner_Character(owner), owner);
 }
 
 __attribute__((naked)) static void take_damage_entry(void)

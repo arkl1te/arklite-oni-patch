@@ -6,8 +6,8 @@
  * frames and the background stay; the title reads "More options". Close works on both pages,
  * and Esc on our page goes back to the stock page instead of closing the dialog.
  *
- *   Display           HUD Scale (50..300%, hud_scale.c) and the pause menu's black background
- *                     opacity (0..100%, drawn by arklite.c).
+ *   Display           HUD Scale (50..300%, hud_scale.c), the pause menu's black background
+ *                     opacity (0..100%, drawn by arklite.c) and the FPS counter (mp_hud.c).
  *   When Game Pauses  three checkboxes acting as one choice (the stock radio buttons use the
  *                     grey g206 art, so Oni's own checkboxes look right here):
  *                     keep the level's music, play the main theme (the original game), silence.
@@ -29,6 +29,7 @@
 static int g_hudScale = 100;            /* percent */
 static int g_pauseBackground = 33;      /* percent; 33 was Arklite's fixed value */
 static int g_pauseMusic = PAUSE_MUSIC_KEEP;
+static int g_showFps;
 
 static const char *const g_musicNames[] = { "keep", "theme", "silence" };
 
@@ -45,8 +46,9 @@ static void settings_load(void)
 	g_pauseMusic = PAUSE_MUSIC_KEEP;
 	for (int i = 0; i < 3; i++)
 		if (str_ieq_n(music, g_musicNames[i], sizeof music)) g_pauseMusic = i;
-	log_msg("options: hud_scale %d, pause_background %d, pause_music %s",
-	        g_hudScale, g_pauseBackground, g_musicNames[g_pauseMusic]);
+	g_showFps = GetPrivateProfileIntA("options", "show_fps", 0, ini_path()) != 0;
+	log_msg("options: hud_scale %d, pause_background %d, pause_music %s, show_fps %d",
+	        g_hudScale, g_pauseBackground, g_musicNames[g_pauseMusic], g_showFps);
 }
 
 static void settings_save_int(const char *key, int v)
@@ -59,6 +61,7 @@ static void settings_save_int(const char *key, int v)
 int   pause_music_mode(void)       { return g_pauseMusic; }
 u32   pause_background_alpha(void) { return (u32)(g_pauseBackground * 255 + 50) / 100; }
 float hud_scale(void)              { return g_hudScale * 0.01f; }
+int   show_fps(void)               { return g_showFps; }
 
 /* ---- Page ---------------------------------------------------------------------------------- */
 
@@ -66,6 +69,7 @@ enum {
 	ID_MORE = 113,
 	ID_HUD_SCALE = 120, ID_PAUSE_BACKGROUND,
 	ID_MUSIC_KEEP, ID_MUSIC_THEME, ID_MUSIC_SILENCE,
+	ID_SHOW_FPS,
 };
 #define ID_CLOSE    2
 #define ID_SOUND    102   /* stock Overall Volume slider, Sound Volume after volume.c */
@@ -149,7 +153,7 @@ void more_options_init(WMtWindow *dialog)
 	WMtWindow *rowLabel = find_child(dialog, 30, 65);      /* "Quality:" */
 	WMtWindow *header = find_child(dialog, 50, 35);        /* "Graphics" (blue) */
 	WMtWindow *title = find_child(dialog, 5, 10);          /* "Options", 70 px wide */
-	WMtWindow *hud, *background;
+	WMtWindow *hud, *background, *fps;
 
 	g_dialog = dialog;
 	g_anchor = rowLabel;
@@ -179,6 +183,7 @@ void more_options_init(WMtWindow *dialog)
 	add(rowLabel, "Pause Background:", 0, 30, 90, 136, 20);
 	background = add(slider, "pause background", ID_PAUSE_BACKGROUND, 168, 90, 72, 20);
 	g_backgroundValue = add(rowLabel, "", 0, 241, 90, 44, 20);
+	fps = add(checkbox, "Show FPS", ID_SHOW_FPS, 30, 115, 270, 20);
 
 	/* When Game Pauses: the Sound frame (y 175..275) */
 	add(header, "When Game Pauses", 0, 50, 160, 200, 20);
@@ -194,6 +199,7 @@ void more_options_init(WMtWindow *dialog)
 	show_percent(g_hudValue, g_hudScale);
 	show_percent(g_backgroundValue, g_pauseBackground);
 	check_music();
+	if (fps) WMrCheckBox_SetCheck(fps, g_showFps);
 
 	/* "More..." left of Close, same size */
 	g_more = WMrWindow_New(WIN_CLASS(close), "More...", WIN_FLAGS(close), WIN_STYLE(close), ID_MORE,
@@ -211,7 +217,7 @@ void more_options_init(WMtWindow *dialog)
 
 int more_options_command(WMtWindow *dialog, u32 id, u32 notify)
 {
-	if (dialog != g_dialog || id < ID_MORE || id > ID_MUSIC_SILENCE) return 0;
+	if (dialog != g_dialog || id < ID_MORE || id > ID_SHOW_FPS) return 0;
 	if (g_initializing || notify != WMcNotify_Click) return 1;
 
 	if (id == ID_MORE) {
@@ -234,6 +240,12 @@ int more_options_command(WMtWindow *dialog, u32 id, u32 notify)
 			settings_save_int("pause_background", v);
 			show_percent(g_backgroundValue, v);
 		}
+	} else if (id == ID_SHOW_FPS) {
+		WMtWindow *box = WMrDialog_GetItemByID(dialog, id);
+
+		g_showFps = !g_showFps;
+		settings_save_int("show_fps", g_showFps);
+		if (box) WMrCheckBox_SetCheck(box, g_showFps);
 	} else {
 		/* The click toggled the box; whichever box was clicked becomes the one choice. */
 		g_pauseMusic = (int)(id - ID_MUSIC_KEEP);

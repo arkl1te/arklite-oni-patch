@@ -114,6 +114,9 @@ typedef struct { char *ref; u32 file_index; } TMtLevelFileEntry;
 #define TMcLevel_OpenFileCallAddr 0x4218c1
 #define TMmFile_InstanceCount(f)  (*(u32 *)((u8 *)(f) + 0x28))
 #define TMmFile_Descriptors(f)    (*(u32 **)((u8 *)(f) + 0x2c))
+#define TMmFile_NameCount(f)      (*(u32 *)((u8 *)(f) + 0x34))
+#define TMmFile_Names(f)          (*(u32 **)((u8 *)(f) + 0x38))   /* { descriptor index, name }, sorted */
+#define TMmTemplate_Tag(t)        (*(u32 *)((u8 *)(t) + 8))
 
 /* ---- Scripts ------------------------------------------------------------------------- */
 

@@ -1,4 +1,4 @@
-/* Crash log (AE\Arklite.log).
+/* Crash log (in Arklite's log, AE\logs\Arklite_<date>_<time>.log).
  *
  * Wine prints nothing when Oni dies while loading a level, so faults and the exit path are
  * logged: registers plus every stack value that points into Oni.exe, Daodan or Arklite. */
@@ -37,6 +37,10 @@ static void log_stack(u32 esp)
 }
 
 static int g_faults;
+static u32 g_last_at, g_last_ms;
+
+__declspec(dllimport) int WINAPI TerminateProcess(HANDLE, u32);
+__declspec(dllimport) u32 WINAPI GetTickCount(void);
 
 static long WINAPI fault_handler(u32 **info)
 {
@@ -54,6 +58,15 @@ static long WINAPI fault_handler(u32 **info)
 	        R(0xb0), R(0xa4), R(0xac), R(0xa8), R(0xa0), R(0x9c), R(0xb4), R(0xc4));
 	log_stack(R(0xc4));
 #undef R
+	/* the same access violation again at once: the crash's own handling ran into it (a broken
+	 * heap, its lock held), and the Linux host froze there with the game on screen instead of
+	 * closing. Closing now lets the others see this player gone */
+	if (code == 0xc0000005u && rec[3] == g_last_at && GetTickCount() - g_last_ms < 2000) {
+		log_msg("the same fault came back while handling it: closing Oni");
+		TerminateProcess(GetCurrentProcess(), code);
+	}
+	g_last_at = rec[3];
+	g_last_ms = GetTickCount();
 	return 0;
 }
 

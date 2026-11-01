@@ -44,7 +44,12 @@ __declspec(dllimport) void * WINAPI AddVectoredExceptionHandler(u32, void *);
 
 /* ---- common.c ---------------------------------------------------------------------------- */
 
-void log_open(const char *path);
+/* Logs and dumps go to AE\logs\<name>_<date>_<time>.<ext>, the newest LOG_KEEP of each name kept */
+#define LOG_DIR  "logs"
+#define LOG_KEEP 3
+HANDLE log_file_create(const char *name, char *path);   /* path: MAX_PATH, gets the file's name */
+void log_open(const char *name);
+const char *log_path(void);                   /* this session's log, e.g. logs\Arklite_2026-10-29_01-00-27.log */
 void log_msg(const char *f, ...);              /* one line, CRLF appended */
 
 /* Rewrite an instruction after checking its current bytes; logs and returns 0 on a mismatch. */
@@ -95,6 +100,7 @@ int   more_options_cancel(WMtWindow *dialog);   /* Esc: 1 if it only left the Mo
 int   pause_music_mode(void);
 u32   pause_background_alpha(void);   /* 0..255 */
 float hud_scale(void);                /* 1.0 = original size */
+int   show_fps(void);                 /* the FPS counter is on */
 
 /* ---- hud_scale.c -------------------------------------------------------------------------- */
 
@@ -113,6 +119,10 @@ void hud_smooth_restore(u8 *texture, u32 saved);
 /* ---- random_class.c----------------------------------------------------------------------- */
 
 void random_class_install(void);
+
+/* ---- particle_table.c --------------------------------------------------------------------- */
+
+void particle_table_install(void);
 
 /* ---- texture_clamp.c ---------------------------------------------------------------------- */
 
@@ -148,10 +158,14 @@ int  rollback_restore_tick(u32 tick);     /* back to the start of tick: 1, or 0 
 void rollback_impulses(int on);           /* one-shot sounds off while ticks run again */
 u32  rollback_ambients_stopped(void);     /* ambient sounds stopped because their ticks were taken back */
 u32  rollback_known_pages(void);
+int  rollback_check_begin(void);          /* after a rollback's re-run: keep its result */
+int  rollback_check_end(const char *what); /* after the same ticks ran again: 1 same, 0 game state differs */
+void rollback_check_stats(u32 *checks, u32 *bad);
+void rollback_keep(const void *p, u32 n); /* memory a rewind never puts back (HUD textures) */
 #define ROLLBACK_KEPT_TICKS 12            /* RB_SLOTS: how far back the game can go */
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
-void lockstep_impulses_mute(int muted);   /* one-shot sounds off while rollback re-runs ticks */
+int lockstep_impulses_mute(int muted);    /* rollback re-runs ticks: only new one-shot sounds play (1), else off (0) */
 /* net.c's recording of a networked game (same format, player 2's record per tick) */
 int  lockstep_net_record_begin(u32 level, const char *path);
 void lockstep_net_record_frame(u32 n, const u32 (*p1)[12], const u32 (*p2)[12]);
@@ -170,6 +184,7 @@ int  net_active(void);
 void net_menu_local(void);     /* Play (a mode set at startup stays) */
 /* time_limit in minutes, score_limit in points (below 0: reached going down); 0: none */
 void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectators, u32 time_limit, int score_limit);
+#define NET_PLAYERS_MAX     4      /* the Host dialog's Max players: 2 to this */
 #define NET_TIME_LIMIT_MAX  999
 #define NET_SCORE_LIMIT_MAX 999
 void net_menu_join(const char *address);   /* host[:port] */
@@ -200,18 +215,21 @@ void net_tick_done(void);      /* after every tick */
 enum { NETHUD_OFF, NETHUD_LOBBY, NETHUD_STARTING, NETHUD_MATCH };
 typedef struct {
 	int state;                 /* NETHUD_* */
-	int local_player;          /* 0 Konoko (host), 1 player 2 (joiner) */
+	int local_player;          /* this PC's player: 0 the host (Konoko), 1.. the joiners, in joining order */
+	int local_char;            /* players_char() of this PC's character (a joiner's lobby: 1) */
+	int joiner;                /* this PC joined (else it hosts) */
 	int ready, connected;      /* this PC pressed F3; the host is / is heard */
 	u32 players, ready_count, needed;
 	int countdown_ms;          /* -1: none */
 	u32 problem;               /* NETBAD_*: what keeps the joiner out (joiner: of the host's game; host: a joiner) */
 	int desynced;              /* a state hash differed in this match */
-	int silent_ms;             /* match: nothing from the other PC for this long (0: under 1.5 s) */
-	int lost;                  /* match: 1 the other PC stopped answering, 2 it left */
+	u32 present;               /* the players in this lobby or match, a bit per player (gone ones not) */
+	u32 gone, left;            /* match: players who stopped answering, and of them those who left (they stand) */
+	int silent_ms, silent_who; /* match: nothing from that player's PC for this long (0: under 1.5 s) */
+	int lost;                  /* joiner's match: 1 the host stopped answering, 2 it left */
 	u32 time_limit;            /* the match's limits (the host's): minutes, 0 none */
 	int score_limit;           /* 0: none; below 0: reached going down */
-	int ping_ms;               /* the last round trip to the other PC, -1: not known */
-	int peer_present;          /* the other PC's player is in this lobby or match */
+	int ping_ms[NET_PLAYERS_MAX];   /* each player's last round trip to the host (the host's row: a joiner's own), -1: not known */
 	int over;                  /* match: a limit was reached, the game stands until everyone pressed fire */
 	int over_ready;            /* this PC's player pressed fire */
 	u32 over_players, over_ready_count;
@@ -220,8 +238,9 @@ typedef struct {
 /* What differs between the two PCs, so the host doesn't let the joiner in */
 enum {
 	NETBAD_PROTO = 1, NETBAD_DLL = 2, NETBAD_DAODAN = 4, NETBAD_DAODAN_INI = 8, NETBAD_LEVEL0 = 16,
-	NETBAD_MAP = 32, NETBAD_PLAYERS = 64,
+	NETBAD_MAP = 32, NETBAD_PLAYERS = 64, NETBAD_FULL = 128,
 };
+#define NETBAD_LAST NETBAD_FULL
 void net_hud(NetHud *h);
 u8  *net_swapped_konoko(void);   /* Konoko while the joiner's display runs with player 2 in gs+0xac, else 0 */
 const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
@@ -264,6 +283,7 @@ void mp_menu_join_failed(const char *folder, const char *why);   /* the map down
 WMtWindow *ui_add(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *src, u32 cls, u32 style,
                   const char *text, u32 id, int x, int y, int w, int h);
 void ui_set_frame(WMtWindow *w, int x, int y, int width, int height);
+void ui_list_set_frame(WMtWindow *w, int x, int y, int width, int height);   /* a listbox: its row count follows */
 void ui_set_text(WMtWindow *w, const char *text);
 void ui_set_text_fit(WMtWindow *w, const char *text);   /* cut with "..." to the window's width */
 /* Tahoma Bold 10 (the menus' font): width in pixels, and src cut with "..." to fit width */
@@ -299,10 +319,10 @@ int  mp_hud_text_width(const char *s, int n);   /* the first n characters (n < 0
 
 #define MP_NAME_MAX 24
 void mp_names_install(void);   /* Arklite.ini [multiplayer] name, [players] p2_name */
-const char *mp_name(int who);  /* 0: Konoko (the host), 1: player 2 (the joiner) */
+const char *mp_name(int who);  /* 0: Konoko (the host), 1..: the other players */
 const char *mp_name_local(void);          /* this PC's player's */
 u32  mp_name_serial(void);                /* changes with this PC's name */
-void mp_name_set_peer(const char *name);  /* net.c: the other PC's player's */
+void mp_name_set(int who, const char *name);   /* net.c: another PC's player's ("" unknown) */
 int  mp_name_editing(void);               /* typed in the F2 menu */
 void mp_name_edit_begin(void);
 void mp_name_edit_end(int keep);          /* keep: saved in Arklite.ini */
@@ -314,13 +334,15 @@ void mp_names_say(int who, const char *text);   /* chat.c: a message over that p
 
 /* Chat in network games: Enter opens it, Enter sends, Esc closes (see chat.c) */
 #define CHAT_MAX 128                  /* characters + 1 */
+void mp_sound(const char *impulse);   /* a level 0 impulse by name, no position; outside a tick */
 void chat_install(void);              /* Arklite.ini [chat] */
 void chat_frame(void);                /* every frame, after the update */
 void chat_draw(int width, int height);   /* from the HUD */
 int  chat_blocking(void);             /* open (or Enter/Esc that closed it still down): the game gets the mouse but no keyboard */
-void chat_receive(const char *text);  /* net.c: the other PC's player said it */
+void chat_receive(int who, const char *text);   /* net.c: player who (another PC's) said it */
+void chat_server(const char *text);   /* net.c: a server line ("Name entered the game") */
 int  chat_wrap(const char *s, int width, int *starts, int max);   /* line starts of s wrapped to width (HUD text); returns the count */
-int  net_chat_send(const char *text); /* net.c: to the other PC; 0 if there's nobody */
+int  net_chat_send(const char *text); /* net.c: to the other PCs; 0 if there's nobody */
 int  chat_muted(int who);             /* the F1 scoreboard muted that player's messages */
 void chat_set_muted(int who, int on);
 
@@ -332,6 +354,7 @@ void chat_set_muted(int who, int on);
 #define PLAYERS_CHOICE_MASK 0xffff0000u
 void char_menu_install(void);
 int  char_menu_open(void);     /* the F2 menu is up: this PC's player gets no input */
+void hud_textures_prepare(void);   /* net.c, before rollback starts: the HUD's textures made */
 u8  *hud_solid(u16 argb1555, const char *name);   /* an 8x8 texture of one color (kept until Oni exits) */
 void hud_rect(u8 *texture, int x, int y, int w, int h, u32 alpha);   /* stretched over the rectangle, from the HUD */
 void char_menu_frame(void);    /* every frame, after the update: keys and mouse */
@@ -344,12 +367,16 @@ void char_menu_tag(u32 count, void *actions); /* writes it into this PC's record
 void players_install(void);
 const u32 *players_begin_frame(void);         /* player 2's record for this frame, or 0 */
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
-void players_net_frame(const u32 (*records)[12], u32 n);   /* networked: tick i gets records[i] */
-u8  *players_p2(void);                        /* player 2's character, or 0 */
-u8  *players_char(int who);                   /* 0: Konoko, 1: player 2; or 0 */
-void players_note_hit(u8 *victim, u8 *attacker);   /* from TakeDamage, in a tick */
+/* Players in a game: slot 0 Konoko, 1..PLAYERS_MAX-1 the next Player-flagged placements */
+#define PLAYERS_MAX NET_PLAYERS_MAX
+void players_net_frame(const u32 (*records)[6][12], u32 n);   /* networked: slot s's tick i gets records[s][i] (slot 0 unused) */
+void players_set_count(u32 n);                /* players spawned at the next level load (2 by default) */
+u32  players_count(void);
+int  players_spawn_points(void);              /* the level's Player-flagged placements */
+u8  *players_char(int who);                   /* slot who's character, or 0 */
+void players_note_hit(u8 *victim, u8 *attacker, u32 owner);   /* from TakeDamage, in a tick */
 int  players_can_change(int who);            /* alive: an F2 choice applies at once */
-int  players_score(int who);                  /* 0: Konoko (player 1), 1: player 2 */
+int  players_score(int who);                  /* by slot */
 int  players_enabled(void);                   /* Arklite.ini [players] p2 isn't 0 */
 u32  players_respawn_ticks(void);             /* [multiplayer] respawn_delay, in ticks */
 void players_set_respawn_ticks(u32 ticks);    /* the network host's, on the joiner */
@@ -360,7 +387,8 @@ void players_tick_record(const u32 *record);  /* in the tick: Konoko's record (i
 void players_set_limits(int on, u32 ticks, int score);
 u32  players_over_tick(void);                 /* tick + 1 in which a limit was reached, 0: not over */
 int  players_time_left(void);                 /* ticks, -1: no time limit */
-int  players_winner(void);                    /* 0, 1, or -1 for a draw */
+int  players_winner(u32 mask);                /* the best of mask's players (a bit per slot), -1 for a draw */
+int  players_ranking(u32 mask, int *out);     /* mask's players, best first; returns how many */
 int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
 int  multiplayer_map(void);                   /* two or more Player-flagged characters (spawn points) */
 
@@ -374,6 +402,11 @@ void items_install(void);
 void items_tick(void);   /* in a multiplayer game's tick: taken items come back after a while */
 u32  items_default_ticks(void);             /* [multiplayer] item_respawn, in ticks */
 void items_set_default_ticks(u32 ticks);    /* the network host's, on the joiner */
+void items_player_respawned(const float *pos);   /* respawn_fx.c's particle, there */
+void respawn_fx_install(void);                 /* keeps level 0's classes the effect is made from */
+void respawn_fx_load(u32 level);               /* before a level's classes are set up */
+const char *respawn_fx_root(void);             /* the particle class a respawn fires */
+void items_stop_firing(void);               /* release every held trigger: the firing loop sounds end */
 
 /* ---- live_menu.c ------------------------------------------------------------------------- */
 
@@ -387,6 +420,7 @@ u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u
 
 /* ---- vertex_light.c ---------------------------------------------------------------------- */
 
+void bench_frame(void);           /* every frame: ARKLITE_BENCH timing (bench.c) */
 void vertex_light_frame(void);   /* every frame: animated corners of a custom level (vertexlight.bin) */
 
 /* ---- crash_log.c -------------------------------------------------------------------------- */

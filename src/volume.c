@@ -6,8 +6,12 @@
  * +0xc/+0x10 and their play id at +0. Play ids are tagged where the engine starts them:
  *   - Music: the main menu music (0x512798) and sound_music_start (0x5144de, the handler it
  *     shares with sound_ambient_start, so we wrap the sound_music_start registration).
- *   - Voice: character dialog, sound_dialog_play* (0x5141f6).
- *   - Sound: everything else (impulse sounds, ambients, level sound objects).
+ *   - Voice: scripted dialog, sound_dialog_play* (0x5141f6); the lines of g_scriptVoices, which
+ *     Bungie's scripts start with sound_ambient_start; and character speech: civilians,
+ *     neutral lines, gifts, chr_talk, vocalizations and taunts. Speech is positional: it goes
+ *     through OSrInGameDialog_Play (0x5125c0) to OSrAmbient_Start, which can start the play
+ *     later (0x512062) under a new id, so speech is told by its ambient (play +8), not its id.
+ *   - Sound: everything else (impulse sounds, pain, ambients, level sound objects).
  * A new play sets its first channel volume inside the start call, before it stores the
  * channel, so we also wrap the play update (0x480c20, 5 call sites) to know which play is
  * being updated.
@@ -32,6 +36,7 @@ enum { CAT_SOUND, CAT_MUSIC, CAT_VOICE, CAT_COUNT };
 #define SScPlaySize      0x58
 #define SSmPlay_ID(p)    (*(u32 *)(p))
 #define SSmPlay_State(p) (*(u32 *)((u8 *)(p) + 4))
+#define SSmPlay_Ambient(p) (*(void **)((u8 *)(p) + 8))
 #define SSmPlay_Chan1(p) (*(u8 **)((u8 *)(p) + 0xc))
 #define SSmPlay_Chan2(p) (*(u8 **)((u8 *)(p) + 0x10))
 /* Two channel pools, 0x10c bytes each; +0x3c = volume last computed by the engine */
@@ -55,9 +60,13 @@ enum { CAT_SOUND, CAT_MUSIC, CAT_VOICE, CAT_COUNT };
 #define SSrPlay_Update       ((u32 (ONI_FC *)(u8 *, u32))0x480c20)
 /* ECX ambient, EDX &volume; returns the play id or -1 */
 #define SSrAmbient_Start2D   ((u32 (ONI_FC *)(void *, float *))0x4823a0)
-/* Script handler shared by sound_music_start and sound_ambient_start (ret 0x10) */
+/* ECX ambient, EDX position, 4 optional pointers on the stack (ret 0x10) */
+#define OSrAmbient_Start     ((u32 (ONI_FC *)(void *, void *, void *, void *, void *, void *))0x511730)
+/* Script handler shared by sound_music_start and sound_ambient_start (ret 0x10): the third
+ * argument is the parameter array, {type, value} each, the sound's name the first value */
 #define SLrSound_AmbientStart ((u16 (ONI_FC *)(u32, u32, u32, u32, u32, u32))0x514410)
 #define SLcMusicStartPushAddr 0x512e60
+#define SLcAmbientStartPushAddr 0x513026
 /* Persisted Overall Volume, 0..1 */
 #define ONrPersist_GetOverallVolume ((float (ONI_FC *)(void))0x50f120)
 #define ONgPersist_OverallVolume    (*(float *)0x5ed380)
@@ -76,6 +85,7 @@ static const u32 g_movieVolumeCalls[] = {
 #define ONcMenuMusic_StartCall  0x512798
 #define ONcDialog_StartCall     0x5141f6
 #define SLcAmbient_StartCall    0x5144de
+#define ONcSpeech_AmbientStartCall 0x512630
 
 /* Options dialog */
 #define ONcOptions_Proc         0x4d25c0
@@ -164,7 +174,16 @@ static struct { u32 id; u8 cat; } g_tags[MAX_TAGS];   /* play ids are never reus
 static u32 g_ntags;
 static u8 *g_play;          /* play being updated by SSrPlay_Update */
 static int g_starting;      /* category of the play being started, CAT_SOUND if none */
-static int g_scriptMusic;   /* inside sound_music_start */
+static int g_scriptCat;     /* category of what sound_music_start or sound_ambient_start plays */
+
+/* Ambients played as speech: a line is live while its ambient is here, and a character says far
+ * fewer lines at once than this. Ambients are in level 0, so the pointers stay good. */
+#define MAX_SPEECH 64
+static void *g_speech[MAX_SPEECH];
+static u32 g_nspeech;
+
+/* Spoken lines that the level scripts start with sound_ambient_start */
+static const char *const g_scriptVoices[] = { "c00_01_98shinatama" };
 
 static void tag_play(u32 id, int cat)
 {
@@ -174,11 +193,21 @@ static void tag_play(u32 id, int cat)
 	g_ntags++;
 }
 
+static void speech_add(void *ambient)
+{
+	for (u32 i = 0; i < MAX_SPEECH && i < g_nspeech; i++)
+		if (g_speech[i] == ambient) return;
+	g_speech[g_nspeech++ % MAX_SPEECH] = ambient;
+}
+
 static int play_category(u8 *play)
 {
 	u32 id = SSmPlay_ID(play);
+	void *ambient = SSmPlay_Ambient(play);
 	for (u32 i = 0; i < MAX_TAGS && i < g_ntags; i++)
 		if (g_tags[i].id == id) return g_tags[i].cat;
+	for (u32 i = 0; i < MAX_SPEECH && i < g_nspeech; i++)
+		if (g_speech[i] == ambient) return CAT_VOICE;
 	return CAT_SOUND;
 }
 
@@ -248,16 +277,34 @@ static u32 ONI_FC menu_music_start(void *ambient, float *volume) { return start_
 static u32 ONI_FC dialog_start(void *ambient, float *volume)     { return start_tagged(ambient, volume, CAT_VOICE); }
 static u32 ONI_FC script_ambient_start(void *ambient, float *volume)
 {
-	return start_tagged(ambient, volume, g_scriptMusic ? CAT_MUSIC : CAT_SOUND);
+	return start_tagged(ambient, volume, g_scriptCat);
+}
+
+static u32 ONI_FC speech_start(void *ambient, void *position, void *a, void *b, void *c, void *d)
+{
+	speech_add(ambient);
+	return OSrAmbient_Start(ambient, position, a, b, c, d);
 }
 
 static u16 ONI_FC sound_music_start(u32 ecx, u32 edx, u32 a, u32 b, u32 c, u32 d)
 {
 	u16 result;
 
-	g_scriptMusic = 1;
+	g_scriptCat = CAT_MUSIC;
 	result = SLrSound_AmbientStart(ecx, edx, a, b, c, d);
-	g_scriptMusic = 0;
+	g_scriptCat = CAT_SOUND;
+	return result;
+}
+
+static u16 ONI_FC sound_ambient_start(u32 ecx, u32 edx, u32 a, u32 b, u32 c, u32 d)
+{
+	const char *name = ((const char **)a)[1];
+	u16 result;
+
+	for (unsigned i = 0; name && i < sizeof g_scriptVoices / sizeof g_scriptVoices[0]; i++)
+		if (str_ieq_n(name, g_scriptVoices[i], 32)) g_scriptCat = CAT_VOICE;
+	result = SLrSound_AmbientStart(ecx, edx, a, b, c, d);
+	g_scriptCat = CAT_SOUND;
 	return result;
 }
 
@@ -425,9 +472,11 @@ void volume_install(void)
 	n += patch_call(ONcMenuMusic_StartCall, (u32)SSrAmbient_Start2D, (u32)menu_music_start);
 	n += patch_call(ONcDialog_StartCall, (u32)SSrAmbient_Start2D, (u32)dialog_start);
 	n += patch_call(SLcAmbient_StartCall, (u32)SSrAmbient_Start2D, (u32)script_ambient_start);
+	n += patch_call(ONcSpeech_AmbientStartCall, (u32)OSrAmbient_Start, (u32)speech_start);
 	n += patch_push_imm32(SLcMusicStartPushAddr, (u32)SLrSound_AmbientStart, (u32)sound_music_start);
+	n += patch_push_imm32(SLcAmbientStartPushAddr, (u32)SLrSound_AmbientStart, (u32)sound_ambient_start);
 	n += patch_push_imm32(ONcOptions_ProcPushAddr, ONcOptions_Proc, (u32)options_proc);
 	n += patch_call(WMcSlider_MouseCall, (u32)WMrSlider_Mouse, (u32)slider_mouse);
-	total += 7;
+	total += 9;
 	log_msg("volume: %d of %d patches applied (settings in %s)", n, total, ini_path());
 }
