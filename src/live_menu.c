@@ -189,8 +189,9 @@ static int console_for_this_pc(u8 *who)
 
 	net_hud(&h);
 	if (!who || h.state != NETHUD_MATCH) return 1;
-	if (who != players_char(0) && who != players_char(1)) return 1;   /* an AI's: everyone's, as before */
-	return who == players_char(h.local_player);
+	for (int s = 0; s < PLAYERS_MAX; s++)
+		if (who == players_char(s)) return s == h.local_char;
+	return 1;   /* an AI's: everyone's, as before */
 }
 
 static u16 ONI_FC fire_events(void *events, u8 *who)
@@ -212,6 +213,7 @@ static void main_loop_sound(void)
 	char_menu_frame();
 	chat_frame();
 	vertex_light_frame();
+	bench_frame();
 	if (g_pending) {
 		g_pending = 0;
 		g_menu_level = ONrLevel_GetCurrent();

@@ -194,9 +194,10 @@ static void report(void)
 	u32 totals[5] = { 0 };
 	char buf[300];
 
-	g_out = CreateFileA("Arklite-memsurvey.txt", 0x40000000, 1, 0, 2, 0x80, 0);
+	char path[MAX_PATH];
+	g_out = log_file_create("Arklite-memsurvey.txt", path);
 	if (g_out == INVALID_HANDLE_VALUE) {
-		log_msg("memsurvey: can't create Arklite-memsurvey.txt");
+		log_msg("memsurvey: can't create %s", path);
 		return;
 	}
 	g_nheaps = GetProcessHeaps(MAX_HEAPS, g_heaps);
@@ -302,8 +303,10 @@ void rollback_tick_end(void)
  * positions, buffer pointers), and putting those back under it crashed its mixer. So every
  * RB_WATCH_EVERY ticks (every tick for the first RB_WATCH_FIRST), between ticks, the known
  * pages are made PAGE_NOACCESS until the next tick: the main thread (drawing) touching one only
- * opens it again, another thread touching one makes it shared, and shared pages are never
- * copied, put back or compared again.
+ * opens it again, another thread touching one makes it shared, and a shared page is put back
+ * only in the dwords ticks were seen changing (tmask: its slot against the tick's end) and
+ * never seen changing between ticks (omask: the tick's end against the next tick's start).
+ * SS2's own state (rb_add_excl) is never put back.
  *
  * Locks: a critical section that another thread holds must never be put back (a restore that
  * brought back the sound thread's ownership of one left the game waiting forever). Restores and
@@ -352,11 +355,11 @@ void rollback_tick_end(void)
 #define PF_PROT          4                /* write-protected now */
 #define PF_EXEC          8                /* executable (restore EXECUTE_READWRITE) */
 #define PF_WATCH         16               /* PAGE_NOACCESS between ticks, to catch other threads */
-#define PF_SHARED        32               /* known, but another thread uses it: put back only where ticks alone write (omask) */
-#define RB_LEARN         60               /* ticks a shared page is watched before it's put back */
+#define PF_SHARED        32               /* known, but another thread uses it: put back only where ticks alone write (tmask, omask) */
 #define RB_MAX_EXCL      1024             /* ranges never put back (SS2's sound state, open ACM streams) */
 #define RB_MAX_NOTES     48               /* pages that became shared, logged from the main thread */
 #define RB_WATCH_EVERY   10
+#define RB_MAX_DROPPED   1024             /* pages dropped as another heap's, kept for rollback checks */
 #define RB_WATCH_FIRST   120
 
 typedef struct {
@@ -398,13 +401,15 @@ typedef struct {
 	Region *regs;
 	u32 nregs;
 	u32 oni[RB_MAX_ONI], noni;     /* allocation bases of Oni's runtime memory */
+	u32 oni_span[RB_MAX_ONI];      /* and each one's size, reserved part included (rb_span) */
 	u32 samples_wanted, samples_done, next_sample, total_bad, ticks_protected, last_runs, nshared;
 	u32 fault_page, fault_tid, fault_repeat, forced;   /* a fault that keeps coming back */
 	volatile u32 body_serial, in_fault;   /* rb_watchdog: ticks begun; the main thread is in rb_fault */
 	volatile long learn_lock;      /* rb_learn from the main thread, another thread and the watchdog */
 	u8 *omask;                     /* by place in pages[]: 128 bytes, the dwords seen changing between ticks */
+	u8 *tmask;                     /* by place in pages[]: 128 bytes, the dwords seen changing in a tick */
 	u8 *endc;                      /* by place in pages[]: shared pages as the last tick ended */
-	u16 learn[RB_MAX_PAGES];       /* ticks a shared page has been watched (RB_LEARN: put back from then on) */
+	u8 endc_have[RB_MAX_PAGES];    /* endc holds this page (it was shared when the last tick ended) */
 	u32 endc_ok;                   /* endc holds the last tick's end (no restore since) */
 	u32 amb_lo[RB_SLOTS], amb_hi[RB_SLOTS];   /* SS2 ambient play ids the slot's tick started: (lo, hi] */
 	u32 ex_lo[RB_MAX_EXCL], ex_hi[RB_MAX_EXCL], nex;
@@ -413,6 +418,11 @@ typedef struct {
 	u32 acm_hits, acm_logs;        /* rb_acm_guard: ACM memory found in known pages */
 	u32 grow, grown, grow_logs;    /* rb_grow: Oni took memory the snapshots don't cover; pages added; logged */
 	u32 freed, freed_logs;         /* rb_forget: pages of allocations Oni gave back */
+	u32 reused, heap_pages, heap_logs, heap_walked;   /* rb_check_allocs, rb_heaps_guard */
+	u32 dropped[RB_MAX_DROPPED], ndropped;            /* rb_heaps_guard's pages, for rollback checks */
+	u8 *vpages, *vdropped;         /* rollback checks: known pages and dropped pages after the first re-run */
+	u32 vn, vnd, vchecks, vbad, vlogs;
+	HANDLE vout;
 	u32 plist_logs, plist_cuts;    /* rb_particles_check */
 	u32 stack_top, rescues, rescue_learned;
 	HANDLE main_thread;
@@ -440,6 +450,18 @@ static int page_writable(u32 p)
 	return VirtualQuery((const void *)(p << PAGE_SHIFT), &m, sizeof m) == sizeof m && writable(&m);
 }
 
+/* The size of the allocation at base, its reserved pages included: it never changes while the
+ * allocation lives, so a different one means it was freed and the address handed out again */
+static u32 rb_span(u32 base)
+{
+	MEMORY_BASIC_INFORMATION m;
+	u32 a = base;
+	while (a < 0x7ff00000u && VirtualQuery((const void *)a, &m, sizeof m) == sizeof m && (u32)m.AllocationBase == base &&
+	       m.State != 0x10000 /* MEM_FREE */ && m.RegionSize)
+		a = (u32)m.BaseAddress + m.RegionSize;
+	return a - base;
+}
+
 static void rb_add_oni(const void *a)
 {
 	MEMORY_BASIC_INFORMATION m;
@@ -447,7 +469,10 @@ static void rb_add_oni(const void *a)
 	if (!a || VirtualQuery(a, &m, sizeof m) != sizeof m || m.State != MEM_COMMIT) return;
 	base = (u32)m.AllocationBase;
 	while (k < g_e->noni && g_e->oni[k] != base) k++;
-	if (k == g_e->noni && g_e->noni < RB_MAX_ONI) g_e->oni[g_e->noni++] = base;
+	if (k == g_e->noni && g_e->noni < RB_MAX_ONI) {
+		g_e->oni_span[g_e->noni] = rb_span(base);
+		g_e->oni[g_e->noni++] = base;
+	}
 }
 
 /* The allocations Oni's C runtime made */
@@ -533,8 +558,9 @@ static void rb_learn(u32 p)
 {
 	Engine *e = g_e;
 	u32 i = e->npages++;
-	e->learn[i] = 0;
+	e->endc_have[i] = 0;
 	memset(e->omask + i * 128, 0, 128);
+	memset(e->tmask + i * 128, 0, 128);
 	for (u32 s = 0; s < RB_SLOTS; s++)   /* not written in a tick since any of them */
 		if (e->slot_valid[s]) memcpy(slot_page(s, i), (const void *)(p << PAGE_SHIFT), 0x1000);
 	e->pages[i] = p;
@@ -683,6 +709,8 @@ static void rb_start(void)
 	e->nnotes = e->notes_logged = 0;
 	e->amb_stopped = e->acm_hits = e->acm_logs = 0;
 	e->grow = e->grown = e->grow_logs = e->plist_logs = e->plist_cuts = e->freed = e->freed_logs = 0;
+	e->reused = e->heap_pages = e->heap_logs = e->heap_walked = e->ndropped = 0;
+	e->vchecks = e->vbad = e->vlogs = 0;
 	e->main_tid = GetCurrentThreadId();
 	if (!e->main_thread) e->main_thread = OpenThread(0x1fffff /* THREAD_ALL_ACCESS */, 0, e->main_tid);
 	__asm__ volatile("movl %%fs:4, %0" : "=r"(e->stack_top));
@@ -699,9 +727,12 @@ static void rb_reset(const char *why)
 	rb_unwatch();
 	if (g_e->nruns) rb_unprotect();
 	log_msg("rollback: snapshots off (%s); %d pages were known, %d KB taken during the match followed, %d KB given back "
-	        "dropped, %d broken particle lists cut, ACM memory in known pages %d times", why, g_e->npages, g_e->grown * 4, g_e->freed * 4,
-	        g_e->plist_cuts, g_e->acm_hits);
+	        "dropped, %d broken particle lists cut, ACM memory in known pages %d times, %d freed addresses taken again, %d KB of "
+	        "other heaps dropped", why, g_e->npages, g_e->grown * 4, g_e->freed * 4, g_e->plist_cuts, g_e->acm_hits, g_e->reused,
+	        g_e->heap_pages * 4);
 	g_e->active = 0;
+	if (g_e->vout && g_e->vout != INVALID_HANDLE_VALUE) CloseHandle(g_e->vout);
+	g_e->vout = 0;
 }
 
 static void rb_snapshot(u32 tick, const void *action)
@@ -709,15 +740,17 @@ static void rb_snapshot(u32 tick, const void *action)
 	Engine *e = g_e;
 	u32 s = tick % RB_SLOTS;
 
-	/* shared pages: the dwords that changed since the last tick ended weren't the ticks' */
+	/* shared pages: the dwords that changed since the last tick ended weren't the ticks'. Only
+	 * pages endc holds: one that became shared between ticks (the sound thread touching it while
+	 * watched) has no copy from then, and comparing with whatever was there marked most of it as
+	 * not the ticks', so a rollback never put it back (the taunt-spam desync) */
 	for (u32 i = 0; e->endc_ok && i < e->npages; i++) {
 		u32 p = e->pages[i];
-		if (!(e->flag[p] & PF_SHARED) || !page_writable(p)) continue;
+		if (!(e->flag[p] & PF_SHARED) || !e->endc_have[i] || !page_writable(p)) continue;
 		const u32 *now = (const u32 *)(p << PAGE_SHIFT), *was = (const u32 *)(e->endc + i * 0x1000);
 		u8 *m = e->omask + i * 128;
 		for (u32 k = 0; k < 1024; k++)
 			if (now[k] != was[k]) m[k >> 3] |= (u8)(1 << (k & 7));
-		if (e->learn[i] < 0xffff) e->learn[i]++;
 	}
 	for (u32 i = 0; i < e->npages; i++)
 		if ((e->flag[e->pages[i]] & PF_CAND) && page_writable(e->pages[i]))
@@ -754,6 +787,30 @@ static void rb_rd_forget(void)
 	memset(g_rd_hi, 0, sizeof g_rd_hi);
 }
 
+/* Memory that drawing owns inside the game's pages, never put back: Arklite's HUD textures
+ * (char_menu.c). A TXMP keeps its size, its pixels pointer and its GL texture name (+0x9c) in
+ * the struct, in Oni's dynamic instance file; a rewind that put back the page under one gave it
+ * the old values, or another texture's. Here, not in the engine: they're made before it is. */
+static u32 g_keep_lo[256], g_keep_hi[256], g_nkeep;
+
+void rollback_keep(const void *p, u32 n)
+{
+	if (g_nkeep < 256 && p && n) {
+		g_keep_lo[g_nkeep] = (u32)p;
+		g_keep_hi[g_nkeep++] = (u32)p + n;
+	}
+}
+
+static void rb_keep_mask(u32 p)
+{
+	u32 a = p << PAGE_SHIFT;
+	for (u32 x = 0; x < g_nkeep; x++) {
+		if (g_keep_hi[x] <= a || g_keep_lo[x] >= a + 0x1000) continue;
+		u32 lo = g_keep_lo[x] > a ? (g_keep_lo[x] - a) / 4 : 0, hi = g_keep_hi[x] < a + 0x1000 ? (g_keep_hi[x] - a + 3) / 4 : 1024;
+		for (u32 k = lo; k < hi; k++) g_e->mask[k] = 1;
+	}
+}
+
 /* g_e->mask[k] = 1 for the dwords of the page that belong to a live critical section: its
  * DebugInfo (+0) points to a debug record whose CriticalSection field (+4) points back */
 static void rb_lock_mask(u32 p)
@@ -775,6 +832,7 @@ static void rb_lock_mask(u32 p)
 		if (*(const u16 *)d != 0) continue;   /* debug record Type: RTL_CRITSECT_TYPE */
 		for (u32 n = k; n < k + 6 && n < 1024; n++) g_e->mask[n] = 1;   /* 24 bytes */
 	}
+	rb_keep_mask(p);
 }
 
 static void rb_restore_page(u32 i, const u8 *from)
@@ -784,10 +842,10 @@ static void rb_restore_page(u32 i, const u8 *from)
 	u32 *page = (u32 *)a;
 	const u32 *src = (const u32 *)from;
 	rb_lock_mask(p);
-	if (e->flag[p] & PF_SHARED) {
-		const u8 *m = e->omask + i * 128;
+	if (e->flag[p] & PF_SHARED) {   /* only what ticks alone wrote */
+		const u8 *m = e->omask + i * 128, *t = e->tmask + i * 128;
 		for (u32 k = 0; k < 1024; k++)
-			if (m[k >> 3] & (1 << (k & 7))) e->mask[k] = 1;
+			if ((m[k >> 3] & (1 << (k & 7))) || !(t[k >> 3] & (1 << (k & 7)))) e->mask[k] = 1;
 	}
 	for (u32 x = 0; x < e->nex; x++) {   /* SS2's sound state */
 		if (e->ex_hi[x] <= a || e->ex_lo[x] >= a + 0x1000) continue;
@@ -802,8 +860,12 @@ static void rb_restore(u32 slot)
 {
 	Engine *e = g_e;
 	rb_rd_forget();
+	/* a page as it was needs nothing put back: most known pages don't change from one tick to the
+	 * next, and the per-page work (live locks, masks) on all of them made a rollback cost 14 ms
+	 * late in a match on the Windows joiner, one per tick while the host turned the camera */
 	for (u32 i = 0; i < e->npages; i++)
-		if (rb_kept(e->pages[i])) rb_restore_page(i, slot_page(slot, i));
+		if (rb_kept(e->pages[i]) && memcmp_pages((const u8 *)(e->pages[i] << PAGE_SHIFT), slot_page(slot, i)))
+			rb_restore_page(i, slot_page(slot, i));
 	e->endc_ok = 0;
 }
 
@@ -883,12 +945,15 @@ static void rb_unwatch(void)
 	}
 }
 
-/* A known page that is copied, put back and compared */
+/* A known page that is copied, put back and compared. A shared page is put back from the
+ * start, but only in the dwords ticks were seen changing and never seen changing between ticks
+ * (rb_restore_page): it used to wait 60 ticks of watching first, and a rollback in those ticks
+ * (one comes every few ticks with the other player's keys) left the page in the future. */
 static int rb_kept(u32 p)
 {
 	Engine *e = g_e;
 	if (!(e->flag[p] & PF_CAND)) return 0;   /* Oni freed it (rb_forget) */
-	if ((e->flag[p] & PF_SHARED) && (!e->index[p] || e->learn[e->index[p] - 1] < RB_LEARN)) return 0;
+	if ((e->flag[p] & PF_SHARED) && !e->index[p]) return 0;
 	return page_writable(p);
 }
 
@@ -960,7 +1025,9 @@ static void rb_forget(u32 base)
 	u32 k = 0, n = 0;
 	while (k < e->noni && e->oni[k] != base) k++;
 	if (k == e->noni) return;
-	e->oni[k] = e->oni[--e->noni];
+	e->noni--;
+	e->oni[k] = e->oni[e->noni];
+	e->oni_span[k] = e->oni_span[e->noni];
 	for (u32 i = 0; i < e->nregs; i++) {
 		Region *r = &e->regs[i];
 		if (r->alloc != base || !r->size) continue;
@@ -1015,12 +1082,24 @@ static int WINAPI rb_virtual_free(void *p, u32 n, u32 type)
 	return r;
 }
 
-/* Allocations another thread freed, or freed in ways not seen above */
+/* Allocations another thread freed, or freed in ways not seen above (the free hooks only act
+ * on the main thread). One whose address was taken again by the time of this check (same base,
+ * another size: under Wine a piece of its process heap) is dropped too: kept, its pages would be
+ * put back over the new owner's */
 static void rb_check_allocs(void)
 {
 	Engine *e = g_e;
-	for (u32 k = e->noni; k-- > 0; )
-		if (!rb_alloc_alive(e->oni[k])) rb_forget(e->oni[k]);
+	for (u32 k = e->noni; k-- > 0; ) {
+		u32 base = e->oni[k], span;
+		if (!rb_alloc_alive(base)) {
+			rb_forget(base);
+		} else if ((span = rb_span(base)) != e->oni_span[k]) {
+			if (e->reused++ < 8)
+				log_msg("rollback: tick %d: Oni's allocation at %08x was freed and its address taken again (%d KB, was %d KB); "
+				        "out of the snapshots", e->last_tick, base, span / 1024, e->oni_span[k] / 1024);
+			rb_forget(base);
+		}
+	}
 }
 
 static void rb_hook_iat(u32 slot, const u8 *site, void *hook, void **orig)
@@ -1065,9 +1144,9 @@ static void rb_grow(void)
 			if (!writable(&m) || m.Type == MEM_MAPPED) continue;
 			u32 p = (u32)m.BaseAddress >> PAGE_SHIFT, end = p + (m.RegionSize >> PAGE_SHIFT);
 			while (p < end) {
-				while (p < end && (e->flag[p] & PF_CAND)) p++;
+				while (p < end && (e->flag[p] & (PF_CAND | PF_FOREIGN))) p++;
 				u32 q = p;
-				while (q < end && !(e->flag[q] & PF_CAND)) q++;
+				while (q < end && !(e->flag[q] & (PF_CAND | PF_FOREIGN))) q++;
 				if (q > p && e->nregs < MAX_REGIONS) {
 					Region *r = &e->regs[e->nregs++];
 					r->base = p << PAGE_SHIFT;
@@ -1087,6 +1166,66 @@ static void rb_grow(void)
 	if (added && e->grow_logs++ < 8)
 		log_msg("rollback: tick %d: Oni took %d KB more (from %08x); in the snapshots now (%d KB since the match began)",
 		        e->last_tick, added * 4, first, e->grown * 4);
+}
+
+/* Every page of a heap that isn't Oni's C runtime heap (the process heap, msacm32's, a driver's)
+ * leaves the snapshots for good. Such a page can only be a candidate through an address Oni
+ * freed and the system reused, and putting it back rewinds that heap's own bookkeeping: under
+ * Wine a one-shot sound opening its ACM stream (0x484b70 -> acmStreamOpen) then faulted in the
+ * process heap (the Linux host's crash after a mortar hit, and its freeze at tick 7735). Walks
+ * every heap: at the first tick, after Oni took memory, and once a second. */
+#define PROCESS_HEAP_REGION 1
+
+static void rb_heap_range(HANDLE h, u32 lo, u32 n, const char *kind)
+{
+	Engine *e = g_e;
+	u32 dropped = 0, first = 0, known = 0;
+	if (!n) n = 1;
+	for (u32 p = lo >> PAGE_SHIFT; p <= (lo + n - 1) >> PAGE_SHIFT && p < PAGES; p++) {
+		if (!(e->flag[p] & PF_CAND)) continue;
+		if (e->index[p]) known++;
+		e->flag[p] = PF_FOREIGN;   /* not a candidate, and never protected (rb_protect skips it) */
+		if (e->ndropped < RB_MAX_DROPPED) e->dropped[e->ndropped++] = p;
+		if (!dropped++) first = p << PAGE_SHIFT;
+	}
+	e->heap_pages += dropped;
+	if (dropped && e->heap_logs++ < 8) {
+		/* whose allocation the page is in, and whether Oni's runtime made it: a page of one of
+		 * Oni's live allocations that another heap's walk claims is game memory left in the future */
+		MEMORY_BASIC_INFORMATION m;
+		u32 base = VirtualQuery((const void *)first, &m, sizeof m) == sizeof m ? (u32)m.AllocationBase : 0, k = 0;
+		while (k < e->noni && e->oni[k] != base) k++;
+		log_msg("rollback: tick %d: %d snapshot page(s) from %08x (%d already written in ticks) belong to heap %08x (%s "
+		        "%08x, %d KB; allocation %08x, %s), not Oni's; out of the snapshots", e->last_tick, dropped, first, known,
+		        (u32)h, kind, lo, n / 1024, base, k < e->noni ? "one of Oni's" : "not one of Oni's");
+	}
+}
+
+static void rb_heaps_guard(void)
+{
+	Engine *e = g_e;
+	HANDLE heaps[MAX_HEAPS], crt = ONgCrtHeap;
+	u32 n = GetProcessHeaps(MAX_HEAPS, heaps), walked = 0;
+	if (n > MAX_HEAPS) n = MAX_HEAPS;
+	for (u32 i = 0; i < n; i++) {
+		PROCESS_HEAP_ENTRY en;
+		u32 rlo = 0, rhi = 0;
+		if (!heaps[i] || heaps[i] == crt) continue;
+		en.lpData = 0;
+		while (HeapWalk(heaps[i], &en)) {
+			u32 a = (u32)en.lpData;
+			walked++;
+			if (en.wFlags & PROCESS_HEAP_REGION) {   /* a whole segment: its blocks need no look */
+				rlo = a;
+				rhi = a + en.more[0] + en.more[1];
+				rb_heap_range(heaps[i], rlo, rhi - rlo, "segment");
+			} else if (a < rlo || a >= rhi) {        /* a large block, outside every segment */
+				rb_heap_range(heaps[i], a, en.cbData + en.cbOverhead, "large block");
+			}
+		}
+	}
+	if (!e->heap_walked) log_msg("rollback: guarding against other heaps: %d heaps, %d entries walked", n, walked);
+	e->heap_walked = walked;
 }
 
 /* ---- Particle lists ------------------------------------------------------------------------ *
@@ -1298,7 +1437,8 @@ static void rb_rewind_test(u32 tick, void (*body)(void *))
 	for (u32 t = back; t <= tick; t++)
 		if (!e->slot_valid[t % RB_SLOTS] || e->slot_tick[t % RB_SLOTS] != t) return;   /* not kept yet */
 	if (e->out == INVALID_HANDLE_VALUE || !e->out) {
-		e->out = g_out = CreateFileA("Arklite-rollbacktest.txt", 0x40000000, 1, 0, 2, 0x80, 0);
+		char path[MAX_PATH];
+		e->out = g_out = log_file_create("Arklite-rollbacktest.txt", path);
 		out("Arklite rollback test: each sample puts the game back %d ticks, runs them again with their", RB_BACK);
 		out("inputs and compares every known page with the first time. Oni's C runtime heap: 0x%08x.", (u32)ONgCrtHeap);
 	}
@@ -1373,7 +1513,11 @@ int rollback_test_tick(void *action, void (*body)(void *))
 		e->next_sample = tick + 60;
 	}
 	rb_check_allocs();
-	if (e->grow) rb_grow();
+	{
+		u32 grew = e->grow;
+		if (grew) rb_grow();
+		if (grew || !e->heap_walked || !(e->ticks_protected % 60)) rb_heaps_guard();
+	}
 	rb_particles_check(tick);
 	rb_snapshot(tick, action);
 	if (e->samples_done < e->samples_wanted && tick >= e->next_sample) {
@@ -1389,9 +1533,19 @@ int rollback_test_tick(void *action, void (*body)(void *))
 	e->in_body = 0;
 	e->amb_hi[e->cur] = SSgAmbientNextId;
 	rb_unprotect();
-	for (u32 i = 0; i < e->npages; i++)
-		if ((e->flag[e->pages[i]] & PF_SHARED) && page_writable(e->pages[i]))
-			memcpy(e->endc + i * 0x1000, (const void *)(e->pages[i] << PAGE_SHIFT), 0x1000);
+	/* shared pages: what this tick changed (from its start, in its slot), and the end for the
+	 * next tick's start to compare with */
+	for (u32 i = 0; i < e->npages; i++) {
+		u32 p = e->pages[i];
+		e->endc_have[i] = 0;
+		if (!(e->flag[p] & PF_SHARED) || !page_writable(p)) continue;
+		const u32 *now = (const u32 *)(p << PAGE_SHIFT), *was = (const u32 *)slot_page(e->cur, i);
+		u8 *t = e->tmask + i * 128;
+		for (u32 k = 0; k < 1024; k++)
+			if (now[k] != was[k]) t[k >> 3] |= (u8)(1 << (k & 7));
+		memcpy(e->endc + i * 0x1000, now, 0x1000);
+		e->endc_have[i] = 1;
+	}
 	e->endc_ok = 1;
 	while (e->notes_logged < e->nnotes) {
 		u32 k = e->notes_logged++;
@@ -1540,8 +1694,9 @@ static int rb_alloc(void)
 	g_e->gimg = alloc_own(RB_MAX_CHARS * NET_CHAR_IMAGE_SIZE);
 	g_e->gnow = alloc_own(NET_CHAR_IMAGE_SIZE);
 	g_e->omask = alloc_own(RB_MAX_PAGES * 128);
+	g_e->tmask = alloc_own(RB_MAX_PAGES * 128);
 	g_e->endc = alloc_own(RB_MAX_PAGES * 0x1000);
-	if (!g_e->flag || !g_e->index || !g_e->regs || !g_e->gimg || !g_e->gnow || !g_e->omask || !g_e->endc) return 0;
+	if (!g_e->flag || !g_e->index || !g_e->regs || !g_e->gimg || !g_e->gnow || !g_e->omask || !g_e->tmask || !g_e->endc) return 0;
 	for (u32 s = 0; s < RB_SLOTS; s++)
 		if (!(g_e->slot[s] = alloc_own(RB_MAX_PAGES * 0x1000))) return 0;
 	CreateThread(0, 0x10000, rb_watchdog, 0, 0, 0);
@@ -1690,13 +1845,14 @@ static void rb_sound_before_restore(u32 tick)
 
 u32 rollback_ambients_stopped(void) { return g_e ? g_e->amb_stopped : 0; }
 
-/* One-shot sounds off (0) while ticks run again, on (1) after: SS2's impulse players
- * (0x47ff50, 0x480440, 0x480560) read Arklite's zero byte in place of the "sound driver" byte
- * *0x5eb757, which ambients (and stopping them) still read. 0x480440's read is lockstep.c's
- * sound seed call when that's in (the patch below then skips it), muted with
- * lockstep_impulses_mute. */
+/* One-shot sounds while ticks run again (0), as usual after (1): lockstep.c's impulse_play then
+ * plays only the ones the ticks' first runs didn't. Without it, SS2's impulse players 0x480443
+ * (0x480440's driver test) and 0x480560 read Arklite's zero byte in place of the "sound driver"
+ * byte *0x5eb757 (0x480443 is lockstep.c's sound seed call when that's in, which the patch then
+ * skips). Not 0x47ff50: ambients start their channels there (0x480c20 states 3 and 5), so the
+ * ambients and speech lines (taunts) the re-run ticks start played silently. */
 static const u8 g_zero_byte;
-static const u32 g_impulse_sites[] = { 0x47ff50, 0x480443, 0x480560 };
+static const u32 g_impulse_sites[] = { 0x480443, 0x480560 };
 
 void rollback_impulses(int on)
 {
@@ -1704,12 +1860,12 @@ void rollback_impulses(int on)
 	u8 want[5] = { 0xa0 }, now[5] = { 0xa0 };
 	u32 to = on ? 0x5eb757 : (u32)&g_zero_byte, from = on ? (u32)&g_zero_byte : 0x5eb757;
 	if (muted == !on) return;
-	lockstep_impulses_mute(!on);
+	muted = !on;
+	if (lockstep_impulses_mute(!on)) return;
 	memcpy(now + 1, &from, 4);
 	memcpy(want + 1, &to, 4);
 	for (u32 i = 0; i < sizeof g_impulse_sites / sizeof g_impulse_sites[0]; i++)
 		if (code_matches(g_impulse_sites[i], now, 5)) patch_write(g_impulse_sites[i], want, 5);
-	muted = !on;
 }
 
 /* Put the game back to the start of tick, if it's still kept: 1 done, 0 not kept */
@@ -1722,6 +1878,7 @@ int rollback_restore_tick(u32 tick)
 	 * time that passed and run them once more, so each rollback pushed this PC's clock ahead */
 	u32 base = GS_TIME_BASE(ONgGameState);
 	rb_unwatch();
+	rb_check_allocs();   /* memory another thread freed since this tick began: not put back */
 	/* the sound thread waits until the restore is done: it reads memory being put back */
 	u8 *lock = SSgLock;
 	if (lock) SSrLock(lock);
@@ -1734,6 +1891,99 @@ int rollback_restore_tick(u32 tick)
 }
 
 u32 rollback_known_pages(void) { return g_e && g_e->active ? g_e->npages : 0; }
+
+/* ---- Checking rollbacks in a match (net.c) ------------------------------------------------ *
+ * A rollback puts back a tick's start and runs the ticks again with the inputs that came in.
+ * Memory it doesn't put back stays as the guessed run left it, and if the ticks read it this
+ * PC's game comes out differently from the others' (the 2026-10-29 desync: player 1's z a few
+ * float steps off, after the joiner's 210 rollbacks of player 1's input). The rewind test runs
+ * ticks again with the same inputs, so it can't see such memory. So some rollbacks are checked
+ * in the match: after the re-run, the characters, both RNGs, every known page and the pages
+ * dropped as another heap's are kept (rollback_check_begin); net.c puts the same tick back and
+ * runs the same ticks with the same inputs once more; rollback_check_end compares. Both runs
+ * had the right inputs, so a character that differs is game state a rollback leaves behind.
+ * Each check that differs goes to logs\Arklite-rollbackcheck_<date>_<time>.txt: the character
+ * fields, then the known pages that differ (first dword, Oni.exe globals pointing near) and the
+ * dropped pages that differ. Some page differences are expected: ambient sounds' play ids (a
+ * rollback stops the ambients its ticks started; the next run starts them with new ids). A
+ * game-state difference with no page listed means memory outside the snapshots (another heap,
+ * Daodan, Arklite outside .tstate). */
+int rollback_check_begin(void)
+{
+	Engine *e = g_e;
+	if (!e || !e->active) return 0;
+	if (!e->vpages) e->vpages = alloc_own(RB_MAX_PAGES * 0x1000);
+	if (!e->vdropped) e->vdropped = alloc_own(RB_MAX_DROPPED * 0x1000);
+	if (!e->vpages || !e->vdropped) return 0;
+	rb_unwatch();
+	rb_rd_forget();
+	rb_game_capture();
+	e->vn = e->npages;
+	for (u32 i = 0; i < e->vn; i++)
+		if (rb_kept(e->pages[i])) memcpy(e->vpages + i * 0x1000, (const void *)(e->pages[i] << PAGE_SHIFT), 0x1000);
+	e->vnd = e->ndropped;
+	for (u32 i = 0; i < e->vnd; i++)
+		if (rb_readable(e->dropped[i] << PAGE_SHIFT))
+			memcpy(e->vdropped + i * 0x1000, (const void *)(e->dropped[i] << PAGE_SHIFT), 0x1000);
+	return 1;
+}
+
+/* After the second run: 1 if the game state came out the same, 0 if not. what: the rollback */
+int rollback_check_end(const char *what)
+{
+	Engine *e = g_e;
+	HANDLE was = g_out;
+	u32 game_bad, pages_bad = 0, dropped_bad = 0, shown = 0;
+	if (!e || !e->active || !e->vpages) return 1;
+	rb_unwatch();
+	rb_rd_forget();
+	e->vchecks++;
+	if (!e->vout || e->vout == INVALID_HANDLE_VALUE) {
+		char path[MAX_PATH];
+		e->vout = log_file_create("Arklite-rollbackcheck.txt", path);
+		g_out = e->vout;
+		out("Arklite rollback check: a rollback's ticks run once more with the same inputs; the two runs compared.");
+		out("A character that differs is game state a rollback leaves behind. 'first time' = the rollback's run,");
+		out("'re-run' = the check's run. Expected page noise: ambient sounds' play ids.");
+	}
+	g_out = e->vout;
+	out("");
+	out("check %d: %s", e->vchecks, what);
+	game_bad = rb_game_compare();
+	for (u32 i = 0; i < e->vn; i++) {
+		u32 p = e->pages[i];
+		if (!rb_kept(p) || !rb_page_differs(p, e->vpages + i * 0x1000)) continue;
+		pages_bad++;
+		if (shown++ < 24) rb_out_diff(p, e->vpages + i * 0x1000);
+	}
+	for (u32 i = 0; i < e->vnd; i++) {
+		u32 a = e->dropped[i] << PAGE_SHIFT, k = 0;
+		const u32 *now = (const u32 *)a, *want = (const u32 *)(e->vdropped + i * 0x1000);
+		if (!rb_readable(a) || !memcmp_pages((const u8 *)now, (const u8 *)want)) continue;
+		while (k < 1024 && now[k] == want[k]) k++;
+		dropped_bad++;
+		if (shown++ < 32)
+			out("    DIFFERS 0x%08x (dropped as another heap's), first at +0x%03x: %08x the first time, %08x re-run",
+			    a, k * 4, want[k], now[k]);
+	}
+	if (e->npages > e->vn) out("    %d page(s) first written in the re-run (not compared)", e->npages - e->vn);
+	out("  %s; %d known page(s) and %d dropped page(s) differ", game_bad ? "GAME STATE DIFFERS" : "game state matched",
+	    pages_bad, dropped_bad);
+	g_out = was;
+	if (game_bad) {
+		e->vbad++;
+		if (e->vlogs++ < 8)
+			log_msg("rollback: check %d (%s): GAME STATE DIFFERS when the same ticks run twice (%d values; %d known and %d "
+			        "dropped pages differ): see Arklite-rollbackcheck in logs", e->vchecks, what, game_bad, pages_bad, dropped_bad);
+	}
+	return !game_bad;
+}
+
+void rollback_check_stats(u32 *checks, u32 *bad)
+{
+	*checks = g_e ? g_e->vchecks : 0;
+	*bad = g_e ? g_e->vbad : 0;
+}
 
 void rollback_install(void)
 {

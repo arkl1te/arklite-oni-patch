@@ -8,7 +8,13 @@
  * The button opens a popup (mp_menu.c): New lists the levels with Play (alone), Host (the Host
  * settings dialog, then the level as a network host; a level needs two or more spawns, that is
  * Player-flagged characters, read from its files) and Back. Join lists bookmarked servers
- * (mp_menu.c) and starts the host's map in the host's level slot. */
+ * (mp_menu.c) and starts the host's map in the host's level slot.
+ *
+ * A map holds no game textures, only their names: placeholders the engine resolves by searching
+ * every loaded file (TMrInstance_GetDataPtr). level.ini's [textures] levels= lists the game levels
+ * they come from, and those levels' files are mounted in the map's slot, after its own, from the
+ * player's own GameDataFolder. Of such a file only the textures stay (textures_only), so the
+ * engine sees none of that level's objects, sounds or classes. */
 #include "arklite.h"
 
 __declspec(dllimport) int  WINAPI ReadFile(HANDLE, void *, u32, u32 *, void *);
@@ -20,8 +26,12 @@ void *memset(void *, int, unsigned);
 
 /* ---- Custom level discovery ------------------------------------------------------------ */
 
-#define MAX_CUSTOM      128
+#define MAX_CUSTOM      2048
 #define MAX_LEVEL_FILES 8
+#define MAX_TEXTURE_LEVELS 24
+#define MAX_MOUNT_FILES (MAX_LEVEL_FILES + MAX_TEXTURE_LEVELS)
+#define TAG_TXMP 0x54584d50
+#define TAG_TXAN 0x5458414e
 #define ITEM_CUSTOM     0x200     /* listbox item data: ITEM_CUSTOM + index; < 127 = level number */
 #define ID_CUSTOM_GAME  105
 #define ONrLevel_GetCurrent ((u16 (ONI_FC *)(void))0x5054c0)
@@ -43,6 +53,8 @@ static char g_dataDir[MAX_PATH];               /* absolute, ends with '\' */
 static char g_igmdFormat[256] = "IGMD\\%s";   /* the loading level's script folder (open_level_file_hook) */
 static char g_mountedIgmd[256];               /* the mounted level's script folder */
 static int  g_slot = -1;
+static char *g_textureRefs[MAX_TEXTURE_LEVELS];   /* the mounted game files that lend their textures */
+static int  g_ntextureRefs;
 static char g_mountedIni[MAX_PATH];           /* level.ini of the level mounted in g_slot */
 static char g_mountedDir[MAX_PATH];           /* its folder, ends with '\' */
 static char g_mountedFolder[64];              /* its folder's name in CustomLevels */
@@ -193,11 +205,28 @@ static int choose_slot(void)
 	return g_slot;
 }
 
+/* The table entry for the mount's file number f, or 0 */
+static TMtLevelFileEntry *mount_entry(int f, const int *reuse, int nreuse)
+{
+	TMtLevelFileEntry *e;
+
+	if (f < nreuse) return &TMgLevelFiles[reuse[f]];
+	if (TMgLevelFileCount >= TMcLevelFiles_Max) {
+		log_msg("mount: level file table full");
+		return 0;
+	}
+	e = &TMgLevelFiles[TMgLevelFileCount];
+	e->ref = UUrMemory_Block_New(0x100);
+	if (!e->ref) return 0;
+	TMgLevelFileCount++;
+	return e;
+}
+
 static int mount_custom_level(const CustomLevel *cl)
 {
-	int reuse[MAX_LEVEL_FILES], nreuse = 0;
+	int reuse[MAX_MOUNT_FILES], nreuse = 0, mounted;
 	u32 s = choose_slot();
-	char path[MAX_PATH];
+	char path[MAX_PATH], levels[128];
 
 	if ((int)s < 0) {
 		log_msg("mount: no free level slot");
@@ -205,7 +234,7 @@ static int mount_custom_level(const CustomLevel *cl)
 	}
 
 	/* Entries left by a previous mount in this slot are reused. */
-	for (u32 i = 0; i < TMgLevelFileCount && nreuse < MAX_LEVEL_FILES; i++)
+	for (u32 i = 0; i < TMgLevelFileCount && nreuse < MAX_MOUNT_FILES; i++)
 		if ((TMgLevelFiles[i].file_index >> 25) == s) reuse[nreuse++] = i;
 
 	for (int f = 0; f < cl->nfiles; f++) {
@@ -216,24 +245,45 @@ static int mount_custom_level(const CustomLevel *cl)
 			log_msg("mount: path too long: %s", path);
 			return 0;
 		}
-		if (f < nreuse) {
-			e = &TMgLevelFiles[reuse[f]];
-		} else {
-			if (TMgLevelFileCount >= TMcLevelFiles_Max) {
-				log_msg("mount: level file table full");
-				return 0;
-			}
-			e = &TMgLevelFiles[TMgLevelFileCount];
-			e->ref = UUrMemory_Block_New(0x100);
-			if (!e->ref) return 0;
-			TMgLevelFileCount++;
-		}
+		if (!(e = mount_entry(f, reuse, nreuse))) return 0;
 		str_cpy(e->ref, 0x100, path);
 		e->file_index = (((cl->hash[f] & 0xffffff) | (s << 24)) << 1) | 1;
 		log_msg("mount: slot %d <- %s (index 0x%08x)", s, path, e->file_index);
 	}
+	mounted = cl->nfiles;
+
+	/* The game levels whose textures the map names. Each gets an index of its own: a file's
+	 * index says which file an instance is in, and these would all have the same suffix hash. */
+	g_ntextureRefs = 0;
+	fmt(path, "%sCustomLevels\\%s\\level.ini", g_dataDir, cl->folder);
+	GetPrivateProfileStringA("textures", "levels", "", levels, sizeof levels, path);
+	for (const char *p = levels; *p; ) {
+		u32 n = 0;
+		TMtLevelFileEntry *e;
+
+		while (*p >= '0' && *p <= '9') n = n * 10 + (u32)(*p++ - '0');
+		while (*p && (*p < '0' || *p > '9')) p++;
+		if (!n || n > 126) continue;
+		if (g_ntextureRefs == MAX_TEXTURE_LEVELS) {
+			log_msg("mount: too many texture levels");
+			return 0;
+		}
+		fmt(path, "%slevel%d_Final.dat", g_dataDir, n);
+		if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+			/* a quad with no texture crashes the game while loading */
+			log_msg("mount: the map needs textures from %s, which isn't there", path);
+			return 0;
+		}
+		if (!(e = mount_entry(mounted, reuse, nreuse))) return 0;
+		str_cpy(e->ref, 0x100, path);
+		e->file_index = ((((0xa70000u + n) & 0xffffff) | (s << 24)) << 1) | 1;
+		g_textureRefs[g_ntextureRefs++] = e->ref;
+		mounted++;
+		log_msg("mount: slot %d <- textures of %s (index 0x%08x)", s, path, e->file_index);
+	}
+
 	/* Leftover entries from a bigger previous level: park them on slot 127, never loaded. */
-	for (int f = cl->nfiles; f < nreuse; f++)
+	for (int f = mounted; f < nreuse; f++)
 		TMgLevelFiles[reuse[f]].file_index = (127u << 25) | 1;
 
 	TMgLevelValid[s] = 1;
@@ -249,6 +299,29 @@ static int mount_custom_level(const CustomLevel *cl)
 		str_cpy(g_mountedIgmd, sizeof g_mountedIgmd, "IGMD\\%s");
 	log_msg("mount: scripts from %s", g_mountedIgmd);
 	return 1;
+}
+
+/* A game level lending its textures: everything else in it goes before the engine resolves
+ * anything. An instance with no data is skipped everywhere (TMiGame_InstanceFile_PrepareForMemory,
+ * the callbacks, the tag loops), and with no name it can't be looked up. */
+static void textures_only(char *ref, void *file)
+{
+	u32 n = TMmFile_InstanceCount(file), names = TMmFile_NameCount(file), kept = 0, named = 0;
+	u32 *desc = TMmFile_Descriptors(file), *name = TMmFile_Names(file);
+
+	for (u32 k = 0; k < n; k++) {
+		u32 *d = desc + k * 5, tag = TMmTemplate_Tag(d[0]);
+		if (tag != TAG_TXMP && tag != TAG_TXAN) d[1] = 0;
+		else if (d[1]) kept++;
+	}
+	for (u32 k = 0; k < names; k++)
+		if (desc[name[k * 2] * 5 + 1]) {
+			name[named * 2] = name[k * 2];
+			name[named * 2 + 1] = name[k * 2 + 1];
+			named++;
+		}
+	TMmFile_NameCount(file) = named;
+	log_msg("open: %s: %u textures of %u instances, %u by name", ref, kept, n, named);
 }
 
 /* The engine opens a level's files (TMrLevel_Load) before its scripts (0x50fe50, from the
@@ -273,6 +346,9 @@ static u16 ONI_FC open_level_file_hook(char *ref, void **out)
 		}
 		str_cpy(g_igmdFormat, sizeof g_igmdFormat, g_mountedIgmd);
 		if (error || !*out) break;
+
+		for (int t = 0; t < g_ntextureRefs; t++)
+			if (g_textureRefs[t] == ref) textures_only(ref, *out);
 
 		u32 index = TMgLevelFiles[i].file_index, n = TMmFile_InstanceCount(*out), fixed = 0;
 		u32 *desc = TMmFile_Descriptors(*out);
@@ -500,7 +576,7 @@ static void fill_level_list(WMtWindow *dialog)
 	/* New windows go right after the list in the drawing order, before the outline frame,
 	 * whose translucent fill would dim them. Buttons stay 130x40 (stock Load at 120, Cancel at 410). */
 	ui_label(dialog, g_lb, play, "New Game", 5, 10, 110, 20, UI_LEFT);
-	ui_set_frame(g_lb, 140, 30, 375, 340);
+	ui_list_set_frame(g_lb, 140, 30, 375, 340);
 	WIN_STYLE(g_lb) |= LBcStyle_OwnerDraw;   /* rows drawn by custom_game_proc: multiplayer maps in blue */
 	g_status = ui_label(dialog, g_lb, play, "", 140, 375, 375, 20, UI_CENTER);
 	ui_set_text(play, "Play");

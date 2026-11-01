@@ -1,15 +1,18 @@
-/* Multiplayer step 2: a second player on the same PC, on a gamepad.
+/* Multiplayer step 2: more players than Konoko: a second player on the same PC on a gamepad,
+ * and in network games one player per PC (up to PLAYERS_MAX).
  *
- * Player 2 is the second character with the Player flag: AI2 setup (0x48a6b0) gives a Player
- * placement charType 0 (+0x1e8, no AI; AI characters are 2), and Konoko is the one in
- * gs+0xac (PlayerCharacter). Place a second Player-flagged character in the map.
+ * Players are numbered by slot: slot 0 is Konoko (gs+0xac, PlayerCharacter), slot s the
+ * character spawned from the (s+1)th Player-flagged CHAR placement. AI2 setup (0x48a6b0) gives
+ * a Player placement charType 0 (+0x1e8, no AI; AI characters are 2).
  *
  * Oni spawns only one of them: the level start walks the CHAR objects (0x4d0080, type 'CHAR')
  * with 0x48a3a0, which spawns the first with IsPlayer (object +0x2c bit 0, +0x2c |= 0x20 for
  * spawned, ONrGameState_NewCharacter 0x4dac50) and stops the walk. The three walks with it
- * (0x48a2ee, 0x48a419, 0x48a518) are wrapped: after each, Arklite walks again and spawns every
- * other IsPlayer character that isn't spawned yet, keeping Konoko in gs+0xac (NewCharacter
- * makes every charType 0 character the player).
+ * (0x48a2ee, 0x48a419, 0x48a518) are wrapped: after each, Arklite walks again and spawns the
+ * next placements, up to the player count (players_set_count: 2 on one PC and in a network
+ * lobby, the match's players in a network match; never more than the map has), keeping Konoko
+ * in gs+0xac (NewCharacter makes every charType 0 character the player). Placements past the
+ * count are only spawn points.
  *
  * Every tick (0x4fa6a0) turns that tick's action record into the input state at gs+0xb8
  * (0x30 bytes: +0 aim up/down and +4 aim left/right from the record's +0x28/+0x24, +0x10
@@ -17,8 +20,8 @@
  * 0x4fa520 first, which reads the character in gs+0xac) and hands it to the player with
  * ONrCharacter_SetInput (0x4ed420, call at 0x4fa934), which copies it into the character's
  * active data (+0x2158). The AI drives its characters through that same slot. Right after
- * Konoko's call, Arklite does the same for player 2 with player 2's record and its own input
- * state, pointing gs+0xac at player 2 while 0x4fa520 runs.
+ * Konoko's call, Arklite does the same for every other player with that player's record and its
+ * own input state, pointing gs+0xac at that player while 0x4fa520 runs.
  *
  * Player 2's record is made once per frame from an XInput gamepad, like Daodan's input makes
  * Konoko's: the first tick of the frame gets it, later ticks keep the buttons held and don't
@@ -36,10 +39,9 @@
  *   - nothing pauses: see live_menu.c.
  *
  * Spawn points (a map with two or more Player-flagged characters is a multiplayer map): every
- * Player-flagged CHAR placement is a spawn point. The first is Konoko's own placement and the
- * second player 2's; the third and later ones (player3, player4, ...) are only spawn points and
- * aren't spawned. Each player starts at a spawn point picked at random (Konoko by moving her
- * placement there for the game's own walk, player 2 the same way for NewCharacter) and, after
+ * Player-flagged CHAR placement is a spawn point. The first is Konoko's own placement, the next
+ * ones those of players 2, 3, ... (as many as the player count); the rest are only spawn points. Each player starts at a spawn point picked at random (Konoko by moving her
+ * placement there for the game's own walk, the others the same way for NewCharacter) and, after
  * dying, comes back at one: once respawn_delay seconds have passed since the death tick (char
  * +0x1638, set by the death function 0x4eb550 with the dead flag, +4 bit 0), the first tick
  * whose input state has an attack button pressed (punch, kick, fire1-3) respawns that player:
@@ -49,12 +51,12 @@
  * spawn point. A character spawned from a placement takes the placement's position (+0xc) and
  * facing (+0x228). The pick is random among the points no other living player is near (the
  * farthest one if none), from a hash of the level, the tick and the player, so every PC and
- * every replay picks the same. Respawning runs in the tick, right after both players' input.
+ * every replay picks the same. Respawning runs in the tick, right after every player's input.
  *
  * Character choice (F2, char_menu.c): word 11 of each player's action record carries the class
  * that player comes back as (PLAYERS_CHOICE_TAG | ONCC instance number + 1, or the tag alone
  * for the placement's own class). The tick notes it for Konoko from the tick's action
- * (players_tick_record, from lockstep.c's tick hook) and for player 2 from player 2's record, so
+ * (players_tick_record, from lockstep.c's tick hook) and for the others from their records, so
  * every PC and every replay knows it at the same tick. A respawn with a class noted puts that
  * class's name in the placement (+0x30, char[64], what NewCharacter looks up) and clears its
  * RandomCostume and UpgradeDifficulty flags (0x802, which would pick another class of the same
@@ -68,7 +70,7 @@
  * the player was spawned as. Every PC does it in the tick from the shared input, like
  * respawning. A player
  * who comes back as another class gets the health the map gives its own player (the maximum,
- * +0x3c, Konoko or player 2 had when spawned with the placement's class; current health +0x38
+ * +0x3c, the player had when spawned with the placement's class; current health +0x38
  * set to it too), so every character is as tough as the map's Konoko. On a multiplayer map that
  * health is MP_HEALTH (100) for every player and class, set at each spawn; the in-place class
  * change (0x4d7c30) doesn't touch health, so it stays.
@@ -148,30 +150,36 @@ static int g_enabled, g_pad, g_invert_y;
 static float g_aim_speed = 8.0f;
 static XInputGetState_t g_xinput;
 
-static int g_p2 TICK_STATE = -1;       /* character index, -1: none */
+#define PL              PLAYERS_MAX
+static int g_pl[PL] TICK_STATE = { -1, -1, -1, -1 };   /* slot s's character index ([0]: Konoko, in gs+0xac), -1: none */
 static u32 g_level;
-static u32 g_input[12] TICK_STATE;     /* player 2's input state, like gs+0xb8 */
-static u32 g_record[12];               /* this frame's record */
+static u32 g_input[PL][12] TICK_STATE; /* each player's input state, like gs+0xb8 (slot 0 unused) */
+static u32 g_record[12];               /* this frame's record for player 2 (gamepad) */
 static int g_has_record, g_tick_index;
-static const u32 (*g_net_records)[12];  /* networked game: one record per tick (net.c) */
+static const u32 (*g_net_records)[6][12];  /* networked game: records[slot][tick] (net.c) */
 static u32 g_net_count;
+static u32 g_count = 2;                /* players to spawn (players_set_count) */
 
 #define MAX_SPAWN       64
 #define SPAWN_CLEAR     60.0f   /* no other living player this near: a free spawn point */
-static u8 *g_spawn[MAX_SPAWN];         /* Player-flagged placements: [0] Konoko's, [1] player 2's */
+static u8 *g_spawn[MAX_SPAWN];         /* Player-flagged placements: [s] slot s's, then spawn points only */
 static int g_nspawn;
 static u32 g_spawn_level;             /* for the spawn pick only: the level isn't current yet */
-static int g_p1_point TICK_STATE = -1;  /* where Konoko just spawned, for player 2's pick */
 static u32 g_respawn_ticks = 90;       /* dead this long, an attack button brings a player back */
 /* Score (see "Score" below) */
 #define KILL_CREDIT     600     /* 10 s */
-static int g_score[2] TICK_STATE, g_was_dead[2] TICK_STATE;
-static int g_class[2] TICK_STATE = { -1, -1 };   /* ONCC instance number chosen with F2, -1: the placement's */
-static int g_base_health[2] TICK_STATE;          /* each player's maximum health with the map's class */
-static int g_as[2] TICK_STATE = { -1, -1 };      /* the class each player's character is, -1: the map's */
-static u8 *g_map_class[2] TICK_STATE;            /* the ONCC each player was last spawned as with the map's class */
-static int g_hit_by[2] TICK_STATE = { -1, -1 };
-static u32 g_hit_tick[2] TICK_STATE;
+static int g_score[PL] TICK_STATE, g_was_dead[PL] TICK_STATE;
+static int g_class[PL] TICK_STATE = { -1, -1, -1, -1 };   /* ONCC instance number chosen with F2, -1: the placement's */
+static int g_base_health[PL] TICK_STATE;          /* each player's maximum health with the map's class */
+static int g_as[PL] TICK_STATE = { -1, -1, -1, -1 };      /* the class each player's character is, -1: the map's */
+static u8 *g_map_class[PL] TICK_STATE;            /* the ONCC each player was last spawned as with the map's class */
+static int g_hit_by[PL] TICK_STATE = { -1, -1, -1, -1 };
+static u32 g_hit_tick[PL] TICK_STATE;
+static u32 g_last_owner[PL] TICK_STATE;           /* last hit's owner handle that credited no one */
+#define BLAST_CREDIT    300     /* 5 s: a death effect's blast (mad_bomber's goes off 3.5 s after) */
+#define BLAST_REACH     150.0f  /* from where the player died (mad_x01's radius is 75) */
+static u32 g_death_tick[PL] TICK_STATE;           /* tick + 1 of each player's last death, 0: none */
+static float g_death_pos[PL][3] TICK_STATE;
 /* The network match's limits (net.c, the host's Host dialog): see "Score" below */
 static int g_limits_on, g_limit_score;
 static u32 g_limit_ticks, g_limit_start;
@@ -190,29 +198,37 @@ static u8 *character(int index)
 	return GS_CHARACTERS(ONgGameState) + index * CHR_SIZE;
 }
 
-/* The second Player-flagged character (charType 0, not Konoko), or -1 */
-static int find_player2(void)
+/* Slot s (1..) has its character: a player character (charType 0) that isn't Konoko */
+static int slot_valid(int s)
+{
+	u8 *c;
+	if (s < 1 || s >= PL || g_pl[s] < 0) return 0;
+	c = character(g_pl[s]);
+	return (CHR_FLAGS(c) & CHR_INUSE) && CHR_TYPE(c) == 0 && c != GS_PLAYER(ONgGameState);
+}
+
+/* A player character no slot has (charType 0, not Konoko), in index order, or -1: for a slot
+ * whose character wasn't spawned by spawn_players (a level loaded some other way) */
+static int find_unclaimed(void)
 {
 	u8 *p1 = GS_PLAYER(ONgGameState);
 	u32 slots = ONgCharacterSlots;
 	for (u32 i = 0; i < slots; i++) {
 		u8 *c = character(i);
-		if ((CHR_FLAGS(c) & CHR_INUSE) && CHR_TYPE(c) == 0 && c != p1) return i;
+		int claimed = 0;
+		if (!(CHR_FLAGS(c) & CHR_INUSE) || CHR_TYPE(c) != 0 || c == p1) continue;
+		for (int s = 1; s < PL; s++) claimed |= slot_valid(s) && g_pl[s] == (int)i;
+		if (!claimed) return i;
 	}
 	return -1;
 }
 
-static int player2_valid(void)
-{
-	u8 *c;
-	if (g_p2 < 0) return 0;
-	c = character(g_p2);
-	return (CHR_FLAGS(c) & CHR_INUSE) && CHR_TYPE(c) == 0 && c != GS_PLAYER(ONgGameState);
-}
-
 int multiplayer_active(void)
 {
-	return g_enabled && ONgGameState && player2_valid();
+	if (!g_enabled || !ONgGameState) return 0;
+	for (int s = 1; s < PL; s++)
+		if (slot_valid(s)) return 1;
+	return 0;
 }
 
 static u8 ONI_FC auto_aim(u8 *shooter, u8 *active, u8 *target)
@@ -272,21 +288,22 @@ static void poll_pad(u32 *rec, u32 ticks)
 static void new_level_check(void)
 {
 	u32 level = ONrLevel_GetCurrent();
-	if (level != g_level || (g_p2 >= 0 && !player2_valid())) {
-		if (level != g_level) {
-			g_score[0] = g_score[1] = 0;
-			g_hit_by[0] = g_hit_by[1] = -1;
-			g_class[0] = g_class[1] = -1;
+	if (level != g_level) {
+		for (int s = 0; s < PL; s++) {
+			g_score[s] = 0;
+			g_hit_by[s] = -1;
+			g_class[s] = -1;
 		}
 		g_level = level;
-		g_p2 = -1;
-		memset(g_input, 0, sizeof g_input);
 	}
-	if (g_p2 < 0 && level) {
-		g_p2 = find_player2();
-		if (g_p2 >= 0) {
-			memset(g_input, 0, sizeof g_input);
-			log_msg("players: player 2 is #%d %s", g_p2, (const char *)character(g_p2) + 0x14);
+	if (!level) return;
+	for (int s = 1; s < PL && s < (int)g_count; s++) {
+		if (slot_valid(s)) continue;
+		if (g_pl[s] >= 0) memset(g_input[s], 0, sizeof g_input[s]);
+		g_pl[s] = find_unclaimed();
+		if (g_pl[s] >= 0) {
+			memset(g_input[s], 0, sizeof g_input[s]);
+			log_msg("players: player %d is #%d %s", s + 1, g_pl[s], (const char *)character(g_pl[s]) + 0x14);
 		}
 	}
 }
@@ -298,7 +315,7 @@ const u32 *players_begin_frame(void)
 	g_net_records = 0;
 	if (!g_enabled || !ONgGameState) return 0;
 	new_level_check();
-	if (g_p2 < 0) return 0;
+	if (!slot_valid(1)) return 0;
 	u32 ticks = GS_SERVER_TIME(ONgGameState) - GS_TICK(ONgGameState);
 	poll_pad(g_record, ticks > 6 ? 6 : ticks ? ticks : 1);
 	const u32 *mask = (const u32 *)gs_field(GS_ACTION_MASK);
@@ -308,7 +325,7 @@ const u32 *players_begin_frame(void)
 	return g_record;
 }
 
-void players_net_frame(const u32 (*records)[12], u32 n)
+void players_net_frame(const u32 (*records)[6][12], u32 n)
 {
 	g_tick_index = 0;
 	g_has_record = 0;
@@ -317,10 +334,14 @@ void players_net_frame(const u32 (*records)[12], u32 n)
 	if (g_enabled && ONgGameState) new_level_check();
 }
 
-u8 *players_p2(void)
+void players_set_count(u32 n)
 {
-	return g_enabled && ONgGameState && player2_valid() ? character(g_p2) : 0;
+	g_count = n < 1 ? 1 : n > PL ? PL : n;
 }
+
+u32 players_count(void) { return g_count; }
+
+int players_spawn_points(void) { return g_nspawn; }
 
 void players_replay_frame(const u32 *rec)
 {
@@ -345,27 +366,26 @@ void players_tick_record(const u32 *rec)
 	if (g_enabled && rec) note_choice(0, rec);
 }
 
-/* Player 2's tick input, as the tick builds Konoko's */
-static void player2_tick(void)
+/* Slot s's tick input, as the tick builds Konoko's (tick: this tick's index in the frame) */
+static void player_tick(int s, int tick)
 {
 	u8 *gs = ONgGameState, *p2, *p1;
-	u32 rec[12], *src = 0;
+	u32 rec[12], *src = 0, *in = g_input[s];
 	u32 lo, hi;
 	u64 b;
 
-	if (!player2_valid()) return;
-	p2 = character(g_p2);
+	if (!slot_valid(s)) return;
+	p2 = character(g_pl[s]);
 	if (g_net_records) {
-		if ((u32)g_tick_index < g_net_count) {
-			memcpy(rec, g_net_records[g_tick_index], sizeof rec);
+		if ((u32)tick < g_net_count) {
+			memcpy(rec, g_net_records[s][tick], sizeof rec);
 			src = rec;
 		}
-	} else if (g_has_record && g_tick_index == 0) {
+	} else if (s == 1 && g_has_record && tick == 0) {
 		memcpy(rec, g_record, sizeof rec);
 		src = rec;
 	}
-	g_tick_index++;
-	if (src) note_choice(1, rec);
+	if (src) note_choice(s, rec);
 	if (src && (!*gs_field(GS_INPUT_ON) || *gs_field(GS_INPUT_OFF) || (CHR_FLAGS(p2) & CHR_NOINPUT))) {
 		rec[7] = rec[8] = rec[9] = rec[10] = 0;
 		rec[0] &= 0x10003;
@@ -379,12 +399,12 @@ static void player2_tick(void)
 		ud = rec[10];
 	}
 	if (ONgInvertLook) ud ^= 0x80000000u;
-	g_input[0] = ud;
-	g_input[1] = lr;
+	in[0] = ud;
+	in[1] = lr;
 
 	/* buttons: 0x4fa520 works on the character in gs+0xac */
-	lo = src ? rec[0] : g_input[4];
-	hi = src ? rec[1] : g_input[5];
+	lo = src ? rec[0] : in[4];
+	hi = src ? rec[1] : in[5];
 	p1 = GS_PLAYER(gs);
 	GS_PLAYER(gs) = p2;
 	b = ONiPlayerButtons(lo, hi);
@@ -392,16 +412,16 @@ static void player2_tick(void)
 	lo = (u32)b;
 	hi = (u32)(b >> 32);
 
-	u32 prev_lo = g_input[4], prev_hi = g_input[5], not_lo = g_input[6], not_hi = g_input[7];
-	g_input[4] = lo;  g_input[5] = hi;               /* held */
-	g_input[6] = ~lo; g_input[7] = ~hi;              /* not held */
-	g_input[8] = not_lo & lo;  g_input[9] = not_hi & hi;      /* pressed */
-	g_input[10] = prev_lo & ~lo; g_input[11] = prev_hi & ~hi; /* released */
-	if (GS_TICK(gs) < 0xe) {                         /* the level's first ticks, as for Konoko */
-		g_input[5] &= 0xfffffe3f;
-		g_input[8] = g_input[9] = g_input[10] = g_input[11] = 0;
+	u32 prev_lo = in[4], prev_hi = in[5], not_lo = in[6], not_hi = in[7];
+	in[4] = lo;  in[5] = hi;               /* held */
+	in[6] = ~lo; in[7] = ~hi;              /* not held */
+	in[8] = not_lo & lo;  in[9] = not_hi & hi;      /* pressed */
+	in[10] = prev_lo & ~lo; in[11] = prev_hi & ~hi; /* released */
+	if (GS_TICK(gs) < 0xe) {               /* the level's first ticks, as for Konoko */
+		in[5] &= 0xfffffe3f;
+		in[8] = in[9] = in[10] = in[11] = 0;
 	}
-	ONrCharacter_SetInput(p2, g_input);
+	ONrCharacter_SetInput(p2, in);
 }
 
 static void respawn_tick(const u32 *p1_input);
@@ -410,7 +430,8 @@ static void score_tick(void);
 static void ONI_FC set_input(u8 *chr, u32 *input)
 {
 	ONrCharacter_SetInput(chr, input);   /* Konoko */
-	if (g_p2 >= 0) player2_tick();
+	for (int s = 1; s < PL; s++) player_tick(s, g_tick_index);
+	g_tick_index++;
 	if (multiplayer_active()) {
 		if (multiplayer_map()) score_tick();
 		respawn_tick(input);
@@ -492,23 +513,31 @@ static int spawn_at(u8 *obj, int point, int keep_player, u32 *index)
 	return !err;
 }
 
+/* The spawn walk: the points taken so far (Konoko's first) */
+static const float *g_taken[PL];
+static int g_ntaken;
+
 static u8 ONI_FC spawn_player(u8 *obj, u32 *seen)
 {
 	u32 f = OBJ_FLAGS(obj), index;
+	int s;
 
 	if (!(f & OBJ_ISPLAYER)) return 1;
-	/* the first is Konoko's, which the game just spawned; the third and later are spawn points */
-	if ((*seen)++ != 1 || (f & OBJ_SPAWNED)) return 1;
+	/* the first is Konoko's, which the game just spawned; those past the count are spawn points */
+	s = (int)(*seen)++;
+	if (s == 0 || s >= (int)g_count || s >= PL || (f & OBJ_SPAWNED)) return 1;
 	OBJ_FLAGS(obj) = f | OBJ_SPAWNED;
 	if (multiplayer_map()) {
-		const float *avoid = g_p1_point >= 0 ? (const float *)OBJ_POS(g_spawn[g_p1_point]) : 0;
-		int point = choose_spawn(&avoid, avoid ? 1 : 0, 2);
+		int point = choose_spawn(g_taken, g_ntaken, s + 1);
 		if (spawn_at(obj, point, 1, &index)) {
+			g_pl[s] = (int)index;
+			memset(g_input[s], 0, sizeof g_input[s]);
+			if (g_ntaken < PL) g_taken[g_ntaken++] = (const float *)OBJ_POS(g_spawn[point]);
 			CHR_HEALTH(character(index)) = CHR_MAX_HEALTH(character(index)) = MP_HEALTH;
-			g_base_health[1] = MP_HEALTH;
-			g_map_class[1] = CHR_CLASS(character(index));
-			g_as[1] = -1;
-			log_msg("players: spawned %s at spawn point %d", OBJ_NAME(obj), point);
+			g_base_health[s] = MP_HEALTH;
+			g_map_class[s] = CHR_CLASS(character(index));
+			g_as[s] = -1;
+			log_msg("players: spawned %s (player %d) at spawn point %d", OBJ_NAME(obj), s + 1, point);
 		}
 	} else {
 		u8 *gs = ONgGameState;
@@ -517,7 +546,11 @@ static u8 ONI_FC spawn_player(u8 *obj, u32 *seen)
 		*(u32 *)(gs + 0xac) = player;
 		*(u32 *)(gs + 0xb0) = player_b0;
 		if (err) log_msg("players: can't spawn %s (error %d)", OBJ_NAME(obj), err);
-		else log_msg("players: spawned %s", OBJ_NAME(obj));
+		else {
+			g_pl[s] = (int)(index & 0xffff);
+			memset(g_input[s], 0, sizeof g_input[s]);
+			log_msg("players: spawned %s (player %d)", OBJ_NAME(obj), s + 1);
+		}
 	}
 	return 1;   /* keep walking */
 }
@@ -531,7 +564,8 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 	g_nspawn = 0;
 	g_spawn_level = ONrLevel_GetCurrent();
 	OBJrEnumerate(OBJcType_CHAR, collect_spawn, 0);
-	g_p1_point = -1;
+	g_ntaken = 0;
+	for (int s = 1; s < PL; s++) g_pl[s] = -1;
 	if (multiplayer_map()) {
 		/* Konoko: her placement moved to the spawn point while the game spawns her */
 		u8 *obj = g_spawn[0];
@@ -543,14 +577,17 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 		r = OBJrEnumerate(type, callback, param);
 		memcpy(OBJ_POS(obj), pos, sizeof pos);
 		OBJ_FACING(obj) = facing;
-		g_p1_point = point;
-		log_msg("players: multiplayer map, %d spawn points; Konoko at spawn point %d", g_nspawn, point);
+		g_taken[g_ntaken++] = (const float *)OBJ_POS(g_spawn[point]);
+		log_msg("players: multiplayer map, %d spawn points, %d players; Konoko at spawn point %d", g_nspawn,
+		        g_count < (u32)g_nspawn ? g_count : (u32)g_nspawn, point);
 	} else {
 		r = OBJrEnumerate(type, callback, param);
 	}
-	g_base_health[0] = g_base_health[1] = 0;
-	g_map_class[0] = g_map_class[1] = 0;
-	g_as[0] = g_as[1] = -1;
+	for (int s = 0; s < PL; s++) {
+		g_base_health[s] = 0;
+		g_map_class[s] = 0;
+		g_as[s] = -1;
+	}
 	if (GS_PLAYER(ONgGameState)) {
 		if (multiplayer_map())
 			CHR_HEALTH(GS_PLAYER(ONgGameState)) = CHR_MAX_HEALTH(GS_PLAYER(ONgGameState)) = MP_HEALTH;
@@ -589,8 +626,8 @@ static int make_player(int who, int point)
 	} else {
 		cls = 0;
 	}
-	/* Konoko comes back as the player (NewCharacter sets gs+0xac); player 2 doesn't */
-	ok = spawn_at(obj, point, who, &index);
+	/* Konoko comes back as the player (NewCharacter sets gs+0xac); the others don't */
+	ok = spawn_at(obj, point, who != 0, &index);
 	if (cls) {
 		memcpy(OBJ_CLASS(obj), saved, sizeof saved);
 		OBJ_FLAGS(obj) = (OBJ_FLAGS(obj) & ~OBJ_RANDOM_CLASS) | (flags & OBJ_RANDOM_CLASS);
@@ -604,21 +641,28 @@ static int make_player(int who, int point)
 		g_map_class[who] = CHR_CLASS(c);
 	} else if (g_base_health[who] > 0) CHR_HEALTH(c) = CHR_MAX_HEALTH(c) = g_base_health[who];
 	g_as[who] = cls ? g_class[who] : -1;
-	log_msg("players: %s respawned at spawn point %d as %s, health %d/%d (tick %u)", who ? "player 2" : "Konoko",
-	        point, cls ? cls : "the map's class", CHR_HEALTH(c), CHR_MAX_HEALTH(c), GS_TICK(ONgGameState));
+	log_msg("players: player %d respawned at spawn point %d as %s, health %d/%d (tick %u)", who + 1, point, cls ? cls : "the map's class", CHR_HEALTH(c), CHR_MAX_HEALTH(c), GS_TICK(ONgGameState));
 	return (int)index;
 }
 
-static int respawn(u8 *c, u8 *other, int is_p2)
-{
-	const float *avoid = 0;
+static u8 *player_char(int who);
 
-	if (other && (CHR_FLAGS(other) & CHR_INUSE) && !(CHR_FLAGS(other) & CHR_DEAD))
-		avoid = CHR_POS(other);
-	int point = choose_spawn(&avoid, avoid ? 1 : 0, is_p2 ? 2 : 1);
+/* Player who's character c comes back at a spawn point no other living player is near */
+static int respawn(u8 *c, int who)
+{
+	const float *avoid[PL];
+	int navoid = 0;
+
+	for (int s = 0; s < PL; s++) {
+		u8 *o = player_char(s);
+		if (s != who && o && (CHR_FLAGS(o) & CHR_INUSE) && !(CHR_FLAGS(o) & CHR_DEAD)) avoid[navoid++] = CHR_POS(o);
+	}
+	int point = choose_spawn(avoid, navoid, (u32)who + 1);
 	if (CHR_ACTIVE(c) && !(CHR_FLAGS(c) & CHR_NOCORPSE)) ONrCharacter_MakeCorpse(c);
 	ONrGameState_DeleteCharacter(c);
-	return make_player(is_p2, point);
+	int index = make_player(who, point);
+	if (index >= 0) items_player_respawned(CHR_POS(character(index)));
+	return index;
 }
 
 static int alive(u8 *c)
@@ -637,15 +681,14 @@ static void change_class(int who, u8 *c)
 	g_as[who] = g_class[who];
 	if (!oncc || oncc == CHR_CLASS(c)) return;
 	ONrCharacter_SetClass(c, oncc);
-	log_msg("players: %s changed to %s, health %d/%d (tick %u)", who ? "player 2" : "Konoko",
-	        TMrInstance_GetInstanceName(oncc), CHR_HEALTH(c), CHR_MAX_HEALTH(c), GS_TICK(ONgGameState));
+	log_msg("players: player %d changed to %s, health %d/%d (tick %u)", who + 1, TMrInstance_GetInstanceName(oncc), CHR_HEALTH(c), CHR_MAX_HEALTH(c), GS_TICK(ONgGameState));
 }
 
 /* ---- Score ---------------------------------------------------------------------------------- *
  * Every hit goes through TakeDamage (0x4e65f0), whose 4th stack argument is the owner of the hit:
  * a handle that 0x51cda0 turns into the attacking character (types 1 and 2), or 0. mp_rules.c
  * reports each hit on a character here. A player who dies (the dead flag appears in a tick)
- * within KILL_CREDIT ticks of a hit by the other player gives that player a kill; any other
+ * within KILL_CREDIT ticks of a hit by another player gives the last one who hit them a kill; any other
  * death (a fall, their own grenade) is a suicide and costs the dead player a point. All of it
  * happens in ticks, so every PC counts the same.
  *
@@ -658,8 +701,8 @@ static u8 *player_char(int who)
 {
 	u8 *gs = ONgGameState;
 	if (!gs) return 0;
-	if (who == 0) return net_swapped_konoko() ? net_swapped_konoko() : GS_PLAYER(gs);   /* (the joiner's display has player 2 there) */
-	return player2_valid() ? character(g_p2) : 0;
+	if (who == 0) return net_swapped_konoko() ? net_swapped_konoko() : GS_PLAYER(gs);   /* (a joiner's display has its own player there) */
+	return slot_valid(who) ? character(g_pl[who]) : 0;
 }
 
 u8 *players_char(int who) { return player_char(who); }
@@ -667,22 +710,63 @@ u8 *players_char(int who) { return player_char(who); }
 static int player_of(u8 *c)
 {
 	if (!c) return -1;
-	for (int who = 0; who < 2; who++)
+	for (int who = 0; who < PL; who++)
 		if (c == player_char(who)) return who;
 	return -1;
 }
 
-void players_note_hit(u8 *victim, u8 *attacker)
+/* The hit's owner as a player: through 0x51cda0 (attacker), else by the handle's slot (owner
+ * types 1 weapon and 2 melee: 0x8000 | salt << 8 | slot in the low 16 bits), which still finds a
+ * player whose character the stock lookup turned down. -1: not another player's hit. */
+static int owner_player(u8 *attacker, u32 owner)
 {
-	int v = player_of(victim), a = player_of(attacker);
-	if (v < 0 || a < 0 || a == v || !ONgGameState) return;
+	int a = player_of(attacker);
+	u32 type = owner >> 24, slot = owner & 0xff;
+	if (a >= 0 || (type != 1 && type != 2) || slot >= ONgCharacterSlots) return a;
+	return player_of(character((int)slot));
+}
+
+/* An environmental hit (owner type 4: a particle with no owner) near where another player just
+ * died: that player's death effect. mad_bomber's (ONCC DeathParticle mad_e01 -> mad_p04 ->
+ * the blast mad_x01) drops the owner Oni gives it (HasDamageOwner off in mad_e01 and mad_x01),
+ * so his blast's kills went to no one and cost the victim a point. -1: none. */
+static int blast_player(u8 *victim, u32 owner)
+{
+	int best = -1;
+	u32 now = GS_TICK(ONgGameState), best_tick = 0;
+	const float *p = CHR_POS(victim);
+	if (owner >> 24 != 4) return -1;
+	for (int d = 0; d < PL; d++) {
+		u32 t = g_death_tick[d];
+		if (!t || now + 1 - t > BLAST_CREDIT || t <= best_tick) continue;
+		float dx = p[0] - g_death_pos[d][0], dy = p[1] - g_death_pos[d][1], dz = p[2] - g_death_pos[d][2];
+		if (dx * dx + dy * dy + dz * dz > BLAST_REACH * BLAST_REACH) continue;
+		best = d;
+		best_tick = t;
+	}
+	return best;
+}
+
+void players_note_hit(u8 *victim, u8 *attacker, u32 owner)
+{
+	int v = player_of(victim), a;
+	if (v < 0 || !ONgGameState) return;
+	a = owner_player(attacker, owner);
+	if (a < 0 && (a = blast_player(victim, owner)) >= 0 && a != v && g_hit_by[v] != a)
+		log_msg("players: player %d caught in player %d's death blast (tick %u)", v + 1, a + 1, GS_TICK(ONgGameState));
+	if (a < 0 || a == v) {
+		g_last_owner[v] = owner;   /* for the log if this player then dies with no credit */
+		return;
+	}
+	if (!attacker && owner >> 24 != 4) log_msg("players: player %d hit by owner %08x, credited to player %d by its slot (tick %u)", v + 1, owner,
+	                       a + 1, GS_TICK(ONgGameState));
 	g_hit_by[v] = a;
 	g_hit_tick[v] = GS_TICK(ONgGameState);
 }
 
-int players_can_change(int who) { return (who == 0 || who == 1) && multiplayer_map() && alive(player_char(who)); }
+int players_can_change(int who) { return who >= 0 && who < PL && multiplayer_map() && alive(player_char(who)); }
 
-int players_score(int who) { return who == 0 || who == 1 ? g_score[who] : 0; }
+int players_score(int who) { return who >= 0 && who < PL ? g_score[who] : 0; }
 
 int players_enabled(void) { return g_enabled; }
 u32 players_respawn_ticks(void) { return g_respawn_ticks; }
@@ -707,19 +791,41 @@ int players_time_left(void)
 	return played >= g_limit_ticks ? 0 : (int)(g_limit_ticks - played);
 }
 
-/* Who won: nearest the score limit (the lowest score with a negative one), -1 for a draw */
-int players_winner(void)
+/* Better placed: nearer the score limit (the lower score with a negative one) */
+static int better(int a, int b) { return g_limit_score < 0 ? a < b : a > b; }
+
+/* Who won among the players in mask (bit per slot): nearest the score limit, -1 for a draw */
+int players_winner(u32 mask)
 {
-	int d = g_score[0] - g_score[1];
-	if (g_limit_score < 0) d = -d;
-	return d > 0 ? 0 : d < 0 ? 1 : -1;
+	int best = -1, tie = 0;
+	for (int s = 0; s < PL; s++) {
+		if (!(mask >> s & 1)) continue;
+		if (best < 0 || better(g_score[s], g_score[best])) best = s, tie = 0;
+		else if (g_score[s] == g_score[best]) tie = 1;
+	}
+	return tie ? -1 : best;
+}
+
+/* Slots of mask in finishing order (best first); returns how many */
+int players_ranking(u32 mask, int *out)
+{
+	int n = 0;
+	for (int s = 0; s < PL; s++) {
+		if (!(mask >> s & 1)) continue;
+		int k = n++;
+		while (k > 0 && better(g_score[s], g_score[out[k - 1]])) { out[k] = out[k - 1]; k--; }
+		out[k] = s;
+	}
+	return n;
 }
 
 void players_reset_scores(void)
 {
-	for (int who = 0; who < 2; who++) {
+	for (int who = 0; who < PL; who++) {
 		g_score[who] = 0;
 		g_hit_by[who] = -1;
+		g_last_owner[who] = 0;
+		g_death_tick[who] = 0;
 		g_class[who] = -1;
 		g_as[who] = -1;
 		u8 *c = player_char(who);
@@ -730,7 +836,7 @@ void players_reset_scores(void)
 static int limit_reached(void)
 {
 	u32 played = GS_TICK(ONgGameState) - g_limit_start;
-	for (int who = 0; who < 2 && g_limit_score; who++)
+	for (int who = 0; who < PL && g_limit_score; who++)
 		if (g_limit_score > 0 ? g_score[who] >= g_limit_score : g_score[who] <= g_limit_score) return 1;
 	return g_limit_ticks && played >= g_limit_ticks;
 }
@@ -738,41 +844,50 @@ static int limit_reached(void)
 static void score_tick(void)
 {
 	if (g_over_tick) return;   /* the match is over: the score stays as it ended */
-	for (int who = 0; who < 2; who++) {
+	for (int who = 0; who < PL; who++) {
 		u8 *c = player_char(who);
 		int dead = c && (CHR_FLAGS(c) & CHR_INUSE) && (CHR_FLAGS(c) & CHR_DEAD);
 		if (dead && !g_was_dead[who]) {
 			int killer = g_hit_by[who];
+			g_death_tick[who] = GS_TICK(ONgGameState) + 1;
+			memcpy(g_death_pos[who], CHR_POS(c), sizeof g_death_pos[who]);
 			if (killer >= 0 && GS_TICK(ONgGameState) - g_hit_tick[who] <= KILL_CREDIT) {
 				g_score[killer]++;
-				log_msg("players: player %d killed player %d (%d : %d)", killer + 1, who + 1, g_score[0], g_score[1]);
+				log_msg("players: player %d killed player %d (%d : %d : %d : %d)", killer + 1, who + 1, g_score[0], g_score[1],
+				        g_score[2], g_score[3]);
 			} else {
 				g_score[who]--;
-				log_msg("players: player %d died on their own (%d : %d)", who + 1, g_score[0], g_score[1]);
+				log_msg("players: player %d died on their own (%d : %d : %d : %d; last uncredited hit owner %08x)", who + 1,
+				        g_score[0], g_score[1], g_score[2], g_score[3], g_last_owner[who]);
 			}
 			g_hit_by[who] = -1;
+			g_last_owner[who] = 0;
 		}
 		g_was_dead[who] = dead;
 	}
 	if (g_limits_on && limit_reached()) {
 		g_over_tick = GS_TICK(ONgGameState) + 1;
-		log_msg("players: the match is over at tick %d (%d : %d)", GS_TICK(ONgGameState), g_score[0], g_score[1]);
+		log_msg("players: the match is over at tick %d (%d : %d : %d : %d)", GS_TICK(ONgGameState), g_score[0], g_score[1],
+		        g_score[2], g_score[3]);
 	}
 }
 
 static void respawn_tick(const u32 *p1_input)
 {
-	u8 *gs = ONgGameState, *p1 = GS_PLAYER(gs), *p2 = player2_valid() ? character(g_p2) : 0;
+	u8 *gs = ONgGameState, *p1 = GS_PLAYER(gs);
 
 	if (!multiplayer_map()) return;
-	if (p1 && wants_respawn(p1, p1_input)) respawn(p1, p2, 0);
+	if (p1 && wants_respawn(p1, p1_input)) respawn(p1, 0);
 	else change_class(0, p1);
-	p1 = GS_PLAYER(gs);
-	if (p2 && wants_respawn(p2, g_input)) {
-		g_p2 = respawn(p2, p1, 1);
-		memset(g_input, 0, sizeof g_input);
-	} else {
-		change_class(1, p2);
+	for (int s = 1; s < PL; s++) {
+		u8 *c = slot_valid(s) ? character(g_pl[s]) : 0;
+		if (!c) continue;
+		if (wants_respawn(c, g_input[s])) {
+			g_pl[s] = respawn(c, s);
+			memset(g_input[s], 0, sizeof g_input[s]);
+		} else {
+			change_class(s, c);
+		}
 	}
 }
 

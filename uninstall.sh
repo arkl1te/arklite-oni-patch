@@ -3,7 +3,7 @@
 #
 #   ./uninstall.sh [--purge] [path/to/Oni/AE]   (or set ONI_AE_DIR)
 #
-# Kept unless --purge: AE/Arklite.ini (settings) and AE/Arklite.log. Always kept: custom levels
+# Kept unless --purge: AE/Arklite.ini (settings) and Arklite's logs (AE/logs/). Always kept: custom levels
 # in AE/GameDataFolder/CustomLevels (an empty folder is removed), recordings (*.akr), persist.dat
 # and persist.dat.before-arklite (the save file as it was before the first install).
 set -euo pipefail
@@ -53,6 +53,9 @@ if [ -L "$AE/GameDataFolder/CustomLevels" ]; then
 else
 	rmdir "$AE/GameDataFolder/CustomLevels" 2>/dev/null || true
 fi
-[ $PURGE = 1 ] && rm -f "$AE/Arklite.ini" "$AE/Arklite.log"
+if [ $PURGE = 1 ]; then
+	rm -f "$AE/Arklite.ini" "$AE/Arklite.log" "$AE/logs/Arklite"*
+	rmdir "$AE/logs" 2>/dev/null || true
+fi
 echo "Arklite removed from $AE"
-[ $PURGE = 1 ] || echo "Kept AE/Arklite.ini and AE/Arklite.log (--purge removes them)."
+[ $PURGE = 1 ] || echo "Kept AE/Arklite.ini and the logs in AE/logs/ (--purge removes them)."

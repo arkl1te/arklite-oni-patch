@@ -20,15 +20,66 @@ void *memcpy(void *d, const void *s, unsigned n)
 	return d;
 }
 
-/* ---- Log (AE\Arklite.log, open for the whole session) ------------------------------------ */
+/* ---- Log (AE\logs\Arklite_<date>_<time>.log, open for the whole session) ------------------ */
+
+typedef struct { u16 year, month, weekday, day, hour, minute, second, ms; } SYSTEMTIME;
+__declspec(dllimport) void WINAPI GetLocalTime(SYSTEMTIME *);
+__declspec(dllimport) int  WINAPI CreateDirectoryA(const char *, void *);
+__declspec(dllimport) int  WINAPI DeleteFileA(const char *);
+__declspec(dllimport) int  WINAPI CloseHandle(HANDLE);
 
 static HANDLE g_log = INVALID_HANDLE_VALUE;
+static char g_log_path[MAX_PATH] = "Arklite.log";
 
-void log_open(const char *path)
+/* "Arklite.log" -> logs\Arklite_2026-10-29_00-45-12.log. A crash or freeze used to be lost to
+ * the next start rewriting the file; now the newest LOG_KEEP of each name are kept (the oldest
+ * deleted to make room for this one). path gets the file's name, for the log. */
+static int name_before(const char *a, const char *b)
 {
-	g_log = CreateFileA(path, 0x40000000 /* GENERIC_WRITE */, 1 /* FILE_SHARE_READ */, 0,
-	                    2 /* CREATE_ALWAYS */, 0x80, 0);
+	while (*a && *a == *b) a++, b++;
+	return (u8)*a < (u8)*b;
 }
+
+HANDLE log_file_create(const char *name, char *path)
+{
+	char stem[100], pattern[MAX_PATH], oldest[MAX_PATH];
+	const char *ext = "";
+	WIN32_FIND_DATAA fd;
+	SYSTEMTIME t;
+	u32 n = str_len(name);
+
+	if (n >= sizeof stem) return INVALID_HANDLE_VALUE;
+	str_cpy(stem, sizeof stem, name);
+	for (u32 i = n; i-- > 0 && stem[i] != '\\' && stem[i] != '/'; )
+		if (stem[i] == '.') { ext = name + i; stem[i] = 0; break; }
+	CreateDirectoryA(LOG_DIR, 0);
+	fmt(pattern, LOG_DIR "\\%s_\?\?\?\?-\?\?-\?\?_\?\?-\?\?-\?\?%s", stem, ext);
+	for (;;) {   /* the names sort by time: delete the first until there's room */
+		u32 count = 0;
+		HANDLE h = FindFirstFileA(pattern, &fd);
+		if (h == INVALID_HANDLE_VALUE) break;
+		do {
+			if (!count++ || name_before(fd.cFileName, oldest)) str_cpy(oldest, sizeof oldest, fd.cFileName);
+		} while (FindNextFileA(h, &fd));
+		FindClose(h);
+		if (count < LOG_KEEP) break;
+		fmt(path, LOG_DIR "\\%s", oldest);
+		if (!DeleteFileA(path)) break;
+	}
+	GetLocalTime(&t);
+	fmt(path, LOG_DIR "\\%s_%04d-%02d-%02d_%02d-%02d-%02d%s", stem, t.year, t.month, t.day, t.hour, t.minute, t.second, ext);
+	return CreateFileA(path, 0x40000000 /* GENERIC_WRITE */, 1 /* FILE_SHARE_READ */, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+}
+
+void log_open(const char *name)
+{
+	char path[MAX_PATH];
+	if (g_log != INVALID_HANDLE_VALUE) CloseHandle(g_log);
+	g_log = log_file_create(name, path);
+	if (g_log != INVALID_HANDLE_VALUE) str_cpy(g_log_path, sizeof g_log_path, path);
+}
+
+const char *log_path(void) { return g_log_path; }
 
 void log_msg(const char *f, ...)
 {

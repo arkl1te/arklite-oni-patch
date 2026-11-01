@@ -169,6 +169,28 @@ void ui_set_frame(WMtWindow *w, int x, int y, int width, int height)
 	if (w) WMrWindow_SetFrame(w, 0, x, y, width, height, 4);
 }
 
+/* A listbox counts its rows when created and never again (WM_ListBox.c, no resize message), and
+ * scrolls by that count: one made shorter can't reach its last rows. Sets the count too. */
+#define WMrWindow_GetLong ((u8 *(ONI_FC *)(WMtWindow *, u32))0x474dc0)
+#define LB_VISIBLE(p)     (*(u32 *)((p) + 0x8c))
+#define LB_ROW_H(p)       (*(short *)((p) + 0x92))
+
+void ui_list_set_frame(WMtWindow *w, int x, int y, int width, int height)
+{
+	u8 *p;
+	int row, chrome;
+
+	if (!w) return;
+	p = WMrWindow_GetLong(w, 0);
+	row = p ? LB_ROW_H(p) : 0;
+	chrome = row > 0 ? WIN_H(w) - (int)LB_VISIBLE(p) * row : -1;
+	ui_set_frame(w, x, y, width, height);
+	if (row > 0 && chrome >= 0 && chrome < row && height > chrome + row)
+		LB_VISIBLE(p) = (u32)((height - chrome) / row);
+	else
+		log_msg("ui: list %d: rows left as they were (row height %d, chrome %d)", WIN_ID(w), row, chrome);
+}
+
 void ui_set_text(WMtWindow *w, const char *text)
 {
 	if (w) WMrWindow_SetTitle(w, text, 0x100);
@@ -741,8 +763,10 @@ int mp_menu_choose(void)
 
 enum { ID_HOST_GO = 1, ID_HOST_CANCEL = 2, ID_HOST_DEDICATE = 3,
        ID_HOST_NAME = 120, ID_HOST_PORT, ID_HOST_PLAYERS, ID_HOST_SPECTATORS, ID_HOST_TIME, ID_HOST_SCORE };
-#define MAX_PLAYERS_SETTING 64
-#define HOST_NOTE "A game has 2 players for now."
+#define MAX_SPECTATORS_SETTING 64
+#define HOST_STR(x)  HOST_STR_(x)
+#define HOST_STR_(x) #x
+#define HOST_NOTE "2 to " HOST_STR(NET_PLAYERS_MAX) " players, if the map has room."
 
 static WMtWindow *g_hostStatus;
 static const char *g_hostMap;
@@ -810,11 +834,11 @@ static void host_init(WMtWindow *dialog)
 	ui_set_frame(frame[1], 5, 187, 300, 133);   /* the frame art needs 93 px (52 + 41 corners) */
 	ui_label(dialog, row, header, "Match", 50, 172, 150, 20, UI_LEFT);
 	ui_label(dialog, row, row, "Max players:", 25, 199, 120, 20, UI_LEFT);
-	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_players", 8, ini_path()), 2, MAX_PLAYERS_SETTING));
-	add_field(dialog, row, row, ID_HOST_PLAYERS, 150, 199, 60, 2, number, FIELD_NUMBER, 2, MAX_PLAYERS_SETTING);
+	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_players", NET_PLAYERS_MAX, ini_path()), 2, NET_PLAYERS_MAX));
+	add_field(dialog, row, row, ID_HOST_PLAYERS, 150, 199, 60, 1, number, FIELD_NUMBER, 2, NET_PLAYERS_MAX);
 	ui_label(dialog, row, row, "Max spectators:", 25, 222, 120, 20, UI_LEFT);
-	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_spectators", 0, ini_path()), 0, MAX_PLAYERS_SETTING));
-	add_field(dialog, row, row, ID_HOST_SPECTATORS, 150, 222, 60, 2, number, FIELD_NUMBER, 0, MAX_PLAYERS_SETTING);
+	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_spectators", 0, ini_path()), 0, MAX_SPECTATORS_SETTING));
+	add_field(dialog, row, row, ID_HOST_SPECTATORS, 150, 222, 60, 2, number, FIELD_NUMBER, 0, MAX_SPECTATORS_SETTING);
 	ui_label(dialog, row, row, "Time limit:", 25, 245, 120, 20, UI_LEFT);
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "time_limit", 10, ini_path()), 0, NET_TIME_LIMIT_MAX));
 	add_field(dialog, row, row, ID_HOST_TIME, 150, 245, 60, 3, number, FIELD_NUMBER, 0, NET_TIME_LIMIT_MAX);
@@ -851,12 +875,12 @@ static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32
 		return 0;
 	}
 	*port = (u32)v;
-	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_PLAYERS), &v) || v < 2 || v > MAX_PLAYERS_SETTING) {
-		host_status("Max players: 2 to 64.");
+	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_PLAYERS), &v) || v < 2 || v > NET_PLAYERS_MAX) {
+		host_status("Max players: 2 to " HOST_STR(NET_PLAYERS_MAX) ".");
 		return 0;
 	}
 	*players = (u32)v;
-	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_SPECTATORS), &v) || v > MAX_PLAYERS_SETTING) {
+	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_SPECTATORS), &v) || v > MAX_SPECTATORS_SETTING) {
 		host_status("Max spectators: 0 to 64.");
 		return 0;
 	}
@@ -1307,7 +1331,7 @@ static void join_init(WMtWindow *dialog)
 	/* The bookmarks: the stock frame (120,10 420x400), now the top 60% */
 	ui_set_frame(outline, 120, 10, 420, 276);
 	/* one list, its rows drawn in three columns: one selection bar across them */
-	ui_set_frame(lb, 140, 42, 375, 232);
+	ui_list_set_frame(lb, 140, 42, 375, 232);
 	WIN_STYLE(lb) |= LBcStyle_OwnerDraw;
 	g_jlist = lb;
 	for (int c = 0; c < JOIN_COLUMNS; c++)

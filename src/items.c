@@ -22,7 +22,13 @@
  * The respawn time is per item: level.ini [respawn] (written by Catwalk from each item's
  * RespawnTime) lists count=N and itemK=<WEAP|PWRU> <x> <y> <z> <seconds>, matched by type and
  * position; 0 seconds means never. Items not listed take Arklite.ini [multiplayer] item_respawn
- * (30 seconds). */
+ * (30 seconds).
+ *
+ * A respawn shows: the particle item_e01 at the item's spot, its +Y (the way its sparks fly) up,
+ * and a zap there, zap09 and zap15 in turn. Those two are only permutations of the group
+ * elec_detail, whose picks are random, so each gets a one-permutation group and impulse of
+ * Arklite's, filled from the game's. All of it runs in the tick, so every PC does the same; the
+ * turn is tick state, and rollback's re-runs play no sound twice (lockstep.c). */
 #include "arklite.h"
 
 void *memset(void *, int, unsigned);
@@ -72,7 +78,10 @@ typedef struct {
 } Item;
 
 static Item g_items[MAX_ITEMS] TICK_STATE;
-static int  g_nitems TICK_STATE, g_delays_read TICK_STATE;
+#define PLAYER_FX_DELAY  3    /* ticks */
+#define PLAYER_FX_MAX    8
+static struct { u32 due; float pos[3]; } g_player_fx[PLAYER_FX_MAX] TICK_STATE;
+static int  g_nitems TICK_STATE, g_delays_read TICK_STATE, g_zap TICK_STATE;
 static u32  g_default_ticks = 30 * 60;
 
 static Item *item_for(u8 *obj, u32 type)
@@ -133,6 +142,8 @@ static u32 ONI_FC level_begin(void)
 {
 	g_nitems = 0;
 	g_delays_read = 0;
+	memset(g_player_fx, 0, sizeof g_player_fx);
+	g_zap = 0;
 	return WPrLevel_Begin();
 }
 
@@ -151,6 +162,7 @@ static void read_delays(void)
 {
 	const char *ini = custom_game_level_ini(ONrLevel_GetCurrent());
 	int count = ini ? (int)GetPrivateProfileIntA("respawn", "count", 0, ini) : 0, listed = 0;
+
 
 	g_delays_read = 1;
 	for (int i = 0; i < g_nitems; i++) g_items[i].delay = g_default_ticks;
@@ -181,6 +193,139 @@ static void read_delays(void)
 	        g_nitems, listed, g_default_ticks / 60);
 }
 
+/* ---- What a respawn looks and sounds like ------------------------------------------------ */
+
+/* What the game's particle command does (around 0x50a0a5, in the stock source
+ * ONiParticle3_CreateParticle), with its own orientation: the command's can't point straight up */
+#define P3rGetParticleClass     ((u8 *(ONI_FC *)(const char *))0x45a030)
+#define P3rCreateParticle       ((u8 *(ONI_FC *)(u8 *, u32))0x455e40)
+#define P3rSendEvent            ((u8 (ONI_FC *)(u8 *, u8 *, u32, float))0x45b2c0)
+#define P3rGetPositionPtr       ((float *(ONI_FC *)(u8 *, u8 *, u8 *))0x45abc0)
+#define ONrGameState_GetGameTime ((u32 (ONI_FC *)(void))0x4fc880)
+#define UUrLocalRandom          ((u32 (ONI_FC *)(void))0x426e30)
+#define AKrCollision_InitCache  ((void (ONI_FC *)(void *))0x441190)
+typedef u32 *(ONI_FC *ParticleField)(u8 *, u8 *);
+#define P3rGetVelocityPtr       ((ParticleField)0x50a3a0)
+#define P3rGetOffsetPosPtr      ((ParticleField)0x50a3c0)
+#define P3rGetDynamicMatrixPtr  ((ParticleField)0x50a3e0)
+#define P3rGetTextureIndexPtr   ((ParticleField)0x50a400)
+#define P3rGetTextureTimePtr    ((ParticleField)0x50a420)
+#define P3rGetOwnerPtr          ((ParticleField)0x50a440)
+#define P3rGetPrevPositionPtr   ((ParticleField)0x50a460)
+#define P3rGetLensFramesPtr     ((ParticleField)0x50a480)
+#define P3rGetEnvironmentCache  ((ParticleField)0x50a4a0)
+#define P3cEvent_Create         11
+#define PCLASS_DEF(c)           (*(u8 **)((c) + 0x48))
+#define PDEF_HAS_ORIENTATION    0x2000
+#define PCLASS_ORIENT_OFFSET(c) (*(u16 *)((c) + 0x5e))
+#define P3_HEADER_SIZE          0x44
+#define RESPAWN_PARTICLE        "item_e01"
+
+static void field_zero(u32 *p, int dwords)
+{
+	if (p) memset(p, 0, dwords * 4);
+}
+
+static void respawn_particle(const char *name, const float *pos)
+{
+	static const float up[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };   /* its +Y is world up, X = Y x Z */
+	u8 *cls = P3rGetParticleClass(name), *p, dead = 0;
+	u32 time, *texture;
+	float *at;
+
+	if (!cls) return;
+	time = ONrGameState_GetGameTime();
+	if (!(p = P3rCreateParticle(cls, time))) return;
+	at = P3rGetPositionPtr(cls, p, &dead);
+	if (dead) return;
+	memcpy(at, pos, 12);
+	if (*(u32 *)(PCLASS_DEF(cls) + 4) & PDEF_HAS_ORIENTATION)
+		memcpy(p + PCLASS_ORIENT_OFFSET(cls) + P3_HEADER_SIZE, up, sizeof up);
+	field_zero(P3rGetVelocityPtr(cls, p), 3);
+	field_zero(P3rGetOffsetPosPtr(cls, p), 3);
+	field_zero(P3rGetDynamicMatrixPtr(cls, p), 1);
+	field_zero(P3rGetOwnerPtr(cls, p), 1);
+	if ((texture = P3rGetTextureIndexPtr(cls, p))) *texture = UUrLocalRandom() & 0xffff;
+	if ((texture = P3rGetTextureTimePtr(cls, p))) *texture = time;
+	field_zero(P3rGetPrevPositionPtr(cls, p), 1);
+	field_zero(P3rGetLensFramesPtr(cls, p), 1);
+	if ((texture = P3rGetEnvironmentCache(cls, p))) AKrCollision_InitCache(texture);
+	P3rSendEvent(cls, p, P3cEvent_Create, (float)(int)time * (1.0f / 60.0f));
+}
+
+/* The game's sound structures (BFW_SoundSystem2.h) */
+#define SSrGroup_GetByName      ((u8 *(ONI_FC *)(const char *))0x47fcf0)
+#define SSrImpulse_Play         ((void (ONI_FC *)(u8 *, const float *, u32, u32, u32))0x480440)
+#define SND_ZAP_GROUP           "elec_detail"
+#define SND_NAME_SIZE           32
+#define GROUP_NUM_CHANNELS(g)   (*(u32 *)((g) + 0x2c))
+#define GROUP_PERMUTATIONS(g)   (*(u8 **)((g) + 0x30))
+#define ARRAY_USED(a)           (*(u32 *)((a) + 0x4))
+#define ARRAY_DATA(a)           (*(u8 **)((a) + 0x10))
+#define PERM_SIZE               0x38
+#define PERM_NAME(p)            ((const char *)(p) + 0x18)
+#define SND_PRIORITY_NORMAL     1
+#define ZAP_NEAR                50.0f   /* full volume inside this distance */
+#define ZAP_FAR                 400.0f  /* silent past it */
+
+typedef struct {   /* UUtMemory_Array */
+	u32 elem_size, used, chunk, allocated;
+	void *data;
+} SoundArray;
+
+typedef struct {   /* SStGroup, SStImpulse */
+	u8 group[0x34], impulse[0x8c], permutation[PERM_SIZE];
+	SoundArray permutations;
+	const char *name;
+	int ready;
+} Zap;
+
+static Zap g_zaps[2] = { { .name = "zap09" }, { .name = "zap15" } };
+
+static int name_starts(const char *s, const char *prefix)
+{
+	while (*prefix) if (*s++ != *prefix++) return 0;
+	return *s == 0 || *s == '.';
+}
+
+/* Fills it from the game's permutation: the sound data's pointer is the game's to set */
+static int zap_ready(Zap *z)
+{
+	u8 *group = SSrGroup_GetByName(SND_ZAP_GROUP), *array, *perm;
+	u32 n;
+
+	if (!group || !(array = GROUP_PERMUTATIONS(group))) return 0;
+	perm = ARRAY_DATA(array);
+	n = ARRAY_USED(array);
+	for (; n; n--, perm += PERM_SIZE)
+		if (name_starts(PERM_NAME(perm), z->name)) break;
+	if (!n) return 0;
+	memcpy(z->permutation, perm, PERM_SIZE);
+	if (!z->ready) {
+		z->permutations.elem_size = PERM_SIZE;
+		z->permutations.used = z->permutations.allocated = 1;
+		z->permutations.data = z->permutation;
+		memcpy(z->group, group, sizeof z->group);
+		*(u16 *)(z->group + 0x28) = 0;   /* flags: no-repeat means nothing with one sound */
+		GROUP_PERMUTATIONS(z->group) = (u8 *)&z->permutations;
+		*(u8 **)(z->impulse + 0x20) = z->group;
+		*(u32 *)(z->impulse + 0x44) = SND_PRIORITY_NORMAL;
+		*(float *)(z->impulse + 0x48) = ZAP_NEAR;
+		*(float *)(z->impulse + 0x4c) = ZAP_FAR;
+		z->ready = 1;
+	}
+	return 1;
+}
+
+static void respawn_sound(const float *pos)
+{
+	Zap *z = &g_zaps[g_zap];
+
+	g_zap ^= 1;
+	if (zap_ready(z)) SSrImpulse_Play(z->impulse, pos, 0, 0, 0);
+	else log_msg("items: no sound %s in the group %s", z->name, SND_ZAP_GROUP);
+}
+
 /* ---- Every tick ------------------------------------------------------------------------- */
 
 static int present(const Item *it)
@@ -203,11 +348,55 @@ u32 items_default_ticks(void) { return g_default_ticks; }
 /* the network host's, on the joiner: read again at the next level start (read_delays) */
 void items_set_default_ticks(u32 ticks) { g_default_ticks = ticks; }
 
+/* A firing weapon's loop sound (SMG, Phase Stream Projector) is an ambient its particles start on
+ * the weapon's Start event and end on Stop, which only a tick's trigger release sends. When the
+ * game stops ticking with a trigger held (the match's end), WPrReleaseTrigger (0x51a3b0, ECX the
+ * weapon, DL 1: now, even mid-burst) clears the firing flag (+2 bit 0x10) and sends Stop. */
+#define WPrReleaseTrigger   ((void (ONI_FC *)(u8 *weapon, u32 now))0x51a3b0)
+#define WEAPON_FIRING(w)    (*(u16 *)((w) + 2) & 0x10)
+
+void items_stop_firing(void)
+{
+	for (int i = 0; i < WP_WEAPON_SLOTS; i++) {
+		u8 *w = WP_WEAPONS + i * WP_WEAPON_SIZE;
+		if (WEAPON_INUSE(w) && WEAPON_FIRING(w)) WPrReleaseTrigger(w, 1);
+	}
+}
+
+/* The particle for a player coming back, whatever the map (respawn_fx.c): in the tick, like an
+ * item's, so every PC and every replay fires it. A few ticks late: on the respawn's tick
+ * the camera, which is the sound listener, is still at the body, and an impulse's volume is set
+ * as it starts, so its sound came out as far away as the spawn point is from the corpse. */
+
+void items_player_respawned(const float *pos)
+{
+	if (!P3rGetParticleClass(respawn_fx_root())) {
+		log_msg("items: no particle class %s", respawn_fx_root());
+		return;
+	}
+	for (int i = 0; i < PLAYER_FX_MAX; i++)
+		if (!g_player_fx[i].due) {
+			g_player_fx[i].due = GS_TICK(ONgGameState) + PLAYER_FX_DELAY;
+			memcpy(g_player_fx[i].pos, pos, sizeof g_player_fx[i].pos);
+			return;
+		}
+}
+
+static void player_fx_tick(u32 tick)
+{
+	for (int i = 0; i < PLAYER_FX_MAX; i++)
+		if (g_player_fx[i].due && tick >= g_player_fx[i].due) {
+			g_player_fx[i].due = 0;
+			respawn_particle(respawn_fx_root(), g_player_fx[i].pos);
+		}
+}
+
 void items_tick(void)
 {
 	u32 tick = GS_TICK(ONgGameState);
 
 	if (!g_delays_read) read_delays();
+	player_fx_tick(tick);
 	for (int i = 0; i < g_nitems; i++) {
 		Item *it = &g_items[i];
 		if (it->delay == NOT_READ) it->delay = g_default_ticks;   /* made after the level start */
@@ -218,6 +407,10 @@ void items_tick(void)
 			if (it->type == OBJcType_WEAP) weapon_from_object(it->obj, 0);
 			else powerup_from_object(it->obj, 0);
 			if (!it->made) it->due = tick + it->delay;   /* couldn't: try again later */
+			else {
+				respawn_particle(RESPAWN_PARTICLE, OBJ_POS(it->obj));
+				respawn_sound(OBJ_POS(it->obj));
+			}
 		}
 	}
 }

@@ -13,7 +13,9 @@
  * Each line gets a black shadow down and right. The context renders a string into a texture and
  * draws it as one sprite (0x41a5e0, 2 corner points {x, y, z, 1/w}, called at 0x42deae); while
  * we draw, that call doubles the sprite from its top-left corner, so our text is twice Oni's
- * size (the user asked for double).
+ * size (the user asked for double). The top right corner (score, time left, FPS) has no doubling:
+ * the same size comes from Tahoma's own 14 point font, Oni's sharp in-game lettering, and the
+ * doubled 7 point only if that font can't be had.
  *
  * Lobby: "Press F3 to be ready" in red, or "Press F3 to be unready" in green, and under it who
  * is ready or the countdown, until the match starts; in red under that, what keeps a joiner out
@@ -23,7 +25,11 @@
  * was reached ("Press fire to go back to the lobby"), the name of
  * the player this PC's player faces over their head, and "Out of sync" when a state check failed. The chat
  * (chat.c) in the lower left, in the lobby too. The F2 character menu
- * (char_menu.c) is drawn last, over all of it. */
+ * (char_menu.c) is drawn last, over all of it.
+ *
+ * The FPS counter (Options > More...) is here for the same text, but not in the HUD, which is
+ * skipped in cutscenes and with the UI hidden: it goes after the console display (0x430430,
+ * called at 0x4fbe7c by every frame of the game display 0x4fb480), in the score's corner. */
 #include "arklite.h"
 
 #define ONgTextContext      (*(void **)0x5ece70)
@@ -31,6 +37,8 @@
 #define TSrContext_Measure  ((u16 (ONI_FC *)(void *, const char *, short *))0x42e920)
 #define TSrContext_GetFont  ((void *(ONI_FC *)(void *, u32))0x42e8c0)
 #define TSrFont_LineHeight  ((u16 (ONI_FC *)(void *))0x42eec0)
+#define TSrContext_SetSize  ((u16 (ONI_FC *)(void *, u32))0x42ed50)
+#define CONTEXT_SIZE(ctx)   (*(u16 *)((u8 *)(ctx) + 0x10))
 #define TSrContext_Draw     ((u16 (ONI_FC *)(void *, const char *, u32, u32, short *))0x42df00)
 #define M3rScreen_Width     ((u16 (ONI_FC *)(void))0x41e0f0)
 #define M3rScreen_Height    ((u16 (ONI_FC *)(void))0x41e130)
@@ -40,8 +48,14 @@
 #define M3rDraw_Sprite      ((u32 (ONI_FC *)(const float *, const void *))0x41a5e0)
 #define ONcText_SpriteCall  0x42deae
 #define TEXT_SCALE          2
+#define CORNER_POINTS       14
 #define ONrTimer_Display    ((void (ONI_FC *)(void *))0x4fd500)
 #define ONcTimer_DisplayCall 0x50061f
+#define COrConsole_Display  ((void (ONI_FC *)(void))0x430430)
+#define ONcConsole_DisplayCall 0x4fbe7c
+
+__declspec(dllimport) int WINAPI QueryPerformanceCounter(unsigned long long *);
+__declspec(dllimport) int WINAPI QueryPerformanceFrequency(unsigned long long *);
 
 #define RED     0xffff4040u
 #define GREEN   0xff40ff40u
@@ -49,7 +63,10 @@
 #define YELLOW  0xffffe040u
 #define SHADOW  0xff000000u
 
-static int g_line_height;         /* scaled */
+#define FPS_REFRESH_FRAMES 6
+#define MARGIN  24
+
+static int g_line_height;         /* on screen, set by corner_begin */
 static int g_scaling;
 static float g_anchor_x, g_anchor_y;   /* the line's top-left, which stays put */
 
@@ -71,8 +88,9 @@ static u32 ONI_FC text_sprite(const float *pts, const void *uv)
 #define CENTER MP_CENTER
 #define RIGHT  MP_RIGHT
 
-/* One line of text; x is its left, center or right edge, y the top of the line */
-static void text(const char *s, int x, int y, int align, u32 color)
+/* One line of text at scale times the font's size; x is its left, center or right edge, y the top
+ * of the line, height its height on screen */
+static void text_at(const char *s, int x, int y, int align, u32 color, int scale, int height)
 {
 	void *ctx = ONgTextContext;
 	short rect[4] = { 0 }, at[2];
@@ -80,24 +98,49 @@ static void text(const char *s, int x, int y, int align, u32 color)
 
 	if (!ctx) return;
 	TSrContext_Measure(ctx, s, rect);
-	w = (rect[2] - rect[0]) * TEXT_SCALE;
+	w = (rect[2] - rect[0]) * scale;
 	if (align == CENTER) x -= w / 2;
 	else if (align == RIGHT) x -= w;
 	/* the point is the line's bottom at Oni's size, the anchor its top-left */
-	g_scaling = 1;
+	g_scaling = scale > 1;
 	for (int pass = 0; pass < 2; pass++) {
 		int off = pass ? 0 : TEXT_SCALE;   /* shadow first */
 		g_anchor_x = (float)(x + off);
 		g_anchor_y = (float)(y + off);
 		at[0] = (short)(x + off);
-		at[1] = (short)(y + off + g_line_height / TEXT_SCALE);
+		at[1] = (short)(y + off + height / scale);
 		TSrContext_SetColor(ctx, pass ? color : SHADOW);
 		TSrContext_Draw(ctx, s, color >> 24, 0, at);   /* the color's alpha: chat.c fades lines */
 	}
 	g_scaling = 0;
 }
 
-/* For char_menu.c, while it draws from the HUD below */
+/* All of it is in the fine font: Tahoma 14 point as is, set by corner_begin. Without that size
+ * (corner_begin left 0 here) the context's 7 point, doubled. */
+static int g_fine_height;
+
+static void text(const char *s, int x, int y, int align, u32 color)
+{
+	if (g_fine_height) text_at(s, x, y, align, color, 1, g_fine_height);
+	else text_at(s, x, y, align, color, TEXT_SCALE, g_line_height);
+}
+
+/* Between corner_begin and corner_end the context has the fine font; all text drawn or measured
+ * goes between them */
+static u32 corner_begin(void *ctx)
+{
+	u32 size = CONTEXT_SIZE(ctx);
+
+	g_line_height = TSrFont_LineHeight(TSrContext_GetFont(ctx, 0)) * TEXT_SCALE;
+	g_fine_height = 0;
+	if (TSrContext_SetSize(ctx, CORNER_POINTS) == 0)
+		g_line_height = g_fine_height = TSrFont_LineHeight(TSrContext_GetFont(ctx, 0));
+	return size;
+}
+
+static void corner_end(void *ctx, u32 size) { TSrContext_SetSize(ctx, size); }
+
+/* For chat.c, char_menu.c and mp_names.c, while they draw from the HUD below */
 void mp_hud_text(const char *s, int x, int y, int align, u32 color) { text(s, x, y, align, color); }
 int  mp_hud_line_height(void) { return g_line_height; }
 
@@ -117,7 +160,7 @@ int mp_hud_text_width(const char *s, int n)
 	buf[k + 1] = 0;
 	TSrContext_Measure(ctx, buf, rect);
 	TSrContext_Measure(ctx, "|", bar);
-	return ((rect[2] - rect[0]) - (bar[2] - bar[0])) * TEXT_SCALE;
+	return ((rect[2] - rect[0]) - (bar[2] - bar[0])) * (g_fine_height ? 1 : TEXT_SCALE);
 }
 
 static void draw_lobby(const NetHud *h, int width, int height)
@@ -130,7 +173,7 @@ static void draw_lobby(const NetHud *h, int width, int height)
 	if (h->countdown_ms >= 0)
 		fmt(line, "The match starts in %d", (h->countdown_ms + 999) / 1000);
 	else if (!h->connected)
-		fmt(line, h->local_player ? "Connecting to the host..." : "Waiting for players to join");
+		fmt(line, h->joiner ? "Connecting to the host..." : "Waiting for players to join");
 	else if (h->players < 2)
 		fmt(line, "Waiting for players to join");
 	else
@@ -138,29 +181,50 @@ static void draw_lobby(const NetHud *h, int width, int height)
 	text(line, x, y, CENTER, WHITE);
 }
 
-/* What keeps the joiner out, under the lobby text */
+/* What keeps a joiner out, under the lobby text */
 static void draw_problem(const NetHud *h, int width, int height)
 {
-	int x = width / 2, y = height / 5 + 2 * (g_line_height + 4);
+	int x = width / 2, y = height / 5 + 2 * (g_line_height + 4), joiner = h->joiner;
 
 	if (!h->problem) return;
-	text(h->local_player ? "Can't join: not the same on both PCs:" : "A player can't join: not the same on both PCs:",
+	if (h->problem == NETBAD_FULL) {
+		text(joiner ? "Can't join: the server is full" : "A player can't join: the server is full", x, y, CENTER, RED);
+		return;
+	}
+	text(joiner ? "Can't join: not the same on both PCs:" : "A player can't join: not the same on both PCs:",
 	     x, y, CENTER, RED);
-	for (u32 bit = 1; bit <= NETBAD_PLAYERS; bit <<= 1) {
+	for (u32 bit = 1; bit <= NETBAD_LAST; bit <<= 1) {
+		if (bit == NETBAD_FULL) continue;
 		if (!(h->problem & bit)) continue;
 		y += g_line_height + 2;
 		text(net_problem_text(bit), x, y, CENTER, RED);
 	}
 	y += g_line_height + 2;
-	text("Copy it from one PC to the other (see Arklite.log)", x, y, CENTER, WHITE);
+	{
+		char line[MAX_PATH + 48];
+		fmt(line, "Copy it from one PC to the other (see %s)", log_path());
+		text(line, x, y, CENTER, WHITE);
+	}
 }
 
-static void draw_score(int local, int width)
+/* The players listed: a network game's, or the ones on this PC */
+static u32 players_shown(const NetHud *h)
+{
+	u32 mask = 0;
+	if (h->state != NETHUD_OFF) return h->present | h->gone;
+	for (int who = 0; who < PLAYERS_MAX; who++)
+		if (players_char(who)) mask |= 1u << who;
+	return mask;
+}
+
+static void draw_score(const NetHud *h, int local, int width)
 {
 	char line[64];
-	int x = width - 24, y = 24, left = players_time_left();
+	int x = width - MARGIN, y = MARGIN, left = players_time_left();
 
-	for (int who = 0; who < 2; who++) {
+	if (show_fps()) y += g_line_height + 2;
+	for (int who = 0; who < PLAYERS_MAX; who++) {
+		if (!(players_shown(h) >> who & 1)) continue;
 		fmt(line, local == who ? "%s (you)   %d" : "%s   %d", mp_name(who), players_score(who));
 		text(line, x, y, RIGHT, local == who ? YELLOW : WHITE);
 		y += g_line_height + 2;
@@ -176,36 +240,55 @@ static void draw_score(int local, int width)
 static void draw_over(const NetHud *h, int width, int height)
 {
 	char line[96];
-	int x = width / 2, y = height / 5, w = players_winner();
+	int x = width / 2, y = height / 5, w = players_winner(h->present), order[PLAYERS_MAX], n;
 
 	if (w < 0) str_cpy(line, sizeof line, "Match over: a draw!");
 	else if (w == h->local_player) str_cpy(line, sizeof line, "Match over: you win!");
 	else fmt(line, "Match over: %s wins!", mp_name(w));
 	text(line, x, y, CENTER, w < 0 ? WHITE : w == h->local_player ? GREEN : RED);
 	y += g_line_height + 4;
-	fmt(line, "%s %d : %d %s", mp_name(0), players_score(0), players_score(1), mp_name(1));
-	text(line, x, y, CENTER, WHITE);
-	y += g_line_height + 4;
+	n = players_ranking(h->present, order);
+	if (n == 2) {
+		fmt(line, "%s %d : %d %s", mp_name(order[0]), players_score(order[0]), players_score(order[1]), mp_name(order[1]));
+		text(line, x, y, CENTER, WHITE);
+		y += g_line_height + 4;
+	} else {
+		for (int i = 0; i < n; i++) {
+			fmt(line, "%d. %s   %d", i + 1, mp_name(order[i]), players_score(order[i]));
+			text(line, x, y, CENTER, order[i] == h->local_player ? YELLOW : WHITE);
+			y += g_line_height + 2;
+		}
+		y += 2;
+	}
 	if (h->over_ready) fmt(line, "Waiting for the others (%d of %d ready, %d s)", h->over_ready_count, h->over_players,
 	                       (h->over_left_ms + 999) / 1000);
 	else fmt(line, "Press fire to go back to the lobby (%d s)", (h->over_left_ms + 999) / 1000);
 	text(line, x, y, CENTER, h->over_ready ? GREEN : YELLOW);
 }
 
-/* The other PC went quiet or is gone */
+/* Another PC went quiet or is gone */
 static void draw_connection(const NetHud *h, int width, int height)
 {
 	char line[96];
-	const char *who = mp_name(1 - h->local_player);
 	int x = width / 2, y = height / 5;
 
-	if (h->lost) {
-		fmt(line, h->lost == 2 ? "%s left the game" : "Connection lost: %s stopped answering", who);
+	if (h->lost) {   /* a joiner without the host: nobody else moves */
+		fmt(line, h->lost == 2 ? "%s left the game" : "Connection lost: %s stopped answering", mp_name(0));
 		text(line, x, y, CENTER, RED);
-		text("Their player stands still. Esc opens the menu to quit.", x, y + g_line_height + 4, CENTER, WHITE);
-	} else if (h->silent_ms) {
-		fmt(line, "Waiting for %s... (%d s)", who, (h->silent_ms + 999) / 1000);
+		text("The other players stand still. Esc opens the menu to quit.", x, y + g_line_height + 4, CENTER, WHITE);
+		return;
+	}
+	if (h->silent_ms) {
+		fmt(line, "Waiting for %s... (%d s)", mp_name(h->silent_who), (h->silent_ms + 999) / 1000);
 		text(line, x, y, CENTER, YELLOW);
+		y += g_line_height + 4;
+	}
+	for (int who = 0; who < PLAYERS_MAX; who++) {
+		if (!(h->gone >> who & 1)) continue;
+		fmt(line, h->left >> who & 1 ? "%s left the game: their player stands still" :
+		    "%s stopped answering: their player stands still", mp_name(who));
+		text(line, x, y, CENTER, RED);
+		y += g_line_height + 2;
 	}
 }
 
@@ -214,7 +297,7 @@ static void ONI_FC timer_display(void *timer)
 	NetHud h;
 	void *ctx = ONgTextContext;
 	int width, height;
-	u32 color;
+	u32 color, size;
 
 	hud_timer_display(timer);   /* Oni's timer, scaled with the HUD */
 	if (!ctx || !ONgGameState || !ONrLevel_GetCurrent()) return;
@@ -223,21 +306,60 @@ static void ONI_FC timer_display(void *timer)
 
 	width = M3rScreen_Width();
 	height = M3rScreen_Height();
-	g_line_height = TSrFont_LineHeight(TSrContext_GetFont(ctx, 0)) * TEXT_SCALE;
 	color = *(u32 *)((u8 *)ctx + 0xc);   /* the timer's color, put back after */
+	size = corner_begin(ctx);
 
 	if (h.state == NETHUD_LOBBY) draw_lobby(&h, width, height);
 	else if (h.state == NETHUD_STARTING) text("Starting the match...", width / 2, height / 5, CENTER, WHITE);
-	else draw_score(h.state == NETHUD_MATCH ? h.local_player : -1, width);
+	else draw_score(&h, h.state == NETHUD_MATCH ? h.local_player : -1, width);
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) draw_problem(&h, width, height);
 	if (h.state != NETHUD_LOBBY && h.state != NETHUD_STARTING) mp_names_draw(width, height);
 	chat_draw(width, height);
-	if (h.desynced) text("Out of sync with the other PC (see Arklite.log)", width / 2, 24, CENTER, RED);
+	if (h.desynced) {
+		char line[MAX_PATH + 48];
+		fmt(line, "Out of sync with another PC (see %s)", log_path());
+		text(line, width / 2, 24, CENTER, RED);
+	}
 	if (h.state == NETHUD_MATCH && h.over) draw_over(&h, width, height);
 	else if (h.state == NETHUD_MATCH) draw_connection(&h, width, height);
 	char_menu_draw(width, height);
 
+	corner_end(ctx, size);
 	TSrContext_SetColor(ctx, color);
+}
+
+/* Counts every frame, so the first figure after turning it on is a real one. The low half of the
+ * performance counter is enough over 6 frames, and float math needs no 64-bit division (-nostdlib). */
+static void ONI_FC console_display(void)
+{
+	static unsigned long long frequency;
+	static u32 frames, start;
+	static int fps;
+	void *ctx = ONgTextContext;
+
+	COrConsole_Display();
+	if (++frames >= FPS_REFRESH_FRAMES) {
+		unsigned long long now = 0;
+		u32 elapsed;
+
+		if (!frequency) QueryPerformanceFrequency(&frequency);
+		QueryPerformanceCounter(&now);
+		elapsed = (u32)now - start;
+		if (start && elapsed) fps = (int)(frames * (float)(long long)frequency / (float)(long long)elapsed + 0.5f);
+		start = (u32)now;
+		frames = 0;
+	}
+	if (show_fps() && fps && ctx && ONgGameState && ONrLevel_GetCurrent()) {
+		u32 color = *(u32 *)((u8 *)ctx + 0xc);
+		char line[16];
+		u32 size;
+
+		size = corner_begin(ctx);
+		fmt(line, "%d FPS", fps);
+		text(line, M3rScreen_Width() - MARGIN, MARGIN, RIGHT, WHITE);
+		corner_end(ctx, size);
+		TSrContext_SetColor(ctx, color);
+	}
 }
 
 void mp_hud_install(void)
@@ -246,4 +368,5 @@ void mp_hud_install(void)
 		log_msg("mp hud: text sprite call changed, the text is Oni's size");
 	if (patch_call(ONcTimer_DisplayCall, (u32)ONrTimer_Display, (u32)timer_display))
 		log_msg("mp hud: lobby text and score on screen");
+	patch_call(ONcConsole_DisplayCall, (u32)COrConsole_Display, (u32)console_display);
 }

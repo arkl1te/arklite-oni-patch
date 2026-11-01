@@ -82,7 +82,7 @@ __declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
 __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
 __declspec(dllimport) u32  WINAPI GetTickCount(void);
 
-static char g_name[MP_NAME_MAX], g_p2_name[MP_NAME_MAX], g_peer[MP_NAME_MAX];
+static char g_name[MP_NAME_MAX], g_p2_name[MP_NAME_MAX], g_peer[PLAYERS_MAX][MP_NAME_MAX];   /* g_peer: the other PCs' players' */
 static char g_edit[MP_NAME_MAX], g_before[MP_NAME_MAX];
 static int g_editing;
 static u32 g_serial = 1;
@@ -90,8 +90,8 @@ static WNDPROC g_old_proc;
 static void *g_hwnd;
 static u8 *g_target;               /* the player the name is over */
 static u32 g_target_seen;
-static char g_say[2][CHAT_MAX];    /* chat: the last message of each player, and when */
-static u32 g_say_at[2];
+static char g_say[PLAYERS_MAX][CHAT_MAX];    /* chat: the last message of each player, and when */
+static u32 g_say_at[PLAYERS_MAX];
 static u8 *g_pill;
 
 /* ---- Names -------------------------------------------------------------------------------- */
@@ -117,13 +117,14 @@ static void clean(char *d, const char *s, const char *fallback)
 const char *mp_name_local(void) { return g_name; }
 u32 mp_name_serial(void) { return g_serial; }
 
-void mp_name_set_peer(const char *name)
+void mp_name_set(int who, const char *name)
 {
 	char n[MP_NAME_MAX];
+	if (who < 0 || who >= PLAYERS_MAX) return;
 	clean(n, name, "");
-	if (same(n, g_peer)) return;
-	str_cpy(g_peer, sizeof g_peer, n);
-	if (*n) log_msg("names: the other player is %s", n);
+	if (same(n, g_peer[who])) return;
+	str_cpy(g_peer[who], MP_NAME_MAX, n);
+	if (*n) log_msg("names: player %d is %s", who + 1, n);
 }
 
 const char *mp_name(int who)
@@ -134,7 +135,7 @@ const char *mp_name(int who)
 	net_hud(&h);
 	if (h.state == NETHUD_OFF) return who == 1 ? g_p2_name : g_name;
 	if (who == h.local_player) return g_name;
-	if (*g_peer) return g_peer;
+	if (who >= 0 && who < PLAYERS_MAX && *g_peer[who]) return g_peer[who];
 	fmt(fallback, "Player %d", who + 1);
 	return fallback;
 }
@@ -237,7 +238,7 @@ static int norm(float *v)
 static int other_player(u8 *c, u8 *me)
 {
 	if (!c || c == me || !(CHR_FLAGS(c) & CHR_INUSE) || (CHR_FLAGS(c) & CHR_DEAD)) return -1;
-	for (int who = 0; who < 2; who++)
+	for (int who = 0; who < PLAYERS_MAX; who++)
 		if (c == players_char(who)) return who;
 	return -1;
 }
@@ -272,7 +273,7 @@ static int facing(const View *v, u8 *c) { return seen(v, c, ZONE_X, ZONE_BOTTOM,
 
 void mp_names_say(int who, const char *text)
 {
-	if (who < 0 || who > 1) return;
+	if (who < 0 || who >= PLAYERS_MAX) return;
 	str_cpy(g_say[who], sizeof g_say[who], text);
 	g_say_at[who] = GetTickCount() | 1;
 }
@@ -387,7 +388,7 @@ void mp_names_draw(int width, int height)
 	/* the one already named keeps it while it's still faced; else the first one faced */
 	if (g_target && other_player(g_target, me) >= 0 && facing(&v, g_target)) g_target_seen = now;
 	else
-		for (int i = 0; i < 2; i++) {
+		for (int i = 0; i < PLAYERS_MAX; i++) {
 			u8 *c = players_char(i);
 			if (c != g_target && other_player(c, me) >= 0 && facing(&v, c)) {
 				g_target = c;
@@ -400,7 +401,7 @@ void mp_names_draw(int width, int height)
 	if (!g_pill) g_pill = hud_solid(0x8000, "arklite_say_pill");
 
 	/* the name of the one faced, and of anyone talking, with what they said over it */
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < PLAYERS_MAX; i++) {
 		u8 *c = players_char(i);
 		int who = other_player(c, me), x, y, talking;
 		if (who < 0) continue;

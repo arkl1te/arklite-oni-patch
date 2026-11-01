@@ -8,13 +8,40 @@
  * (0x412fc0), so each cube edge showed as a black line. Drivers of 2001 often treated GL_CLAMP
  * as clamp-to-edge, which hid it. We push GL_CLAMP_TO_EDGE instead: the edge texel is
  * repeated and no border is sampled. That covers every clamped texture, which only loses the
- * fringe. Oni's other texture path (0x488750) already uses GL_CLAMP_TO_EDGE. */
+ * fringe. Oni's other texture path (0x488750) already uses GL_CLAMP_TO_EDGE.
+ *
+ * Bigger textures, too. The upload (0x40cf40) converts a texture's pixels into a buffer of
+ * 256x256x4 bytes, allocated once at 0x40524e, before handing them to OpenGL. Every format
+ * OniSplit writes goes through it (0x530860 is the format table), so a texture past 65536
+ * pixels ran off its end. Catwalk's levels may use 1024x1024, so the buffer takes that. */
 #include "arklite.h"
 
 #define GL_CLAMP              0x2900
 #define GL_CLAMP_TO_EDGE      0x812f
 #define GLcTexture_WrapSPush  0x40d018   /* glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ..) */
 #define GLcTexture_WrapTPush  0x40d058   /* glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ..) */
+
+#define GLcConvertBufferMov   0x40524e   /* mov ecx, size; call UUrMemory_Block_New */
+#define GLcConvertBufferOld   0x40000    /* 256 * 256 * 4 */
+#define GLcConvertBufferNew   0x400000   /* 1024 * 1024 * 4 */
+#define GLcBlockNew           0x424a50   /* UUrMemory_Block_New, called right after the mov */
+
+static void texture_buffer_install(void)
+{
+	/* Daodan's modding.largetextures gets here first and makes it 512x512, so the size can be any
+	 * that isn't ours yet. */
+	const u8 *code = (const u8 *)GLcConvertBufferMov;
+	u32 size = GLcConvertBufferNew;
+	u32 now = *(const u32 *)(code + 1);
+
+	if (code[0] != 0xb9 || now < GLcConvertBufferOld || now > GLcConvertBufferNew ||
+	    code[5] != 0xe8 || GLcConvertBufferMov + 10 + *(const u32 *)(code + 6) != GLcBlockNew) {
+		log_msg("texture buffer: unexpected code at 0x40524e, left alone");
+		return;
+	}
+	patch_write(GLcConvertBufferMov + 1, &size, 4);
+	log_msg("texture buffer: up to 1024x1024 (was %d bytes)", now);
+}
 
 void texture_clamp_install(void)
 {
@@ -23,4 +50,5 @@ void texture_clamp_install(void)
 
 	if (s && t)
 		log_msg("texture clamp: clamp to edge (no skybox seams)");
+	texture_buffer_install();
 }

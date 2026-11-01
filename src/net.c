@@ -1,47 +1,57 @@
-/* Multiplayer step 3: two PCs over UDP, deterministic lockstep with input delay (no rollback).
+/* Multiplayer step 3: two or more PCs over UDP (up to NET_PLAYERS_MAX players), deterministic
+ * lockstep with input delay, or rollback (delay 0, the default).
  *
- *   ARKLITE_HOST=[port]       host: Konoko is this PC's player (port 27777 by default)
- *   ARKLITE_JOIN=host[:port]  join: player 2 (the second Player-flagged character) is this PC's
+ *   ARKLITE_HOST=[port]       host: Konoko (player 1) is this PC's player (port 27777 by default)
+ *   ARKLITE_JOIN=host[:port]  join: this PC plays player 2, 3, ... (the next Player-flagged characters)
  *
- * Both PCs play the same map (ARKLITE_AUTOSTART=<folder>, or Custom Game). A level starts in the
- * lobby: each PC plays its own player alone (warm-up; the other player stands), and F3 toggles
- * "ready" (shown on screen by mp_hud.c). The joiner says HELLO (phase 0, its ready flag) every
- * 200 ms; the host answers LOBBY: how many players there are, how many are ready, the countdown.
- * When at least two players are there and 51% of them are ready, the host counts down 7 s (back
- * to the lobby if that stops being true); at 0 it sends LOBBY with "go" and both PCs reload the
- * level (ONrGame_StartLevel 0x4beb40, what Load Game does from the pause menu), so the match
- * starts from the same state on both: joining never interrupts the host's game, and nobody
- * needs the other's game state.
+ * The host is the hub: each joiner talks only to the host (one address to reach, as for any
+ * listen server), and the host passes every player's input on to every other PC. Links: on the
+ * host, link s is the joiner playing player s; on a joiner, link 0 is the host.
  *
- * After the reload each PC stops the clock (server time = game tick, so no tick runs) until the
- * other answers: the joiner sends HELLO (phase 1), the host answers START with its RNG seeds
- * (game RNG 0x5326d4 and lockstep.c's tick-local stream), which both put in place right before
- * the first tick. HELLO and START also carry a hash of the level-start state, the start tick,
- * the x87 control word and the game files; a difference is logged. The score (players.c) starts
- * at 0 with the match.
+ * Every PC plays the same map (ARKLITE_AUTOSTART=<folder>, or Custom Game). A level starts in the
+ * lobby: each PC plays its own player alone (warm-up; a joiner plays player 2 there, the others
+ * stand), and F3 toggles "ready" (shown on screen by mp_hud.c). Each joiner says HELLO (phase 0,
+ * its ready flag) every 200 ms; the host answers LOBBY: which player that joiner is (in the order
+ * they came; one leaving moves the later ones up), how many players there are, how many are
+ * ready, the countdown. The host takes up to Max players (the Host dialog, NET_PLAYERS_MAX at
+ * most), and no more than the map has Player-flagged characters; anyone past that hears
+ * NETBAD_FULL. When at least two players are there and 51% of them are ready, the host counts down
+ * 7 s (back to the lobby if that stops being true); at 0 it sends each joiner LOBBY with "go"
+ * (the match's player count and the joiner's player) and every PC reloads the level
+ * (ONrGame_StartLevel 0x4beb40, what Load Game does from the pause menu) with that many players
+ * (players_set_count), so the match starts from the same state everywhere: joining never
+ * interrupts the host's game, and nobody needs another's game state.
  *
- * Both PCs must run the same game: every HELLO and START carries a Compat record (hashes of
- * Arklite's source (build.sh: a local build and GitHub's of the same source match), Daodan, its gameplay settings, level0, and every file in the map's folder,
- * and whether player 2 is on). The host keeps a joiner whose record differs out of the lobby and
- * tells it why in LOBBY (refused); both PCs say on screen what differs. A packet of another
- * protocol (another Arklite) gets the same. The host's LOBBY also carries its gameplay settings
- * from Arklite.ini (respawn_delay, item_respawn) and the match's limits ([host] time_limit,
- * score_limit, from the Host dialog), which the joiner uses. A match ends at a limit (players.c);
- * see "The match's end" for the way back to the lobby (S_OVER, PKT_END).
+ * After the reload each PC stops the clock (server time = game tick, so no tick runs): the
+ * joiners send HELLO (phase 1); once every one of them has (or after LOST_MS, without the ones
+ * still loading: they're gone, see below), the host sends each START with its RNG seeds (game RNG
+ * 0x5326d4 and lockstep.c's tick-local stream), which every PC puts in place right before the
+ * first tick. HELLO and START also carry a hash of the level-start state, the start tick, the x87
+ * control word and the game files; a difference is logged. The score (players.c) starts at 0
+ * with the match.
+ *
+ * Every PC must run the same game: every HELLO and START carries a Compat record (hashes of
+ * Arklite's source (build.sh: a local build and GitHub's of the same source match), Daodan, its
+ * gameplay settings, level0, and every file in the map's folder, and whether player 2 is on).
+ * The host keeps a joiner whose record differs out of the lobby and tells it why in LOBBY
+ * (refused); both PCs say on screen what differs. A packet of another protocol (another
+ * Arklite) gets the same. The host's LOBBY also carries its gameplay settings from Arklite.ini
+ * (respawn_delay, item_respawn) and the match's limits ([host] time_limit, score_limit, from the
+ * Host dialog), which the joiners use. A match ends at a limit (players.c); see "The match's end"
+ * for the way back to the lobby (S_OVER, PKT_END).
  *
  * Ticks are numbered from the session's start. Each frame, for every tick the clock wants
  * (server time - game tick, what Daodan's DDrActionBuffer_Get computes before it hands over the
  * frame's record), this PC makes its input for tick (ticks run + delay): the frame's record for
  * the first, the same buttons without aim for the rest (what a tick with no record does). Daodan
  * only returns a record when a tick is due and keeps merging input until then, so a record that
- * can't go out yet (this PC already `delay + 6` ticks ahead) is merged into the next one. Every
- * packet carries the inputs from the peer's acknowledged tick on (at most 24), so a lost packet
- * is resent by the next. A tick runs once both PCs' inputs for it are here: the update gets
- * Konoko's records as its action records (tick i, record i) and player 2's through
- * players_net_frame. When the peer has inputs further ahead than our delay, this PC is behind
- * and runs one tick more than its clock asks (at most 6 per frame, as stock).
+ * can't go out yet is merged into the next one. Every PKT_INPUT carries, per player, the inputs
+ * from the receiver's acknowledged tick on (MAX_SEND in all), so a lost packet is resent by the
+ * next. A tick runs once every player's input for it is here (with rollback: is here or
+ * guessed): the update gets Konoko's records as its action records (tick i, record i) and the
+ * others' through players_net_frame.
  *
- * Records are cleaned the same way on both PCs: action bits 0-2 (escape, console, pausescreen;
+ * Records are cleaned the same way on every PC: action bits 0-2 (escape, console, pausescreen;
  * 0x4faec0 opens the pause menu from bit 0 inside the tick, which would open it on every PC)
  * are cleared. Word 11 carries this PC's F2 character choice (char_menu.c, read by players.c).
  * Esc still opens the menu through utility input, which reads this PC's keys. The
@@ -50,27 +60,33 @@
  *
  * Desync check: every 60 ticks each PC hashes the game state (both RNG streams and, for every
  * character in use, its flags, health, position, facing and velocity: no pointers, which differ
- * between PCs) and sends it with its inputs. Flag 0x4000 isn't hashed: the draw pass (0x4e1540)
- * sets it on the characters this PC drew. A different hash logs DESYNC with this PC's
- * character summary for that tick and writes every character's full image for that tick
- * (Arklite-desync-host.bin / -join.bin; tools/desync_diff.py compares the two), without the
- * fields each PC's drawing writes (flag 0x4000, +0x163c frames off screen, +0x1660 distance to
- * the camera, active +0x221c..+0x2225 detail level).
+ * between PCs) and sends it with its inputs; the host compares with every joiner's, each joiner
+ * with the host's. Flag 0x4000 isn't hashed: the draw pass (0x4e1540) sets it on the characters
+ * this PC drew. A different hash logs DESYNC with this PC's character summary for that tick and
+ * writes every character's full image for that tick (Arklite-desync-host.bin / -join.bin, -join3
+ * for player 3 and so on; tools/desync_diff.py compares two), without the fields each PC's
+ * drawing writes (flag 0x4000, +0x163c frames off screen, +0x1660 distance to the camera, active
+ * +0x221c..+0x2225 detail level).
  *
- * Each PC sees its own player: on the joiner the camera (gs+0x80, mode +0 == 1 follows the
+ * Each PC sees its own player: on a joiner the camera (gs+0x80, mode +0 == 1 follows the
  * character at +0x54; updated by 0x4d5ca0, called at 0x4fb141 per tick and 0x4fb170 per frame)
  * and the sound listener (0x4e33e0/0x4e3460 position, 0x4e3640 facing, called with gs+0xac at
- * 0x4fb1f4, 0x4fb1fb, 0x4fb20f) follow player 2, and the whole game display (0x4fb480: HUD,
- * laser sight, crosshair) draws with player 2 in the player slot.
+ * 0x4fb1f4, 0x4fb1fb, 0x4fb20f) follow the joiner's player, and the whole game display (0x4fb480:
+ * HUD, laser sight, crosshair) draws with that player in the player slot.
  *
  * Testing on one PC: Oni refuses a second instance (FindWindowA at 0x50f687, je at 0x50f68f),
- * so with networking on that check is skipped. The joiner's log is Arklite-join.log.
+ * so with networking on that check is skipped. The first joiner's log is Arklite-join.log; give
+ * any more joiners on the same PC their own with ARKLITE_LOG=Arklite-join3.log and so on.
  *
- * If no packet arrives for 10 s during the game, the peer is lost: the game goes on with the
- * peer's player standing still. Arklite.ini [net]: port (27777), delay (4 ticks; the host's is
- * used on both PCs), host=1 or join=<ip>[:port] when the environment doesn't say, and record
- * (1: each PC records the game, every tick, to Arklite-net-host.akr / -join.akr, lockstep.c's
- * format; tools/akr_diff.py compares the two and names the first tick and field that differ). */
+ * Players who leave: a joiner that says goodbye, or sends nothing for 10 s during the match, is
+ * gone (mark_gone). From the first tick the host has none of its inputs for, the host makes them
+ * up as "nothing pressed" and sends them on like anyone's (fill_gone), so every PC still runs
+ * the same ticks and that player stands; the rest play on. If the host goes, a joiner plays on
+ * alone with everyone else standing. Arklite.ini [net]: port (27777), delay (0: rollback; the
+ * host's is used on every PC), host=1 or join=<ip>[:port] when the environment doesn't say, and
+ * record (1: with input delay and two players, each PC records the game, every tick, to
+ * Arklite-net-host.akr / -join.akr, lockstep.c's format; tools/akr_diff.py compares the two and
+ * names the first tick and field that differ). */
 #include "arklite.h"
 
 typedef unsigned long long u64;
@@ -104,7 +120,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    NET_DEFAULT_PORT
-#define PROTO           12
+#define PROTO           13
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -186,11 +202,13 @@ __declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(voi
 
 enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY, PKT_NAME,
        PKT_MAP_LIST_REQ, PKT_MAP_LIST, PKT_MAP_REQ, PKT_MAP_DATA, PKT_INFO_REQ, PKT_INFO,
-       PKT_CHAT, PKT_CHAT_ACK, PKT_END };
+       PKT_CHAT, PKT_CHAT_ACK, PKT_END, PKT_NAMES };
+
+#define NPL             NET_PLAYERS_MAX
 
 typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
 #define NFILES 4
-/* What both PCs must have the same of (see g_file_names) */
+/* What every PC must have the same of (see g_file_names) */
 typedef struct {
 	char version[16];
 	u32 files[NFILES];
@@ -209,41 +227,60 @@ typedef struct {
 	PktHead h;
 	u32 level, players, ready, countdown_ms;   /* countdown_ms 0xffffffff: none */
 	u32 go;                /* the match starts: reload the level */
-	u32 joiner_ready;      /* what the host knows of the joiner's ready flag */
-	u32 seed, local_seed;  /* with go: both RNG streams, set on both PCs before the reload */
+	u32 joiner_ready;      /* what the host knows of this joiner's ready flag */
+	u32 seed, local_seed;  /* with go: both RNG streams, set on every PC before the reload */
 	u32 refused;           /* NETBAD_*: the joiner can't play here, and why (then nothing else counts) */
-	u32 respawn_ticks, item_ticks;   /* the host's Arklite.ini, used on both PCs */
+	u32 respawn_ticks, item_ticks;   /* the host's Arklite.ini, used on every PC */
 	u32 map_offer;         /* with refused NETBAD_MAP: the host sends its map's files on request */
 	u32 time_limit;        /* the match's limits, from the host's Host dialog: minutes (0: none) */
 	int score_limit;       /* 0: none; below 0: reached going down (suicides) */
+	u32 slot;              /* the player this joiner is: 1..players-1 */
+	u32 capacity;          /* the most players this server takes on this map */
 } PktLobby;
 typedef struct {
 	PktHead h;
 	u32 level, start_tick, state_hash, fpu_cw, seed, local_seed, delay;
 	Compat c;
+	u32 players;           /* in the match: players 0..players-1 */
+	u32 gone;              /* of them, those who never came (they stand) */
 } PktStart;
+/* Inputs. A joiner sends its own player's to the host; the host sends each joiner everyone
+ * else's (its own and the other joiners' as they came in), so every PC gets every player's input
+ * for every tick. Each stream is one player's inputs for ticks first..first+count-1 (0x30 bytes
+ * each, after the Stream). */
+typedef struct { u32 first; u16 slot, count; } Stream;
 typedef struct {
 	PktHead h;
-	u32 first, count;      /* inputs for ticks first..first+count-1 follow */
-	u32 ack;               /* every input of ours before this tick arrived */
+	u32 ack[NPL];          /* the sender has player p's inputs for ticks < ack[p] */
 	u32 hash_tick, hash;   /* our latest state hash (hash_tick 0: none yet) */
-	int adv;               /* our ticks run minus the peer's inputs we have, as sent (time sync) */
+	int adv;               /* our ticks run minus the inputs we have of the receiver's player (time sync) */
 	u32 stamp;             /* GetTickCount when sent */
-	u32 echo, held;        /* the peer's latest stamp, and how many ms ago it arrived (ping) */
+	u32 echo, held;        /* the receiver's latest stamp, and how many ms ago it arrived (ping) */
+	u32 gone, left;        /* host: the players who stopped answering / left; their inputs come from the host */
+	u16 ping[NPL];         /* host: each joiner's last round trip in ms (0xffff: not known) */
+	u32 nstreams;
 } PktInput;
 typedef struct {
 	PktHead h;
-	char name[MP_NAME_MAX];   /* this PC's player's (mp_names.c); only shown, not game state */
+	char name[MP_NAME_MAX];   /* a joiner's player's (mp_names.c); only shown, not game state */
 } PktName;
-/* Chat (chat.c): only shown, never game state. Messages are numbered in a stream (random per
- * Oni run); the receiver shows them in order and acknowledges the last one it showed, and the
- * sender sends every unacknowledged one again every CHAT_RESEND_MS. A stream the receiver hasn't
- * heard before starts at whatever number comes first (a new joiner, or the other PC restarted). */
+typedef struct {
+	PktHead h;
+	char name[NPL][MP_NAME_MAX];   /* host: every player's ("" none) */
+} PktNames;
+/* Chat (chat.c): only shown, never game state. Each link (host and one joiner) numbers its
+ * messages in a stream (random per link); the receiver shows them in order and acknowledges the
+ * last one it showed, and the sender sends every unacknowledged one again every CHAT_RESEND_MS. A
+ * stream the receiver hasn't heard before starts at whatever number comes first (a new joiner, or
+ * the other PC restarted). The host shows a joiner's message and passes it on to the other
+ * joiners, saying whose it is (from). */
 typedef struct {
 	PktHead h;
 	u32 stream, seq;
+	u32 from;              /* the player who wrote it, CHAT_SERVER: the host's line about who entered or left */
 	char text[CHAT_MAX];
 } PktChat;
+#define CHAT_SERVER     0x100
 typedef struct {
 	PktHead h;
 	u32 stream, seq;       /* the sender's stream: every message up to seq was shown */
@@ -265,8 +302,8 @@ typedef struct {
 	char map[48];          /* the map's name */
 } PktInfo;
 
-/* After a match: each PC says whether its player pressed fire; the host says how many did, how
- * long is left, and finally "go": both PCs reload the level into the lobby */
+/* After a match: each joiner says whether its player pressed fire; the host says how many did,
+ * how long is left, and finally "go": every PC reloads the level into the lobby */
 typedef struct {
 	PktHead h;
 	u32 level;
@@ -280,10 +317,34 @@ typedef struct {
 enum { NET_OFF, NET_HOST, NET_JOIN };
 enum { S_IDLE, S_LOBBY, S_WAIT, S_RUN, S_LOST, S_OVER };
 
+/* The other PCs this one talks to. On the host, link s is the joiner playing player s (1..); on
+ * a joiner, link 0 is the host. */
+typedef struct {
+	SOCKADDR_IN addr;
+	int used;
+	u32 last_recv, last_send;
+	u32 sent_sig;          /* what the last PKT_INPUT carried (sig_for): a new input sends again */
+	int ready;             /* host, lobby: the joiner pressed F3 */
+	int end_ready;         /* host, after the match: the joiner's player pressed fire */
+	int arrived;           /* host, S_WAIT: the joiner reloaded for the match */
+	char name[MP_NAME_MAX];   /* host: the joiner's player's */
+	int entered;           /* host: "Name entered the game" was said (its first PKT_NAME) */
+	u32 ack[NPL];          /* it has player p's inputs for ticks < ack[p] */
+	int adv, adv_known;    /* time sync: its ticks past its inputs of our player, as it sent */
+	u32 stamp, stamp_at;   /* its newest PktInput stamp, and when it came */
+	int ping;              /* ms, the last round trip (-1: not known) */
+	u32 ping_sum, ping_n, ping_max;   /* round trips since the last 30 s log line */
+	u32 last_lobby, last_end;
+	u32 last_names, names_at;   /* host: g_names_serial last sent, and when */
+	struct { u32 tick, hash; } theirs[HASH_SLOTS];
+	u32 checked[HASH_SLOTS];          /* the tick each slot was last compared at */
+	struct { u32 seq, at, from; char text[CHAT_MAX]; } chat_out[CHAT_QUEUE];
+	u32 chat_out_n, chat_seq, chat_stream, chat_sent_at, chat_in_stream, chat_in_seq;
+} Link;
+
 static int g_mode, g_state;
 static u32 g_sock = INVALID_SOCKET;
-static SOCKADDR_IN g_peer;
-static int g_have_peer;
+static Link g_link[NPL];
 static u16 g_port = DEFAULT_PORT;
 static u32 g_delay = 4;
 static int g_record = 1;               /* [net] record: Arklite-net-host.akr / -join.akr */
@@ -291,29 +352,25 @@ static int g_record = 1;               /* [net] record: Arklite-net-host.akr / -
 static u32 g_level, g_last_tick;
 static u32 g_ticks;                    /* ticks run this session */
 static u32 g_gen;                      /* our inputs are made for ticks < g_gen */
-static u32 g_remote;                   /* the peer's inputs are here for ticks < g_remote */
-static u32 g_stall_frames, g_stall_ticks, g_last_stall_log;   /* frames held back by the peer's inputs */
-/* Time sync (rollback): each PC sends how far its ticks are past the peer's inputs it has (adv).
- * With the same latency both ways, (ours - theirs) / 2 is how many ticks this PC runs ahead of
- * the other in real time; the PC ahead leaves out one tick in every SYNC_EVERY until it isn't.
- * Never faster: the old catch-up ran one extra tick every frame, frames with no tick due
- * included, which at high frame rates ran the game about 3x as fast. */
+static u32 g_stall_frames, g_stall_ticks, g_last_stall_log;   /* frames held back by others' inputs */
+/* Time sync (rollback): each PC sends how far its ticks are past the inputs it has of the
+ * receiver's player (adv). With the same latency both ways, (ours - theirs) / 2 is how many
+ * ticks this PC runs ahead of the other in real time; the PC ahead leaves out one tick in every
+ * SYNC_EVERY until it isn't. A joiner keeps in time with the host; the host leaves out ticks only
+ * while it's ahead of every joiner. Never faster: the old catch-up ran one extra tick every
+ * frame, frames with no tick due included, which at high frame rates ran the game about 3x as
+ * fast. */
 #define SYNC_EVERY      8
-static int g_peer_adv, g_peer_adv_known;
-static u32 g_peer_stamp, g_peer_stamp_at;      /* the peer's newest PktInput stamp, when it came */
-static u32 g_ping_sum, g_ping_n, g_ping_max;   /* round trips since the last 30 s log line */
 static u32 g_sync_skip_at, g_sync_skipped;
-/* Rollback (delay 0, the default): this PC's input runs at once, the peer's is predicted, and a
- * wrong guess puts the game back (rollback.c) and runs the ticks again */
+/* Rollback (delay 0, the default): this PC's input runs at once, the others' are predicted, and
+ * a wrong guess puts the game back (rollback.c) and runs the ticks again */
 #define ROLLING         (g_delay == 0)
-#define RB_AHEAD        (ROLLBACK_KEPT_TICKS - 2)   /* ticks run past the peer's last real input, at most */
+#define RB_AHEAD        (ROLLBACK_KEPT_TICKS - 2)   /* ticks run past the last real input of any player, at most */
 #define ONgSoundOn      (*(u8 *)0x5eb757)           /* SS2 "a sound driver is there": every sound call checks it */
-static u32 g_verified;                 /* ticks < this ran with the peer's real inputs */
-static u32 g_pred[RING][12];           /* the peer's input each tick last ran with */
+static u32 g_verified;                 /* ticks < this ran with every player's real inputs */
 static int g_rb_started;               /* the engine is on for this match */
 static u8  g_sound_on;                 /* ONgSoundOn as the game had it */
 static u32 g_rollbacks, g_resim_ticks, g_rb_failed, g_rb_deepest, g_rb_frames;
-static u32 g_peer_ack;                 /* the peer has our inputs for ticks < g_peer_ack */
 static u32 g_rb_us_sum, g_rb_us_max, g_rb_restore_us_max, g_rb_timed;   /* rollback cost since the last 30 s log line */
 
 /* The performance counter's low half: differences over short spans only; us() turns them into
@@ -336,22 +393,29 @@ static u32 us(u32 counts)
 	}
 	return counts / per_us;
 }
-static u32 g_local_in[RING][12], g_remote_in[RING][12];
-static u32 g_remote_at[RING];          /* tick + 1 of the input in the slot, 0: none */
+
+/* Every player's inputs, by tick: this PC's own made here (g_gen), the others' as they came */
+static u32 g_in[NPL][RING][12];
+static u32 g_in_at[NPL][RING];         /* tick + 1 of the input in the slot, 0: none */
+static u32 g_have[NPL];                /* others' inputs are here for ticks < g_have[p] */
+static u32 g_pred[NPL][RING][12];      /* rollback: the input each other player's tick last ran with */
 static u32 g_pending[12], g_last_local[12];
 static int g_has_pending;
-static u32 g_sent_gen;
+
+/* The match: players 0..g_nplayers-1, this PC's is g_slot (the host's 0) */
+static u32 g_nplayers = 2;
+static int g_slot;
+static u32 g_gone, g_left;             /* players who stopped answering / said goodbye: they stand */
+static u32 g_wait_since;               /* host, S_WAIT: when the reload for the match came */
 
 static u32 g_seed, g_local_seed;       /* the host's, put in place before the first tick */
 static u32 g_start_hash, g_start_tick, g_start_fpu;
-static u32 g_last_recv, g_last_send, g_last_hello;
-static int g_lost_left;                /* S_LOST because the peer said goodbye, not silence */
-static u32 g_frame_p1[6][12], g_frame_p2[6][12];
+static u32 g_last_hello;
+static int g_lost_left;                /* joiner S_LOST: the host said goodbye, not silence */
+static u32 g_frames[NPL][6][12];       /* each player's records for the frame's ticks; [0] the update's own */
 
 typedef struct { u32 index, flags; int health; float pos[3], facing, vel[3]; } CharSum;
 static struct { u32 tick, hash, n, seeds[2]; CharSum chars[MAX_CHARS]; } g_mine[HASH_SLOTS];
-static struct { u32 tick, hash; } g_theirs[HASH_SLOTS];
-static u32 g_checked[HASH_SLOTS];        /* the tick each slot was last compared at */
 static u32 g_published[HASH_SLOTS];      /* rollback: the tick each slot's hash went out for (verified) */
 static u32 g_last_hash_tick, g_last_hash;
 static u32 g_checks, g_bad_checks, g_first_bad;
@@ -366,22 +430,21 @@ static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_se
 /* The lobby */
 static int g_match_pending;            /* the level was reloaded for the match: start synced */
 static int g_ready, g_f3_down;         /* this PC's player pressed F3 */
-static int g_peer_seen, g_peer_ready;  /* host: a joiner is in the lobby, and its ready flag */
 static u32 g_countdown_end;            /* host: GetTickCount at 0, 0: no countdown */
 static u32 g_lobby_players = 1, g_lobby_ready, g_lobby_countdown = 0xffffffffu, g_lobby_rx;   /* joiner: the host's view */
 static int g_host_heard;               /* joiner: a LOBBY arrived in this lobby */
-static u32 g_last_lobby;
-static u32 g_last_name, g_name_sent;   /* when our name last went out, and mp_name_serial() then */
+static u32 g_last_name, g_name_sent;   /* joiner: when our name last went out, and mp_name_serial() then */
+static u32 g_names_serial = 1, g_names_local;   /* host: changes with any player's name */
 static u32 g_match_seed, g_match_local_seed;   /* the RNGs the match's level loads with */
 static u32 g_problem, g_problem_at;    /* NETBAD_* last seen (refused / refusing), and when */
 /* The match's limits: the host's from Arklite.ini [host] (the Host dialog), the joiner's from LOBBY */
 static u32 g_time_limit = 10;          /* minutes, 0: none */
 static int g_score_limit = 20;         /* 0: none */
-static int g_ping = -1;                /* ms, the last round trip measured (match only) */
+static int g_peer_ping[NPL];           /* joiner: each player's round trip to the host, as the host said */
 /* After the match (S_OVER) */
-static u32 g_over_at, g_last_end;
+static u32 g_over_at;
 static u8 *g_look_who;                 /* whose camera turns after the match; 0: start again from the character */
-static int g_end_ready, g_peer_end_ready, g_fire_down, g_over_lost;
+static int g_end_ready, g_fire_down, g_over_lost;
 static u32 g_end_players, g_end_ready_count, g_end_left_ms, g_end_rx;   /* joiner: the host's view */
 
 /* A level reload that waits for the live dialogs to close (reload_level) */
@@ -390,10 +453,136 @@ static int g_reload_seeds;             /* load it with g_match_seed / g_match_lo
 
 /* The server, as the Host dialog (or Arklite.ini [host]) has it */
 static char g_server_name[NET_SERVER_NAME_MAX] = "New Oni multiplayer game";
-static u32 g_max_players = 8, g_max_spectators;
+static u32 g_max_players = NET_PLAYERS_MAX, g_max_spectators;
 static u32 g_server_id;
 static int g_startup_mode;             /* set by the environment or Arklite.ini [net], not the menu */
 static int g_hashed, g_join_installed;
+
+/* ---- Players and links ---------------------------------------------------------------------- */
+
+static int gone(int p) { return (g_gone >> p & 1) != 0; }
+
+/* Player p's inputs come over the network (or, on the host, are made up for one who's gone) */
+static int remote(int p) { return p >= 0 && p < (int)g_nplayers && p != g_slot; }
+
+/* What this PC has of player p's inputs: ticks < have_of(p) */
+static u32 have_of(int p) { return p == g_slot ? g_gen : g_have[p]; }
+
+/* The other players' inputs are all here for ticks < remote_min() */
+static u32 remote_min(void)
+{
+	u32 m = 0xffffffffu;
+	for (int p = 0; p < (int)g_nplayers; p++)
+		if (remote(p) && g_have[p] < m) m = g_have[p];
+	return m == 0xffffffffu ? g_gen : m;
+}
+
+/* A link to a PC still in this lobby or match */
+static int live(int l) { return l >= 0 && l < NPL && g_link[l].used && !(g_state != S_LOBBY && g_mode == NET_HOST && gone(l)); }
+
+static int link_of(const SOCKADDR_IN *a)
+{
+	for (int l = 0; l < NPL; l++)
+		if (g_link[l].used && g_link[l].addr.addr == a->addr && g_link[l].addr.port == a->port) return l;
+	return -1;
+}
+
+/* host: joiners in the lobby (links 1.. are kept together) */
+static u32 joiners(void)
+{
+	u32 n = 0;
+	for (int l = 1; l < NPL; l++) n += g_link[l].used != 0;
+	return n;
+}
+
+static u32 bits(u32 v)
+{
+	u32 n = 0;
+	for (; v; v &= v - 1) n++;
+	return n;
+}
+
+/* The players this PC's game has: the lobby's or the match's, without the gone ones */
+static u32 present_mask(void)
+{
+	u32 n;
+	if (g_state == S_LOBBY) n = g_mode == NET_HOST ? 1 + joiners() : g_host_heard ? g_lobby_players : 0;
+	else n = g_nplayers;
+	if (n > NPL) n = NPL;
+	return ((1u << n) - 1) & ~(g_state == S_LOBBY ? 0 : g_gone);
+}
+
+/* The most players this server takes on this level: Max players, and the map's spawn points */
+static u32 capacity(void)
+{
+	int spawns = players_spawn_points();
+	u32 n = g_max_players;
+	if (spawns >= 2 && (u32)spawns < n) n = (u32)spawns;
+	return n < 2 ? 2 : n > NPL ? NPL : n;
+}
+
+/* The character this PC's player drives: a joiner's lobby has only player 2 (each PC plays
+ * alone there); the match's is the joiner's own */
+static int local_char(void)
+{
+	if (g_mode != NET_JOIN) return 0;
+	return g_state == S_LOBBY || g_state == S_IDLE ? 1 : g_slot;
+}
+
+static void link_reset(Link *k)
+{
+	SOCKADDR_IN a = k->addr;
+	int used = k->used;
+	memset(k, 0, sizeof *k);
+	k->addr = a;
+	k->used = used;
+	k->ping = -1;
+	k->chat_stream = (GetTickCount() * 0x9e3779b1u ^ (u32)(unsigned long)k ^ counter()) | 1;
+}
+
+/* host: a joiner comes into the lobby in the first free place */
+static int add_link(const SOCKADDR_IN *a)
+{
+	for (int l = 1; l < NPL; l++) {
+		if (g_link[l].used) continue;
+		memset(&g_link[l], 0, sizeof g_link[l]);
+		g_link[l].addr = *a;
+		g_link[l].used = 1;
+		link_reset(&g_link[l]);
+		g_link[l].last_recv = GetTickCount();
+		g_names_serial++;
+		return l;
+	}
+	return -1;
+}
+
+static void remove_link(int l);
+static void server_line(const char *name, const char *what);
+
+/* host, lobby: joiner l said goodbye or stopped answering */
+static void lobby_leave(int l)
+{
+	char name[MP_NAME_MAX];
+	int said = g_link[l].entered;
+	str_cpy(name, sizeof name, mp_name(l));   /* remove_link moves the names up */
+	log_msg("net: %s (player %d) left the lobby", name, l + 1);
+	remove_link(l);
+	if (said) server_line(name, "left the game");
+}
+
+static void names_push(void)
+{
+	for (int l = 1; l < NPL; l++) mp_name_set(l, g_link[l].used ? g_link[l].name : "");
+}
+
+/* host, lobby: a joiner went; the ones after it move up, so the lobby's players stay 0..n-1 */
+static void remove_link(int l)
+{
+	for (; l + 1 < NPL; l++) g_link[l] = g_link[l + 1];
+	memset(&g_link[NPL - 1], 0, sizeof g_link[0]);
+	g_names_serial++;
+	names_push();
+}
 
 /* What both PCs must have the same of besides Oni.exe: Daodan patches Oni's code and has
  * gameplay settings, and level0 holds the characters and animations */
@@ -521,6 +710,7 @@ static u32 compat_problems(const Compat *c)
 const char *net_problem_text(u32 bit)
 {
 	switch (bit) {
+	case NETBAD_FULL:       return "the server is full";
 	case NETBAD_PROTO:      return "Arklite's version";
 	case NETBAD_DLL:        return "Arklite (not the same release or commit)";
 	case NETBAD_DAODAN:     return "Daodan (binkw32.dll)";
@@ -627,20 +817,23 @@ static void capture_images(u32 slot)
 
 static void dump_images(u32 slot, u32 tick)
 {
-	const char *name = g_mode == NET_HOST ? "Arklite-desync-host.bin" : "Arklite-desync-join.bin";
+	char name[40], path[MAX_PATH];
 	u32 head[4] = { 0x53444b41 /* "AKDS" */, 1, tick, g_nimages[slot] }, w;
 	HANDLE f;
 
 	if (!g_images) return;
-	f = CreateFileA(name, 0x40000000, 1, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+	if (g_mode == NET_HOST) str_cpy(name, sizeof name, "Arklite-desync-host.bin");
+	else if (g_slot <= 1) str_cpy(name, sizeof name, "Arklite-desync-join.bin");
+	else fmt(name, "Arklite-desync-join%d.bin", g_slot + 1);   /* (more joiners on one PC) */
+	f = log_file_create(name, path);
 	if (f == INVALID_HANDLE_VALUE) {
-		log_msg("net: can't write %s", name);
+		log_msg("net: can't write %s", path);
 		return;
 	}
 	WriteFile(f, head, sizeof head, &w, 0);
 	WriteFile(f, g_images[slot], g_nimages[slot] * sizeof(CharImage), &w, 0);
 	CloseHandle(f);
-	log_msg("net: wrote %s (%d characters at tick %d): send it with the other PC's", name, g_nimages[slot], tick);
+	log_msg("net: wrote %s (%d characters at tick %d): send it with the other PC's", path, g_nimages[slot], tick);
 }
 
 static void log_summary(u32 slot)
@@ -654,24 +847,33 @@ static void log_summary(u32 slot)
 	}
 }
 
-static void compare_hash(u32 slot)
+/* Compares hash slot `slot` with the one link l's PC sent for the same tick */
+static void compare_hash(int l, u32 slot)
 {
+	Link *k = &g_link[l];
 	u32 tick = g_mine[slot].tick;
-	if (!tick || g_theirs[slot].tick != tick || g_checked[slot] == tick) return;
-	if (ROLLING && g_published[slot] != tick) return;   /* not run with the peer's real inputs yet */
-	g_checked[slot] = tick;
+	if (!tick || k->theirs[slot].tick != tick || k->checked[slot] == tick) return;
+	if (ROLLING && g_published[slot] != tick) return;   /* not run with every player's real inputs yet */
+	k->checked[slot] = tick;
 	g_checks++;
-	if (g_theirs[slot].hash != g_mine[slot].hash) {
+	if (k->theirs[slot].hash != g_mine[slot].hash) {
 		if (!g_bad_checks++) {
 			g_first_bad = tick;
-			log_msg("net: DESYNC at tick %d: state hash %08x here, %08x on the %s; this PC's characters:",
-			        tick, g_mine[slot].hash, g_theirs[slot].hash, g_mode == NET_HOST ? "joiner" : "host");
+			log_msg("net: DESYNC at tick %d: state hash %08x here, %08x on %s's PC (player %d); this PC's characters:",
+			        tick, g_mine[slot].hash, k->theirs[slot].hash, g_mode == NET_HOST ? mp_name(l) : "the host",
+			        g_mode == NET_HOST ? l + 1 : 1);
 			log_msg("net:   RNG seeds here %08x/%08x (the hash covers them; if every character matches, these differ)",
 			        g_mine[slot].seeds[0], g_mine[slot].seeds[1]);
 			log_summary(slot);
 			dump_images(slot, tick);
 		}
 	}
+}
+
+static void compare_all(u32 slot)
+{
+	for (int l = 0; l < NPL; l++)
+		if (live(l)) compare_hash(l, slot);
 }
 
 /* lockstep.c's tick hook, after every tick */
@@ -685,11 +887,11 @@ void net_tick_done(void)
 	lockstep_get_seeds(&g_mine[slot].seeds[0], &g_mine[slot].seeds[1]);
 	capture_images(slot);
 	g_mine[slot].tick = g_ticks;
-	if (ROLLING && g_ticks > g_remote) return;   /* a guess: published once verified (publish_verified) */
+	if (ROLLING && g_ticks > remote_min()) return;   /* a guess: published once verified (publish_verified) */
 	g_published[slot] = g_ticks;
 	g_last_hash_tick = g_ticks;
 	g_last_hash = g_mine[slot].hash;
-	compare_hash(slot);
+	compare_all(slot);
 }
 
 /* Rollback: the hashes of ticks that turned out to have been run with the right inputs */
@@ -703,7 +905,7 @@ static void publish_verified(void)
 			g_last_hash_tick = tick;
 			g_last_hash = g_mine[slot].hash;
 		}
-		compare_hash(slot);
+		compare_all(slot);
 	}
 }
 
@@ -717,17 +919,25 @@ static void head(PktHead *h, u8 type)
 	h->pad = 0;
 }
 
-static void send_to_peer(const void *p, u32 n)
+static void send_addr(const void *p, u32 n, const SOCKADDR_IN *to)
 {
-	if (!g_have_peer) return;
-	if (sendto(g_sock, p, n, 0, &g_peer, sizeof g_peer) < 0) {
+	if (sendto(g_sock, p, n, 0, to, sizeof *to) < 0) {
 		if (WSAGetLastError() == 10093) return;   /* WSANOTINITIALISED: the process is exiting */
 		if (g_send_errors++ < 5) log_msg("net: send failed (error %d)", WSAGetLastError());
 	} else {
 		g_npackets_sent++;
 	}
-	g_last_send = GetTickCount();
 }
+
+static void send_link(int l, const void *p, u32 n)
+{
+	if (l < 0 || l >= NPL || !g_link[l].used) return;
+	send_addr(p, n, &g_link[l].addr);
+	g_link[l].last_send = GetTickCount();
+}
+
+/* joiner: to the host */
+static void send_to_host(const void *p, u32 n) { send_link(0, p, n); }
 
 static void send_hello(void)
 {
@@ -742,11 +952,11 @@ static void send_hello(void)
 	compat_mine(&p.c);
 	p.phase = g_state != S_LOBBY;
 	p.ready = g_ready;
-	send_to_peer(&p, sizeof p);
+	send_to_host(&p, sizeof p);
 	g_last_hello = GetTickCount();
 }
 
-static void send_start(void)
+static void send_start(int l)
 {
 	PktStart p;
 	memset(&p, 0, sizeof p);
@@ -759,16 +969,24 @@ static void send_start(void)
 	p.local_seed = g_local_seed;
 	p.delay = g_delay;
 	compat_mine(&p.c);
-	send_to_peer(&p, sizeof p);
+	p.players = g_nplayers;
+	p.gone = g_gone;
+	send_link(l, &p, sizeof p);
 }
 
-static u32 lobby_players(void) { return 1 + (g_peer_seen != 0); }
-static u32 lobby_ready(void) { return (g_ready != 0) + (g_peer_seen && g_peer_ready); }
+static u32 lobby_players(void) { return 1 + joiners(); }
+
+static u32 lobby_ready(void)
+{
+	u32 n = g_ready != 0;
+	for (int l = 1; l < NPL; l++) n += g_link[l].used && g_link[l].ready;
+	return n;
+}
 
 static int map_can_serve(void);
 
-/* refused: NETBAD_*, the joiner this goes to can't play here */
-static void send_lobby_to(int go, u32 refused)
+/* refused: NETBAD_*, the joiner at `to` can't play here; slot: the place it has (else 0) */
+static void send_lobby_addr(const SOCKADDR_IN *to, int slot, int go, u32 refused)
 {
 	PktLobby p;
 	u32 now = GetTickCount();
@@ -779,7 +997,7 @@ static void send_lobby_to(int go, u32 refused)
 	p.ready = lobby_ready();
 	p.countdown_ms = g_countdown_end ? (g_countdown_end - now < COUNTDOWN_MS + 1000 ? g_countdown_end - now : 0) : 0xffffffffu;
 	p.go = go;
-	p.joiner_ready = g_peer_ready;
+	p.joiner_ready = slot > 0 && g_link[slot].ready;
 	p.seed = g_match_seed;
 	p.local_seed = g_match_local_seed;
 	p.refused = refused;
@@ -788,130 +1006,248 @@ static void send_lobby_to(int go, u32 refused)
 	p.item_ticks = items_default_ticks();
 	p.time_limit = g_time_limit;
 	p.score_limit = g_score_limit;
-	send_to_peer(&p, sizeof p);
-	g_last_lobby = now;
+	p.slot = (u32)slot;
+	p.capacity = capacity();
+	if (go) p.players = g_nplayers;
+	send_addr(&p, sizeof p, to);
+	if (slot > 0) g_link[slot].last_lobby = now;
 }
 
-static void send_lobby(int go) { send_lobby_to(go, 0); }
+static void send_lobby(int l, int go) { send_lobby_addr(&g_link[l].addr, l, go, 0); }
 
-static void send_inputs(void)
+static void send_lobby_all(int go)
 {
-	static u8 buf[sizeof(PktInput) + MAX_SEND * 0x30];
-	PktInput *p = (PktInput *)buf;
-	u32 from = g_peer_ack, n;
+	for (int l = 1; l < NPL; l++)
+		if (g_link[l].used) send_lobby(l, go);
+}
 
-	if (from + RING - 8 < g_gen) from = g_gen - (RING - 8);   /* far behind: the ring moved on */
-	n = g_gen - from;
-	if (n > MAX_SEND) n = MAX_SEND;
+/* What a PKT_INPUT to link l carries: if it changes, a new one goes at once */
+static u32 sig_for(int l)
+{
+	u32 s = g_last_hash_tick * 31u;
+	for (int p = 0; p < (int)g_nplayers; p++)
+		if (p != l) s = s * 0x01000193u + have_of(p);
+	return s;
+}
+
+/* Every input link l's PC hasn't acknowledged (at most MAX_SEND in all, shared between the
+ * players): a joiner's own, or on the host every player's but the joiner's */
+static void send_inputs(int l)
+{
+	static u8 buf[sizeof(PktInput) + NPL * sizeof(Stream) + MAX_SEND * 0x30];
+	PktInput *p = (PktInput *)buf;
+	Link *k = &g_link[l];
+	u8 *out = buf + sizeof *p;
+	int send[NPL], nsend = 0;
+	u32 per;
+
+	memset(p, 0, sizeof *p);
 	head(&p->h, PKT_INPUT);
-	p->first = from;
-	p->count = n;
-	p->ack = g_remote;
+	for (int q = 0; q < NPL; q++) p->ack[q] = q < (int)g_nplayers ? have_of(q) : 0;
 	p->hash_tick = g_last_hash_tick;
 	p->hash = g_last_hash;
-	p->adv = (int)g_ticks - (int)g_remote;
+	p->adv = (int)g_ticks - (int)g_have[l];
 	p->stamp = GetTickCount();
-	p->echo = g_peer_stamp;
-	p->held = g_peer_stamp ? p->stamp - g_peer_stamp_at : 0;
-	for (u32 i = 0; i < n; i++) memcpy(buf + sizeof *p + i * 0x30, g_local_in[(from + i) % RING], 0x30);
-	send_to_peer(buf, sizeof *p + n * 0x30);
-	g_sent_gen = g_gen;
+	p->echo = k->stamp;
+	p->held = k->stamp ? p->stamp - k->stamp_at : 0;
+	p->gone = g_gone;
+	p->left = g_left;
+	for (int q = 0; q < NPL; q++) p->ping[q] = q && g_link[q].used && g_link[q].ping >= 0 ? (u16)g_link[q].ping : 0xffff;
+
+	for (int q = 0; q < (int)g_nplayers; q++) {
+		if (g_mode == NET_JOIN ? q != g_slot : q == l) continue;
+		if (k->ack[q] < have_of(q)) send[nsend++] = q;
+	}
+	per = nsend ? MAX_SEND / nsend : 0;
+	for (int i = 0; i < nsend; i++) {
+		int q = send[i];
+		u32 from = k->ack[q], to = have_of(q), n;
+		Stream *st = (Stream *)out;
+		if (from + RING - 8 < to) from = to - (RING - 8);   /* far behind: the ring moved on */
+		n = to - from;
+		if (n > per) n = per;
+		st->first = from;
+		st->slot = (u16)q;
+		st->count = (u16)n;
+		out += sizeof *st;
+		for (u32 j = 0; j < n; j++, out += 0x30) memcpy(out, g_in[q][(from + j) % RING], 0x30);
+		p->nstreams++;
+	}
+	send_link(l, buf, (u32)(out - buf));
+	k->sent_sig = sig_for(l);
 }
 
-static void send_name(void)
+/* Inputs to every PC that needs them: new ones at once, the rest every RESEND_MS */
+static void send_inputs_due(u32 now)
 {
-	PktName p;
-	memset(&p, 0, sizeof p);
-	head(&p.h, PKT_NAME);
-	str_cpy(p.name, sizeof p.name, mp_name_local());
-	send_to_peer(&p, sizeof p);
-	g_last_name = GetTickCount();
-	g_name_sent = mp_name_serial();
+	for (int l = 0; l < NPL; l++)
+		if (live(l) && (g_link[l].sent_sig != sig_for(l) || now - g_link[l].last_send >= RESEND_MS)) send_inputs(l);
+}
+
+/* Names: a joiner sends its own to the host, the host every player's to every joiner */
+static void send_names(u32 now)
+{
+	if (g_mode == NET_JOIN) {
+		PktName p;
+		if (!g_link[0].used || (g_name_sent == mp_name_serial() && now - g_last_name < NAME_MS)) return;
+		memset(&p, 0, sizeof p);
+		head(&p.h, PKT_NAME);
+		str_cpy(p.name, sizeof p.name, mp_name_local());
+		send_to_host(&p, sizeof p);
+		g_last_name = now;
+		g_name_sent = mp_name_serial();
+		return;
+	}
+	if (g_names_local != mp_name_serial()) {
+		g_names_local = mp_name_serial();
+		g_names_serial++;
+	}
+	for (int l = 1; l < NPL; l++) {
+		Link *k = &g_link[l];
+		PktNames p;
+		if (!live(l) || (k->last_names == g_names_serial && now - k->names_at < NAME_MS)) continue;
+		memset(&p, 0, sizeof p);
+		head(&p.h, PKT_NAMES);
+		str_cpy(p.name[0], MP_NAME_MAX, mp_name_local());
+		for (int q = 1; q < NPL; q++)
+			if (g_link[q].used) str_cpy(p.name[q], MP_NAME_MAX, g_link[q].name);
+		send_link(l, &p, sizeof p);
+		k->last_names = g_names_serial;
+		k->names_at = now;
+	}
 }
 
 /* ---- Chat ---------------------------------------------------------------------------------- */
 
-static struct { u32 seq, at; char text[CHAT_MAX]; } g_chat_out[CHAT_QUEUE];
-static u32 g_chat_out_n, g_chat_seq, g_chat_stream, g_chat_sent_at;
-static u32 g_chat_in_stream, g_chat_in_seq;
-
-/* Someone to talk to: the joiner is in the lobby (host), the host answered (joiner), or a match */
-static int chat_peer(void)
+static void chat_send_queued(int l)
 {
-	return g_have_peer && (g_state == S_RUN || g_state == S_WAIT || g_state == S_OVER || g_peer_seen || g_host_heard);
-}
-
-static void chat_send_queued(void)
-{
+	Link *k = &g_link[l];
 	PktChat p;
 	u32 now = GetTickCount(), keep = 0;
 
-	for (u32 i = 0; i < g_chat_out_n; i++)
-		if (now - g_chat_out[i].at < CHAT_GIVE_UP_MS) g_chat_out[keep++] = g_chat_out[i];
-	g_chat_out_n = keep;
-	for (u32 i = 0; i < g_chat_out_n; i++) {
+	for (u32 i = 0; i < k->chat_out_n; i++)
+		if (now - k->chat_out[i].at < CHAT_GIVE_UP_MS) k->chat_out[keep++] = k->chat_out[i];
+	k->chat_out_n = keep;
+	for (u32 i = 0; i < k->chat_out_n; i++) {
 		memset(&p, 0, sizeof p);
 		head(&p.h, PKT_CHAT);
-		p.stream = g_chat_stream;
-		p.seq = g_chat_out[i].seq;
-		str_cpy(p.text, sizeof p.text, g_chat_out[i].text);
-		send_to_peer(&p, sizeof p);
+		p.stream = k->chat_stream;
+		p.seq = k->chat_out[i].seq;
+		p.from = k->chat_out[i].from;
+		str_cpy(p.text, sizeof p.text, k->chat_out[i].text);
+		send_link(l, &p, sizeof p);
 	}
-	g_chat_sent_at = now;
+	k->chat_sent_at = now;
+}
+
+static void chat_queue(int l, u32 from, const char *text)
+{
+	Link *k = &g_link[l];
+	if (k->chat_out_n == CHAT_QUEUE) {   /* the oldest is lost */
+		memcpy(k->chat_out, k->chat_out + 1, sizeof k->chat_out[0] * (CHAT_QUEUE - 1));
+		k->chat_out_n--;
+	}
+	k->chat_out[k->chat_out_n].seq = ++k->chat_seq;
+	k->chat_out[k->chat_out_n].at = GetTickCount();
+	k->chat_out[k->chat_out_n].from = from;
+	str_cpy(k->chat_out[k->chat_out_n].text, CHAT_MAX, text);
+	k->chat_out_n++;
+	chat_send_queued(l);
+}
+
+/* Someone to talk to: a joiner in the lobby (host), the host answered (joiner), or a match */
+static int chat_link(int l)
+{
+	if (!live(l)) return 0;
+	if (g_state == S_RUN || g_state == S_WAIT || g_state == S_OVER) return 1;
+	return g_mode == NET_HOST ? g_state == S_LOBBY : g_host_heard;
 }
 
 int net_chat_send(const char *text)
 {
-	if (g_mode == NET_OFF || !chat_peer()) return 0;
-	if (!g_chat_stream) g_chat_stream = (GetTickCount() * 0x9e3779b1u ^ (u32)(unsigned long)&g_chat_out) | 1;
-	if (g_chat_out_n == CHAT_QUEUE) {   /* the oldest is lost */
-		memcpy(g_chat_out, g_chat_out + 1, sizeof g_chat_out[0] * (CHAT_QUEUE - 1));
-		g_chat_out_n--;
-	}
-	g_chat_out[g_chat_out_n].seq = ++g_chat_seq;
-	g_chat_out[g_chat_out_n].at = GetTickCount();
-	str_cpy(g_chat_out[g_chat_out_n].text, CHAT_MAX, text);
-	g_chat_out_n++;
-	chat_send_queued();
-	return 1;
+	int sent = 0;
+	if (g_mode == NET_OFF) return 0;
+	for (int l = 0; l < NPL; l++)
+		if (chat_link(l)) {
+			chat_queue(l, (u32)g_slot, text);
+			sent = 1;
+		}
+	return sent;
 }
 
-static void chat_received(const PktChat *p)
+static void chat_received(int l, const PktChat *p)
 {
+	Link *k = &g_link[l];
 	PktChatAck a;
 	char text[CHAT_MAX];
 
-	if (p->stream != g_chat_in_stream) {
-		g_chat_in_stream = p->stream;
-		g_chat_in_seq = p->seq - 1;
+	if (p->stream != k->chat_in_stream) {
+		k->chat_in_stream = p->stream;
+		k->chat_in_seq = p->seq - 1;
 	}
-	if (p->seq == g_chat_in_seq + 1) {
+	if (p->seq == k->chat_in_seq + 1) {
+		int who = g_mode == NET_HOST ? l : (int)p->from;
 		memcpy(text, p->text, sizeof text);
 		text[sizeof text - 1] = 0;
-		g_chat_in_seq = p->seq;
-		chat_receive(text);
+		k->chat_in_seq = p->seq;
+		if (g_mode == NET_JOIN && p->from == CHAT_SERVER) {
+			chat_server(text);
+		} else if (who >= 0 && who < NPL && who != g_slot) {
+			chat_receive(who, text);
+			if (g_mode == NET_HOST)   /* to the other joiners */
+				for (int o = 1; o < NPL; o++)
+					if (o != l && chat_link(o)) chat_queue(o, (u32)who, text);
+		}
 	}
 	memset(&a, 0, sizeof a);
 	head(&a.h, PKT_CHAT_ACK);
-	a.stream = g_chat_in_stream;
-	a.seq = g_chat_in_seq;
-	send_to_peer(&a, sizeof a);
+	a.stream = k->chat_in_stream;
+	a.seq = k->chat_in_seq;
+	send_link(l, &a, sizeof a);
 }
 
-static void chat_acked(const PktChatAck *a)
+/* "Name entered the game" / "Name left the game": the host's own screen, and every joiner's
+ * (but the one leaving). A joiner says it of the host itself when the host goes. */
+static void server_line(const char *name, const char *what)
 {
+	char t[CHAT_MAX];
+	fmt(t, "%s %s", name, what);
+	chat_server(t);
+	if (g_mode != NET_HOST) return;
+	for (int o = 1; o < NPL; o++)
+		if (chat_link(o) && !gone(o)) chat_queue(o, CHAT_SERVER, t);
+}
+
+static void chat_acked(int l, const PktChatAck *a)
+{
+	Link *k = &g_link[l];
 	u32 keep = 0;
-	if (a->stream != g_chat_stream) return;
-	for (u32 i = 0; i < g_chat_out_n; i++)
-		if ((int)(g_chat_out[i].seq - a->seq) > 0) g_chat_out[keep++] = g_chat_out[i];
-	g_chat_out_n = keep;
+	if (a->stream != k->chat_stream) return;
+	for (u32 i = 0; i < k->chat_out_n; i++)
+		if ((int)(k->chat_out[i].seq - a->seq) > 0) k->chat_out[keep++] = k->chat_out[i];
+	k->chat_out_n = keep;
+}
+
+static void chat_resend_due(u32 now)
+{
+	for (int l = 0; l < NPL; l++)
+		if (g_link[l].chat_out_n && now - g_link[l].chat_sent_at >= CHAT_RESEND_MS) {
+			if (live(l)) chat_send_queued(l);
+			else g_link[l].chat_out_n = 0;
+		}
+}
+
+static void send_bye_to(int l)
+{
+	PktHead h;
+	head(&h, PKT_BYE);
+	for (int i = 0; i < 3; i++) send_link(l, &h, sizeof h);   /* UDP: one may be lost, and there's no next time */
 }
 
 static void send_bye(void)
 {
-	PktHead h;
-	head(&h, PKT_BYE);
-	for (int i = 0; i < 3; i++) send_to_peer(&h, sizeof h);   /* UDP: one may be lost, and there's no next time */
+	for (int l = 0; l < NPL; l++)
+		if (live(l)) send_bye_to(l);
 }
 
 /* Logs what differs on the peer; returns it (NETBAD_*) */
@@ -922,14 +1258,14 @@ static u32 check_files(const char *who, const Compat *c)
 
 	for (u32 i = 0; i < NFILES; i++)
 		if (c->files[i] != g_files[i])
-			log_msg("net: %s differs on the %s (%08x there, %08x here): the games will come apart; use the same AE install on both PCs",
+			log_msg("net: %s differs on the %s (%08x there, %08x here): the games will come apart; use the same AE install on every PC",
 			        g_file_names[i], who, c->files[i], g_files[i]);
 	memcpy(v, c->version, 16);
 	v[16] = 0;
 	if (!str_ieq_n(v, ARKLITE_VERSION, 17))
 		log_msg("net: the %s runs Arklite %s, this PC %s", who, v, ARKLITE_VERSION);
 	if (bad & NETBAD_DLL)
-		log_msg("net: Arklite differs on the %s (source %08x there, %08x here): use the same Arklite release or commit on both PCs",
+		log_msg("net: Arklite differs on the %s (source %08x there, %08x here): use the same Arklite release or commit on every PC",
 		        who, c->dll, g_dll_hash);
 	if (bad & NETBAD_MAP)
 		log_msg("net: the map's files differ on the %s (%08x there, %08x here): copy the map's CustomLevels folder from one PC to the other",
@@ -953,17 +1289,20 @@ static u32 check_start(const char *who, u32 start_tick, u32 state_hash, u32 fpu_
 	return bad;
 }
 
-/* The peer's game isn't this one (NETBAD_*): keep it out, and say why in the log (once while
- * it keeps trying) and on screen (net_hud) */
+/* The peer's game isn't this one, or the server is full (NETBAD_*): keep it out, and say why in
+ * the log (once while it keeps trying) and on screen (net_hud) */
 static void refuse(const char *who, u32 bad, const Compat *c)
 {
 	u32 now = GetTickCount();
 
 	if (bad != g_problem || !g_problem_at || now - g_problem_at > LOST_MS) {
-		log_msg("net: the %s's game isn't the same as this PC's, so they can't play together:", who);
+		if (bad == NETBAD_FULL)
+			log_msg("net: %s", g_mode == NET_HOST ? "a player can't join: the server is full" : "the server is full");
+		else
+			log_msg("net: the %s's game isn't the same as this PC's, so they can't play together:", who);
 		if (c) check_files(who, c);
-		for (u32 bit = 1; bit <= NETBAD_PLAYERS; bit <<= 1)
-			if (bad & bit) log_msg("net:   differs: %s", net_problem_text(bit));
+		for (u32 bit = 1; bit <= NETBAD_LAST; bit <<= 1)
+			if ((bad & bit) && bit != NETBAD_FULL) log_msg("net:   differs: %s", net_problem_text(bit));
 	}
 	g_problem = bad;
 	g_problem_at = now ? now : 1;
@@ -976,44 +1315,94 @@ static void strip(u32 *rec)
 	rec[0] &= ~7u;   /* escape, console, pausescreen: per PC */
 }
 
-static void on_input(const PktInput *p, u32 size)
+/* host: player p's PC stopped answering or left. From the first tick the host has no input of
+ * p's for, p's inputs are "nothing pressed", made up by the host (fill_gone) and sent to the
+ * other joiners like everyone's, so every PC runs p's player the same way: it stands. */
+static void mark_gone(int p, int left, const char *why, int said)
 {
-	const u8 *data = (const u8 *)(p + 1);
+	if (gone(p)) return;
+	g_gone |= 1u << p;
+	if (left) g_left |= 1u << p;
+	g_link[p].chat_out_n = 0;
+	log_msg("net: %s (player %d) %s; their player stands still from tick %d", mp_name(p), p + 1, why, g_have[p]);
+	if (said) server_line(mp_name(p), "left the game");
+}
 
-	if (size < sizeof *p || p->count > MAX_SEND || size < sizeof *p + p->count * 0x30) return;
-	if (p->ack > g_peer_ack && p->ack <= g_gen) g_peer_ack = p->ack;
-	g_peer_adv = p->adv;
-	g_peer_adv_known = 1;
-	{
-		u32 now = GetTickCount();
-		if ((int)(p->stamp - g_peer_stamp) > 0 || !g_peer_stamp) {
-			g_peer_stamp = p->stamp;
-			g_peer_stamp_at = now;
+/* host: the inputs of the gone players, past the frame's ticks */
+static void fill_gone(void)
+{
+	u32 to = g_ticks + g_delay + 12;
+	for (int p = 1; p < (int)g_nplayers; p++) {
+		if (!gone(p)) continue;
+		while (g_have[p] < to) {
+			u32 t = g_have[p], slot = t % RING;
+			memset(g_in[p][slot], 0, 0x30);
+			g_in_at[p][slot] = t + 1;
+			g_have[p]++;
 		}
-		if (p->echo) {
-			u32 rtt = now - p->echo - p->held;
-			if (rtt < 10000) {
-				g_ping = (int)rtt;
-				g_ping_sum += rtt;
-				g_ping_n++;
-				if (rtt > g_ping_max) g_ping_max = rtt;
+	}
+}
+
+static void on_input(int l, const PktInput *p, u32 size)
+{
+	Link *k = &g_link[l];
+	const u8 *data = (const u8 *)(p + 1), *end = (const u8 *)p + size;
+	u32 now = GetTickCount();
+
+	if (size < sizeof *p || p->nstreams > NPL) return;
+	for (int q = 0; q < NPL && q < (int)g_nplayers; q++)
+		if (p->ack[q] > k->ack[q] && p->ack[q] <= have_of(q)) k->ack[q] = p->ack[q];
+	k->adv = p->adv;
+	k->adv_known = 1;
+	if ((int)(p->stamp - k->stamp) > 0 || !k->stamp) {
+		k->stamp = p->stamp;
+		k->stamp_at = now;
+	}
+	if (p->echo) {
+		u32 rtt = now - p->echo - p->held;
+		if (rtt < 10000) {
+			k->ping = (int)rtt;
+			k->ping_sum += rtt;
+			k->ping_n++;
+			if (rtt > k->ping_max) k->ping_max = rtt;
+		}
+	}
+	if (g_mode == NET_JOIN) {
+		u32 news = p->gone & ~g_gone & ((1u << g_nplayers) - 1) & ~(1u << g_slot);
+		for (int q = 0; q < NPL; q++) {
+			g_peer_ping[q] = p->ping[q] == 0xffff ? -1 : p->ping[q];
+			if (news >> q & 1) log_msg("net: the host says %s (player %d) %s; their player stands still", mp_name(q), q + 1,
+			                           p->left >> q & 1 ? "left" : "stopped answering");
+		}
+		g_gone |= news;
+		g_left |= p->left & g_gone;
+	}
+	for (u32 i = 0; i < p->nstreams; i++) {
+		const Stream *st = (const Stream *)data;
+		int q;
+		if (data + sizeof *st > end) return;
+		data += sizeof *st;
+		if (st->count > MAX_SEND || data + st->count * 0x30 > end) return;
+		q = st->slot;
+		/* the host takes only the joiner's own player from it, and none of a gone one's */
+		if (remote(q) && (g_mode == NET_JOIN || (q == l && !gone(q)))) {
+			for (u32 j = 0; j < st->count; j++) {
+				u32 t = st->first + j, slot = t % RING;
+				if (t < g_have[q] || t >= g_ticks + RING - 8) continue;
+				memcpy(g_in[q][slot], data + j * 0x30, 0x30);
+				strip(g_in[q][slot]);
+				g_in_at[q][slot] = t + 1;
 			}
+			while (g_in_at[q][g_have[q] % RING] == g_have[q] + 1) g_have[q]++;
 		}
+		data += st->count * 0x30;
 	}
-	for (u32 i = 0; i < p->count; i++) {
-		u32 t = p->first + i, slot = t % RING;
-		if (t < g_remote || t >= g_ticks + RING - 8) continue;
-		memcpy(g_remote_in[slot], data + i * 0x30, 0x30);
-		strip(g_remote_in[slot]);
-		g_remote_at[slot] = t + 1;
-	}
-	while (g_remote_at[g_remote % RING] == g_remote + 1) g_remote++;
 	if (p->hash_tick && !(p->hash_tick % HASH_EVERY)) {
 		u32 slot = (p->hash_tick / HASH_EVERY) % HASH_SLOTS;
-		if (g_theirs[slot].tick != p->hash_tick) {
-			g_theirs[slot].tick = p->hash_tick;
-			g_theirs[slot].hash = p->hash;
-			compare_hash(slot);
+		if (k->theirs[slot].tick != p->hash_tick) {
+			k->theirs[slot].tick = p->hash_tick;
+			k->theirs[slot].hash = p->hash;
+			compare_hash(l, slot);
 		}
 	}
 }
@@ -1292,7 +1681,7 @@ static u32 dl_receive(u8 *buf, u32 size)
 		}
 		const PktHead *h = (const PktHead *)buf;
 		if ((u32)n < sizeof *h || h->magic != MAGIC || h->proto != PROTO) continue;
-		if (from.addr != g_peer.addr || from.port != g_peer.port) continue;
+		if (from.addr != g_link[0].addr.addr || from.port != g_link[0].addr.port) continue;
 		g_npackets_recv++;
 		return (u32)n;
 	}
@@ -1392,7 +1781,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	const char *why = 0;
 	int ok = 0, cur = -1;
 
-	if (!g_have_peer) return 0;
+	if (!g_link[0].used) return 0;
 	theirs = VirtualAlloc(0, 2 * MAP_MAX_FILES * (sizeof(MapFile) + 1), 0x3000, 4);
 	if (!theirs) return 0;
 	mine = theirs + MAP_MAX_FILES;
@@ -1417,7 +1806,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 			head(&q.h, PKT_MAP_LIST_REQ);
 			q.level = level;
 			q.first = ntheirs;
-			send_to_peer(&q, sizeof q);
+			send_to_host(&q, sizeof q);
 			last_req = now ? now : 1;
 		}
 		while ((n = dl_receive(buf, sizeof buf))) {
@@ -1517,7 +1906,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 					q.file = i;
 					q.chunk = run_start;
 					q.count = run;
-					send_to_peer(&q, sizeof q);
+					send_to_host(&q, sizeof q);
 					run = 0;
 				}
 			}
@@ -1687,9 +2076,6 @@ const char *net_map_fetch_error(void)
 	return g_dl_why ? g_dl_why : "?";
 }
 
-/* Players this game takes: the netcode has the host and one joiner */
-#define NET_MAX_PLAYERS 2
-
 static void answer_info(const PktInfoReq *q, const SOCKADDR_IN *to)
 {
 	PktInfo p;
@@ -1700,8 +2086,8 @@ static void answer_info(const PktInfoReq *q, const SOCKADDR_IN *to)
 	p.token = q->token;
 	p.sent = q->sent;
 	p.level = g_level;
-	p.players = g_state == S_LOBBY ? lobby_players() : g_state == S_RUN || g_state == S_WAIT || g_state == S_OVER ? 1u + g_have_peer : 1;
-	p.max_players = g_max_players < NET_MAX_PLAYERS ? g_max_players : NET_MAX_PLAYERS;
+	p.players = g_state == S_IDLE ? 1 : bits(present_mask());
+	p.max_players = capacity();
 	p.spectators = 0;   /* no spectators yet */
 	p.max_spectators = g_max_spectators;
 	p.in_match = g_state != S_LOBBY;
@@ -1710,20 +2096,21 @@ static void answer_info(const PktInfoReq *q, const SOCKADDR_IN *to)
 	if (folder) str_cpy(p.folder, sizeof p.folder, folder);
 	if (map) str_cpy(p.map, sizeof p.map, map);
 	else fmt(p.map, "Level %d", g_level);
-	send_to(&p, sizeof p, to);
+	send_addr(&p, sizeof p, to);
 }
 
 /* ---- The match's end ------------------------------------------------------------------------ *
  * players.c marks the tick that reached the score or time limit (tick state, so a rollback that
- * changes the score changes it too). Once that tick ran with the peer's real inputs (rollback:
- * g_verified past it; with input delay every tick does; with the peer lost there's nothing to
- * wait for) the match is over: S_OVER, the game stands (the clock stops, as in S_WAIT) and
- * mp_hud.c shows the result. Each PC's player presses fire (the left mouse button: the clock is
- * stopped, so no action records come) and says so in PKT_END. The host sends "go" when everyone
- * did, or END_MS after its own end, and both PCs reload the level into the lobby (as a match
- * start does, but without the match): the joiner is back in the host's lobby and F3 starts the
- * next match. A joiner that never hears "go" goes back on its own 5 s later. Inputs keep going
- * out meanwhile, so a peer a few ticks behind can still finish the match's last ticks.
+ * changes the score changes it too). Once that tick ran with every player's real inputs
+ * (rollback: g_verified past it; with input delay every tick does; with the host lost there's
+ * nothing to wait for) the match is over: S_OVER, the game stands (the clock stops, as in
+ * S_WAIT) and mp_hud.c shows the result. Each PC's player presses fire (the left mouse button:
+ * the clock is stopped, so no action records come) and the joiners say so in PKT_END. The host
+ * sends "go" when every player still here did, or END_MS after its own end, and every PC
+ * reloads the level into the lobby (as a match start does, but without the match): the joiners
+ * are back in the host's lobby and F3 starts the next match. A joiner that never hears "go" goes
+ * back on its own 5 s later. Inputs keep going out meanwhile, so a PC a few ticks behind can
+ * still finish the match's last ticks.
  *
  * While the game stands the mouse turns the camera as it turns the player in a tick, but only the
  * camera: the follow camera (gs+0x80 mode 1, its character at +0x54) sits behind the character's
@@ -1750,7 +2137,17 @@ static int fire_down(void)
 	return focused() && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
 }
 
-static void send_end(int go)
+/* host: the players still here after the match, and how many of them pressed fire */
+static u32 end_players(void) { return bits(present_mask()); }
+
+static u32 end_ready_count(void)
+{
+	u32 n = g_end_ready != 0;
+	for (int l = 1; l < NPL; l++) n += live(l) && g_link[l].end_ready;
+	return n;
+}
+
+static void send_end(int l, int go)
 {
 	PktEnd p;
 	u32 now = GetTickCount();
@@ -1759,29 +2156,35 @@ static void send_end(int go)
 	p.level = g_level;
 	p.ready = g_end_ready;
 	p.go = go;
-	p.players = 1 + !g_over_lost;
-	p.ready_count = (g_end_ready != 0) + (!g_over_lost && g_peer_end_ready);
+	p.players = end_players();
+	p.ready_count = end_ready_count();
 	p.left_ms = now - g_over_at < END_MS ? END_MS - (now - g_over_at) : 0;
-	send_to_peer(&p, sizeof p);
-	g_last_end = now;
+	send_link(l, &p, sizeof p);
+	g_link[l].last_end = now;
+}
+
+static void send_end_all(int go)
+{
+	for (int l = 0; l < NPL; l++)
+		if (live(l)) send_end(l, go);
 }
 
 static void back_to_lobby(const char *why)
 {
 	u32 level = g_level;
 	log_msg("net: back to the lobby (%s): reloading level %d", why, level);
-	g_over_lost = 1;   /* no goodbye: the other PC goes back too */
+	g_over_lost = 1;   /* no goodbye: the other PCs go back too */
 	g_match_pending = 0;
 	session_end("match over");
 	reload_level(level, 0);
 }
 
-static void end_received(const PktEnd *p)
+static void end_received(int l, const PktEnd *p)
 {
 	if (p->level != g_level) return;
 	if (g_mode == NET_HOST) {
-		if (g_peer_end_ready != (int)p->ready && p->ready) log_msg("net: the joiner pressed fire");
-		g_peer_end_ready = p->ready;
+		if (g_link[l].end_ready != (int)p->ready && p->ready) log_msg("net: %s (player %d) pressed fire", mp_name(l), l + 1);
+		g_link[l].end_ready = p->ready;
 		return;
 	}
 	g_end_players = p->players;
@@ -1802,20 +2205,33 @@ static int over_confirmed(void)
 
 static void enter_over(u32 now)
 {
-	int w = players_winner();
+	u32 mask = present_mask() | (1u << g_slot);
+	int w = players_winner(mask), order[NPL], n = players_ranking(mask, order);
+	char line[160] = "";
+
 	g_over_lost = g_state == S_LOST;
 	g_state = S_OVER;
 	g_over_at = now;
-	g_last_end = 0;
+	for (int l = 0; l < NPL; l++) {
+		g_link[l].last_end = 0;
+		g_link[l].end_ready = 0;
+	}
 	g_end_ready = 0;
 	g_fire_down = fire_down();   /* fire held as the match ended doesn't count */
-	g_end_players = 2;
+	g_end_players = bits(mask);
 	g_end_ready_count = 0;
 	g_end_left_ms = END_MS;
 	g_end_rx = now;
 	g_look_who = 0;
-	log_msg("net: the match is over after %d ticks: %s %d, %s %d; %s", g_ticks, mp_name(0), players_score(0), mp_name(1),
-	        players_score(1), w < 0 ? "a draw" : w == 0 ? "the host won" : "the joiner won");
+	items_stop_firing();   /* no more ticks: a trigger held now would loop its sound until the reload */
+	mp_sound("objective_new");
+	for (int i = 0; i < n; i++) {
+		char one[48];
+		fmt(one, "%s%s %d", i ? ", " : "", mp_name(order[i]), players_score(order[i]));
+		if (str_len(line) + str_len(one) < sizeof line) fmt(line + str_len(line), "%s", one);
+	}
+	log_msg("net: the match is over after %d ticks: %s; %s", g_ticks, line,
+	        w < 0 ? "a draw" : w == g_slot ? "this PC's player won" : "another player won");
 }
 
 #define REC_AIM_LR(r)           (*(const float *)((r) + 0x24))
@@ -1903,6 +2319,19 @@ static void over_look(u32 count, const u8 *actions, u32 now)
 	ACT_AIM_PITCH(act) = pitch;
 }
 
+static void ONI_FC camera_update(u32 ticks, u32 edx, u32 arg);
+
+/* S_WAIT, from the reload until every PC is in: no ticks, so the camera never ran for the new
+ * level and the host (whose camera nothing else moves) saw black until it moved. It runs as at
+ * the match's end; a joiner's is pointed at its own player first (camera_update, no tick). */
+static void wait_camera(u32 count, const void *actions, u32 now)
+{
+	camera_update(0, 0, 0);
+	over_look(count, (const u8 *)actions, now);
+}
+
+static void host_check_silence(u32 now);
+
 static u32 over_frame(u32 count, const u8 *actions, u32 now, u32 *ticks_run)
 {
 	static int help_down;
@@ -1914,15 +2343,18 @@ static u32 over_frame(u32 count, const u8 *actions, u32 now, u32 *ticks_run)
 	if (down && !g_fire_down && !g_end_ready && !live_menu_open() && !char_menu_open() && !chat_blocking()) {
 		g_end_ready = 1;
 		log_msg("net: fire pressed: ready to go back to the lobby");
-		if (g_have_peer) send_end(0);
+		send_end_all(0);
 	}
 	g_fire_down = down;
-	if (g_have_peer && now - g_last_end >= END_SEND_MS) send_end(0);
-	if (now - g_last_send >= 100) send_inputs();   /* the peer may still need our last ones */
+	for (int l = 0; l < NPL; l++) {
+		if (!live(l)) continue;
+		if (now - g_link[l].last_end >= END_SEND_MS) send_end(l, 0);
+		if (now - g_link[l].last_send >= 100) send_inputs(l);   /* the others may still need our last ones */
+	}
 	if (g_mode == NET_HOST) {
-		int quiet = (int)(now - g_last_recv) > LOST_MS;
-		if ((g_end_ready && (g_peer_end_ready || g_over_lost || quiet)) || now - g_over_at >= END_MS) {
-			for (int i = 0; i < 3; i++) send_end(1);
+		host_check_silence(now);
+		if ((g_end_ready && end_ready_count() >= end_players()) || now - g_over_at >= END_MS) {
+			for (int i = 0; i < 3; i++) send_end_all(1);
 			back_to_lobby(now - g_over_at >= END_MS ? "time's up" : "everyone pressed fire");
 			if (ticks_run) *ticks_run = 0;
 			return 0;
@@ -1938,11 +2370,140 @@ static u32 over_frame(u32 count, const u8 *actions, u32 now, u32 *ticks_run)
 	return err;
 }
 
+static void host_begin(void);
+
+/* The host: from a joiner (link l, -1 for an address it doesn't know yet) */
+static void host_hello(int l, const PktHello *p, const SOCKADDR_IN *from)
+{
+	static u32 warned_level;
+	u32 bad;
+
+	if (p->level != g_level) {
+		if (warned_level != p->level) log_msg("net: a joiner is on level %d, this is level %d", p->level, g_level);
+		warned_level = p->level;
+		return;
+	}
+	if (l >= 0) g_link[l].last_recv = GetTickCount();
+	if (g_state == S_LOBBY) {
+		if (p->phase) return;   /* it reloaded already; it says phase 0 again soon or waits */
+		bad = compat_problems(&p->c);
+		if (bad) {   /* not the same game: it stays out of the lobby, and hears why */
+			refuse("joiner", bad, &p->c);
+			send_lobby_addr(from, l > 0 ? l : 0, 0, bad);
+			if (l > 0) remove_link(l);
+			return;
+		}
+		if (l < 0) {
+			const u8 *ip = (const u8 *)&from->addr;
+			if (lobby_players() >= capacity() || (l = add_link(from)) < 0) {
+				refuse("joiner", NETBAD_FULL, 0);
+				send_lobby_addr(from, 0, 0, NETBAD_FULL);
+				return;
+			}
+			log_msg("net: %d.%d.%d.%d:%d joined the lobby as player %d (%d of %d)", ip[0], ip[1], ip[2], ip[3], ntohs(from->port),
+			        l + 1, lobby_players(), capacity());
+			check_files("joiner", &p->c);
+			g_problem = 0;
+		}
+		if (g_link[l].ready != (int)p->ready)
+			log_msg("net: %s (player %d) is %s", mp_name(l), l + 1, p->ready ? "ready" : "not ready");
+		g_link[l].ready = p->ready;
+		send_lobby(l, 0);
+		return;
+	}
+	if (l < 1 || gone(l)) return;   /* not in this match: it waits in its lobby for the next one */
+	if (!p->phase) {   /* still in the lobby: it missed "go" */
+		if (g_state == S_WAIT) send_lobby(l, 1);
+		return;
+	}
+	if (g_state == S_WAIT) {
+		bad = compat_problems(&p->c);
+		if (bad) {   /* changed since the lobby: no START, it doesn't play */
+			refuse("joiner", bad, &p->c);
+			return;
+		}
+		if (!g_link[l].arrived) {
+			const u8 *ip = (const u8 *)&from->addr;
+			g_link[l].arrived = 1;
+			log_msg("net: %d.%d.%d.%d:%d (player %d) is in (input delay %d ticks there)", ip[0], ip[1], ip[2], ip[3],
+			        ntohs(from->port), l + 1, p->delay);
+			check_start("joiner", p->start_tick, p->state_hash, p->fpu_cw, &p->c);
+		}
+		for (int k = 1; k < (int)g_nplayers; k++)
+			if (!gone(k) && !g_link[k].arrived) return;   /* the others are still loading */
+		host_begin();
+		return;
+	}
+	send_start(l);   /* again for every HELLO: the first START may be lost */
+}
+
+static void joiner_lobby(const PktLobby *p)
+{
+	g_link[0].last_recv = GetTickCount();
+	if (g_state != S_LOBBY || p->level != g_level) return;
+	if (p->refused) {   /* the host keeps this PC out: nothing else in it counts */
+		refuse("host", p->refused, 0);
+		/* only the map differs and the host can send it: reload, downloading it first */
+		if (p->refused == NETBAD_MAP && p->map_offer) map_download_start();
+		return;
+	}
+	if (!g_host_heard) log_msg("net: in the host's lobby as player %d", p->slot + 1);
+	else if ((int)p->slot != g_slot) log_msg("net: now player %d in the host's lobby", p->slot + 1);
+	g_host_heard = 1;
+	g_problem = 0;
+	if (p->slot >= 1 && p->slot < NPL) g_slot = (int)p->slot;
+	/* the host's gameplay settings: for the warm-up, and the match's level reload */
+	players_set_respawn_ticks(p->respawn_ticks);
+	items_set_default_ticks(p->item_ticks);
+	g_time_limit = p->time_limit;
+	g_score_limit = p->score_limit;
+	g_lobby_players = p->players;
+	g_lobby_ready = p->ready;
+	g_lobby_countdown = p->countdown_ms;
+	g_lobby_rx = g_link[0].last_recv;
+	if (p->go) {
+		if (p->players < 2 || p->players > NPL || (int)p->slot >= (int)p->players || p->slot < 1) {
+			log_msg("net: the host's match has %d players, this PC as player %d: not playable here", p->players, p->slot + 1);
+			return;
+		}
+		g_nplayers = p->players;
+		g_match_seed = p->seed;
+		g_match_local_seed = p->local_seed;
+		start_match();
+	}
+}
+
+static void joiner_start(const PktStart *p)
+{
+	u32 bad;
+	g_link[0].last_recv = GetTickCount();
+	if (g_state != S_WAIT) return;
+	if (p->level != g_level) {
+		log_msg("net: the host is on level %d, this is level %d", p->level, g_level);
+		return;
+	}
+	bad = compat_problems(&p->c);
+	if (bad) {   /* changed since the lobby: the match doesn't begin */
+		refuse("host", bad, &p->c);
+		return;
+	}
+	if (p->players != g_nplayers) {
+		log_msg("net: the host's match has %d players, this PC loaded it for %d: not starting", p->players, g_nplayers);
+		return;
+	}
+	check_start("host", p->start_tick, p->state_hash, p->fpu_cw, &p->c);
+	g_seed = p->seed;
+	g_local_seed = p->local_seed;
+	g_gone = p->gone & ~(1u << g_slot);
+	if (p->delay <= 30) g_delay = p->delay;   /* the host's, on every PC (0: rollback) */
+	begin_run();
+}
+
 static void receive(void)
 {
 	static u8 buf[2048];
 	SOCKADDR_IN from;
-	int len, n;
+	int len, n, l;
 
 	for (;;) {
 		len = sizeof from;
@@ -1958,14 +2519,12 @@ static void receive(void)
 			answer_info((const PktInfoReq *)buf, &from);
 			continue;
 		}
-		if (g_have_peer && (from.addr != g_peer.addr || from.port != g_peer.port)) {
-			/* one joiner at a time: another only takes an empty lobby's place */
-			if (g_mode == NET_JOIN || g_state != S_LOBBY || g_peer_seen) continue;
-		}
-		if (g_state == S_IDLE) continue;   /* not in a level yet: the peer will resend */
+		l = link_of(&from);
+		if (g_mode == NET_JOIN && l != 0) continue;   /* only the host talks to a joiner */
+		if (g_state == S_IDLE) continue;   /* not in a level yet: the others will resend */
 		if (h->proto != PROTO) {   /* another Arklite: its packets can't be read */
 			if (!(g_problem & NETBAD_PROTO) || GetTickCount() - g_problem_at > LOST_MS)
-				log_msg("net: packet of protocol %d from the %s, this is %d: use the same Arklite.dll on both PCs", h->proto,
+				log_msg("net: packet of protocol %d from the %s, this is %d: use the same Arklite.dll on every PC", h->proto,
 				        g_mode == NET_HOST ? "joiner" : "host", PROTO);
 			refuse(g_mode == NET_HOST ? "joiner" : "host", NETBAD_PROTO, 0);
 			continue;
@@ -1974,128 +2533,67 @@ static void receive(void)
 			map_serve(buf, n, &from);
 			continue;
 		}
-
 		if (h->type == PKT_HELLO && g_mode == NET_HOST && (u32)n >= sizeof(PktHello)) {
-			const PktHello *p = (const PktHello *)buf;
-			static u32 warned_level;
-			if (p->level != g_level) {
-				if (warned_level != p->level) log_msg("net: a joiner is on level %d, this is level %d", p->level, g_level);
-				warned_level = p->level;
-				continue;
-			}
-			if (!g_have_peer || g_state == S_WAIT || (g_state == S_LOBBY && !g_peer_seen)) {
-				g_peer = from;
-				g_have_peer = 1;
-			}
-			g_last_recv = GetTickCount();
-			if (g_state == S_LOBBY) {
-				if (p->phase) continue;   /* it reloaded already; it says phase 0 again soon or waits */
-				u32 bad = compat_problems(&p->c);
-				if (bad) {   /* not the same game: it stays out of the lobby, and hears why */
-					refuse("joiner", bad, &p->c);
-					send_lobby_to(0, bad);
-					continue;
-				}
-				if (!g_peer_seen) {
-					const u8 *ip = (const u8 *)&from.addr;
-					log_msg("net: %d.%d.%d.%d:%d joined the lobby", ip[0], ip[1], ip[2], ip[3], ntohs(from.port));
-					check_files("joiner", &p->c);
-					g_peer_seen = 1;
-					g_problem = 0;
-				}
-				if (g_peer_ready != (int)p->ready)
-					log_msg("net: the joiner is %s", p->ready ? "ready" : "not ready");
-				g_peer_ready = p->ready;
-				send_lobby(0);
-				continue;
-			}
-			if (!p->phase) {   /* still in the lobby: it missed "go" */
-				if (g_state == S_WAIT) send_lobby(1);
-				continue;
-			}
-			if (g_state == S_WAIT) {
-				u32 bad = compat_problems(&p->c);
-				if (bad) {   /* changed since the lobby: no START, the match doesn't begin */
-					refuse("joiner", bad, &p->c);
-					continue;
-				}
-				const u8 *ip = (const u8 *)&from.addr;
-				log_msg("net: %d.%d.%d.%d:%d joined (input delay %d ticks there)", ip[0], ip[1], ip[2], ip[3], ntohs(from.port), p->delay);
-				check_start("joiner", p->start_tick, p->state_hash, p->fpu_cw, &p->c);
-				lockstep_get_seeds(&g_seed, &g_local_seed);
-				begin_run();
-			}
-			send_start();   /* again for every HELLO: the first START may be lost */
-		} else if (h->type == PKT_LOBBY && g_mode == NET_JOIN && (u32)n >= sizeof(PktLobby)) {
-			const PktLobby *p = (const PktLobby *)buf;
-			g_last_recv = GetTickCount();
-			if (g_state != S_LOBBY || p->level != g_level) continue;
-			if (p->refused) {   /* the host keeps this PC out: nothing else in it counts */
-				refuse("host", p->refused, 0);
-				/* only the map differs and the host can send it: reload, downloading it first */
-				if (p->refused == NETBAD_MAP && p->map_offer) map_download_start();
-				continue;
-			}
-			if (!g_host_heard) log_msg("net: in the host's lobby");
-			g_host_heard = 1;
-			g_problem = 0;
-			/* the host's gameplay settings: for the warm-up, and the match's level reload */
-			players_set_respawn_ticks(p->respawn_ticks);
-			items_set_default_ticks(p->item_ticks);
-			g_time_limit = p->time_limit;
-			g_score_limit = p->score_limit;
-			g_lobby_players = p->players;
-			g_lobby_ready = p->ready;
-			g_lobby_countdown = p->countdown_ms;
-			g_lobby_rx = g_last_recv;
-			if (p->go) {
-				g_match_seed = p->seed;
-				g_match_local_seed = p->local_seed;
-				start_match();
-			}
+			host_hello(l, (const PktHello *)buf, &from);
+			continue;
+		}
+		if (l < 0) continue;   /* everything else only from a PC in this lobby or match */
+		if (g_mode == NET_HOST && g_state != S_LOBBY && gone(l)) continue;
+		if (h->type == PKT_LOBBY && g_mode == NET_JOIN && (u32)n >= sizeof(PktLobby)) {
+			joiner_lobby((const PktLobby *)buf);
 		} else if (h->type == PKT_START && g_mode == NET_JOIN && (u32)n >= sizeof(PktStart)) {
-			const PktStart *p = (const PktStart *)buf;
-			g_last_recv = GetTickCount();
-			if (g_state != S_WAIT) continue;
-			if (p->level != g_level) {
-				log_msg("net: the host is on level %d, this is level %d", p->level, g_level);
-				continue;
-			}
-			u32 bad = compat_problems(&p->c);
-			if (bad) {   /* changed since the lobby: the match doesn't begin */
-				refuse("host", bad, &p->c);
-				continue;
-			}
-			check_start("host", p->start_tick, p->state_hash, p->fpu_cw, &p->c);
-			g_seed = p->seed;
-			g_local_seed = p->local_seed;
-			if (p->delay <= 30) g_delay = p->delay;   /* the host's, on both PCs (0: rollback) */
-			begin_run();
+			joiner_start((const PktStart *)buf);
 		} else if (h->type == PKT_END && (u32)n >= sizeof(PktEnd)) {
-			if (!g_have_peer || from.addr != g_peer.addr || from.port != g_peer.port) continue;
-			end_received((const PktEnd *)buf);
+			end_received(l, (const PktEnd *)buf);
 		} else if (h->type == PKT_INPUT && (g_state == S_RUN || g_state == S_OVER)) {
-			g_last_recv = GetTickCount();
-			if (!g_ninputs_recv++) log_msg("net: first input from the %s", g_mode == NET_HOST ? "joiner" : "host");
-			on_input((const PktInput *)buf, n);
-		} else if (h->type == PKT_NAME && (u32)n >= sizeof(PktName)) {
-			if (!g_have_peer || from.addr != g_peer.addr || from.port != g_peer.port) continue;
+			g_link[l].last_recv = GetTickCount();
+			if (!g_ninputs_recv++) log_msg("net: first input from %s", g_mode == NET_HOST ? "a joiner" : "the host");
+			on_input(l, (const PktInput *)buf, n);
+		} else if (h->type == PKT_NAME && g_mode == NET_HOST && (u32)n >= sizeof(PktName)) {
 			const PktName *p = (const PktName *)buf;
 			char name[MP_NAME_MAX];
 			memcpy(name, p->name, sizeof name);
 			name[sizeof name - 1] = 0;
-			mp_name_set_peer(name);
+			if (!str_ieq_n(name, g_link[l].name, MP_NAME_MAX) || str_len(name) != str_len(g_link[l].name)) {
+				str_cpy(g_link[l].name, MP_NAME_MAX, name);
+				mp_name_set(l, name);
+				g_names_serial++;
+			}
+			if (!g_link[l].entered) {   /* its name comes right after it joined */
+				g_link[l].entered = 1;
+				server_line(mp_name(l), "entered the game");
+			}
+		} else if (h->type == PKT_NAMES && g_mode == NET_JOIN && (u32)n >= sizeof(PktNames)) {
+			const PktNames *p = (const PktNames *)buf;
+			for (int q = 0; q < NPL; q++) {
+				char name[MP_NAME_MAX];
+				if (q == g_slot) continue;
+				memcpy(name, p->name[q], sizeof name);
+				name[sizeof name - 1] = 0;
+				mp_name_set(q, name);
+			}
 		} else if ((h->type == PKT_CHAT && (u32)n >= sizeof(PktChat)) || (h->type == PKT_CHAT_ACK && (u32)n >= sizeof(PktChatAck))) {
-			if (!g_have_peer || from.addr != g_peer.addr || from.port != g_peer.port) continue;
-			if (h->type == PKT_CHAT) chat_received((const PktChat *)buf);
-			else chat_acked((const PktChatAck *)buf);
+			if (h->type == PKT_CHAT) chat_received(l, (const PktChat *)buf);
+			else chat_acked(l, (const PktChatAck *)buf);
+		} else if (h->type == PKT_BYE && g_mode == NET_HOST) {
+			if (g_state == S_LOBBY) {
+				lobby_leave(l);
+			} else {
+				mark_gone(l, 1, g_state == S_OVER ? "left after the match" : "left", 1);
+			}
 		} else if (h->type == PKT_BYE && g_state == S_RUN) {
-			log_msg("net: the %s left; their player stands still", g_mode == NET_HOST ? "joiner" : "host");
+			log_msg("net: the host left; the other players stand still");
+			server_line(mp_name(0), "left the game");
 			g_lost_left = 1;
 			g_state = S_LOST;
 		} else if (h->type == PKT_BYE && g_state == S_OVER && !g_over_lost) {
-			log_msg("net: the %s left after the match", g_mode == NET_HOST ? "joiner" : "host");
+			log_msg("net: the host left after the match");
+			server_line(mp_name(0), "left the game");
 			g_over_lost = 1;
+		} else if (h->type == PKT_BYE && g_state == S_LOBBY && g_host_heard) {
+			log_msg("net: the host left the lobby");
+			server_line(mp_name(0), "left the game");
+			g_host_heard = 0;
 		}
 	}
 }
@@ -2109,23 +2607,22 @@ static void session_begin(u32 level)
 
 	g_level = level;
 	g_state = g_match_pending ? S_WAIT : S_LOBBY;
+	g_look_who = 0;   /* S_WAIT's camera starts again from the character */
 	{
 		u32 map = hash_map(level);
 		if (map != g_map_hash) log_msg("net: level %d's files: %08x", level, map);
 		g_map_hash = map;
 	}
-	g_ticks = g_remote = g_peer_ack = g_sent_gen = 0;
+	g_ticks = 0;
 	g_stall_frames = g_stall_ticks = 0;
-	g_peer_adv = g_peer_adv_known = 0;
-	g_peer_stamp = g_peer_stamp_at = g_ping_sum = g_ping_n = g_ping_max = 0;
 	g_sync_skip_at = g_sync_skipped = 0;
 	g_has_pending = 0;
-	memset(g_local_in, 0, sizeof g_local_in);
-	memset(g_remote_at, 0, sizeof g_remote_at);
+	memset(g_in, 0, sizeof g_in);
+	memset(g_in_at, 0, sizeof g_in_at);
+	memset(g_have, 0, sizeof g_have);
 	memset(g_last_local, 0, sizeof g_last_local);
 	memset(g_mine, 0, sizeof g_mine);
-	memset(g_theirs, 0, sizeof g_theirs);
-	memset(g_checked, 0, sizeof g_checked);
+	memset(g_peer_ping, 0xff, sizeof g_peer_ping);
 	g_last_hash_tick = g_last_hash = 0;
 	g_checks = g_bad_checks = g_first_bad = 0;
 	memset(g_published, 0, sizeof g_published);
@@ -2134,8 +2631,8 @@ static void session_begin(u32 level)
 	g_rb_started = 0;
 	g_rollbacks = g_resim_ticks = g_rb_failed = g_rb_deepest = g_rb_frames = 0;
 	g_npackets_sent = g_npackets_recv = g_ninputs_recv = g_send_errors = 0;
-	g_last_status = GetTickCount();
-	g_gen = g_delay;   /* ticks 0..delay-1: no input from either PC */
+	g_last_status = g_wait_since = GetTickCount();
+	g_gen = g_delay;   /* ticks 0..delay-1: no input from any PC */
 	g_start_tick = GS_TICK(ONgGameState);
 	g_start_fpu = fpu_control_word();
 	g_start_hash = summarize_with(c, &n, 0);
@@ -2145,12 +2642,29 @@ static void session_begin(u32 level)
 	g_lobby_ready = 0;
 	g_lobby_countdown = 0xffffffffu;
 	g_host_heard = 0;
+	for (int l = 0; l < NPL; l++) {   /* each link starts this level from nothing */
+		Link *k = &g_link[l];
+		memset(k->ack, 0, sizeof k->ack);
+		memset(k->theirs, 0, sizeof k->theirs);
+		memset(k->checked, 0, sizeof k->checked);
+		k->adv = k->adv_known = 0;
+		k->stamp = k->stamp_at = k->ping_sum = k->ping_n = k->ping_max = 0;
+		k->ping = -1;
+		k->sent_sig = 0;
+		k->arrived = k->ready = k->end_ready = 0;
+	}
 	if (g_state == S_LOBBY) {
-		g_peer_seen = g_peer_ready = 0;
-		log_msg("net: level %d loaded: lobby (F3: ready)%s", level, g_mode == NET_HOST ? ", waiting for a player to join" : "");
+		g_gone = g_left = 0;
+		if (g_mode == NET_HOST) {   /* the joiners come in again, in the order they say hello */
+			for (int l = 1; l < NPL; l++) memset(&g_link[l], 0, sizeof g_link[l]);
+			names_push();
+			g_slot = 0;
+		}
+		log_msg("net: level %d loaded: lobby (F3: ready)%s", level, g_mode == NET_HOST ? ", waiting for players to join" : "");
 	} else {
-		log_msg("net: level %d reloaded for the match (tick %d, state %08x, %d characters); %s", level, g_start_tick,
-		        g_start_hash, n, g_mode == NET_HOST ? "waiting for the joiner" : "joining the host");
+		log_msg("net: level %d reloaded for the match (tick %d, state %08x, %d characters, %d players, this PC's is player %d); %s",
+		        level, g_start_tick, g_start_hash, n, g_nplayers, g_slot + 1,
+		        g_mode == NET_HOST ? "waiting for the joiners" : "joining the host");
 	}
 }
 
@@ -2158,14 +2672,27 @@ static void begin_run(void)
 {
 	g_state = S_RUN;
 	g_match_pending = 0;
-	g_gen = g_delay;   /* ticks 0..delay-1: no input from either PC */
-	g_last_recv = GetTickCount();
-	g_peer_end_ready = 0;
-	g_ping = -1;
+	g_gen = g_delay;   /* ticks 0..delay-1: no input from any PC */
+	for (int l = 0; l < NPL; l++) {
+		g_link[l].last_recv = GetTickCount();
+		g_link[l].end_ready = 0;
+		g_link[l].ping = -1;
+	}
 	players_reset_scores();
 	players_set_limits(1, g_time_limit * 3600, g_score_limit);
-	log_msg("net: game on (%s), RNG %08x/%08x, input delay %d ticks; limits: %d min, %d points", mode_name(), g_seed,
-	        g_local_seed, g_delay, g_time_limit, g_score_limit);
+	mp_sound("objective_new");
+	log_msg("net: game on (%s, player %d of %d), RNG %08x/%08x, input delay %d ticks; limits: %d min, %d points", mode_name(),
+	        g_slot + 1, g_nplayers, g_seed, g_local_seed, g_delay, g_time_limit, g_score_limit);
+}
+
+/* host: every joiner of the match is in (or gone): the match starts on every PC */
+static void host_begin(void)
+{
+	lockstep_get_seeds(&g_seed, &g_local_seed);
+	begin_run();
+	fill_gone();
+	for (int l = 1; l < (int)g_nplayers; l++)
+		if (!gone(l)) send_start(l);
 }
 
 static void session_end(const char *why)
@@ -2173,13 +2700,17 @@ static void session_end(const char *why)
 	if (g_state == S_IDLE) return;
 	if (g_state == S_RUN || (g_state == S_OVER && !g_over_lost)) send_bye();
 	players_set_limits(0, 0, 0);
+	players_set_count(2);   /* a lobby: each PC plays alone (start_match sets the match's) */
 	lockstep_net_record_end(why);
 	if (g_rb_started) {
 		rollback_net_end();
 		rollback_impulses(1);
 		ONgSoundOn = g_sound_on;
-		log_msg("net: rollback: %d rollbacks re-ran %d ticks (deepest %d), %d couldn't go back far enough",
-		        g_rollbacks, g_resim_ticks, g_rb_deepest, g_rb_failed);
+		u32 checks, checks_bad;
+		rollback_check_stats(&checks, &checks_bad);
+		log_msg("net: rollback: %d rollbacks re-ran %d ticks (deepest %d), %d couldn't go back far enough; %d checked by "
+		        "running them twice, %d of those came out differently%s", g_rollbacks, g_resim_ticks, g_rb_deepest, g_rb_failed,
+		        checks, checks_bad, checks_bad ? " (see Arklite-rollbackcheck in logs)" : "");
 		g_rb_started = 0;
 	}
 	if (g_state == S_RUN || g_state == S_LOST || g_state == S_OVER)
@@ -2188,6 +2719,14 @@ static void session_end(const char *why)
 	else if (g_state == S_WAIT)
 		log_msg("net: level %d ended (%s) before the match started", g_level, why);
 	g_state = S_IDLE;
+}
+
+/* host: a joiner of the match that's been silent for LOST_MS is gone */
+static void host_check_silence(u32 now)
+{
+	for (int l = 1; l < (int)g_nplayers; l++)
+		if (g_link[l].used && !gone(l) && (int)(now - g_link[l].last_recv) > LOST_MS)
+			mark_gone(l, 0, "stopped answering", 1);
 }
 
 /* ---- Input -------------------------------------------------------------------------------- */
@@ -2215,7 +2754,7 @@ static void take_record(const u32 *rec)
 
 static void make_input(void)
 {
-	u32 *in = g_local_in[g_gen % RING];
+	u32 *in = g_in[g_slot][g_gen % RING];
 
 	if (live_menu_open() || char_menu_open()) {
 		memset(in, 0, 0x30);                 /* a menu is up: our player stands */
@@ -2229,6 +2768,7 @@ static void make_input(void)
 	}
 	in[11] = char_menu_record_word();    /* the F2 choice (players.c) */
 	memcpy(g_last_local, in, 0x30);
+	g_in_at[g_slot][g_gen % RING] = g_gen + 1;
 	g_gen++;
 }
 
@@ -2243,7 +2783,7 @@ static u32 run_update(u32 n, u32 *ticks_run)
 	GS_SERVER_TIME(gs) = GS_TICK(gs) + n;
 	GS_SYNC_BEHIND(gs) = 0;
 	ONgInvertLook = 0;
-	err = ONrGameState_Update(n, g_frame_p1, &ran);
+	err = ONrGameState_Update(n, g_frames[0], &ran);
 	ONgInvertLook = invert;
 	if (ticks_run) *ticks_run = ran;
 	g_last_tick = GS_TICK(gs);
@@ -2266,22 +2806,27 @@ static int f3_pressed(void)
 	return pressed && !live_menu_open() && !chat_blocking();
 }
 
-/* Reload the level for the match: both PCs do it, the host when its countdown ends, the joiner
- * when "go" arrives. The next frame begins a synced session (S_WAIT, then the START handshake).
- * Loading a level draws from the game RNG (a character's idle timer +0x1e4 comes from it at
- * creation, 0x4dc130), and the lobby ran each PC's RNG its own way, so both PCs load with the
- * seeds the host put in "go". */
+/* Reload the level for the match: every PC does it, the host when its countdown ends, the
+ * joiners when "go" arrives. The next frame begins a synced session (S_WAIT, then the START
+ * handshake). The level loads with as many players as the match has (players_set_count), and
+ * loading draws from the game RNG (a character's idle timer +0x1e4 comes from it at creation,
+ * 0x4dc130), and the lobby ran each PC's RNG its own way, so every PC loads with the seeds the
+ * host put in "go". */
 static void start_match(void)
 {
 	u32 level = g_level;
 
 	if (g_mode == NET_HOST) {
+		g_nplayers = lobby_players();
+		g_slot = 0;
 		lockstep_get_seeds(&g_match_seed, &g_match_local_seed);
-		for (int i = 0; i < 3; i++) send_lobby(1);   /* and again for each HELLO that still says lobby */
+		for (int i = 0; i < 3; i++) send_lobby_all(1);   /* and again for each HELLO that still says lobby */
 	}
-	log_msg("net: the match starts: reloading level %d (RNG %08x/%08x)", level, g_match_seed, g_match_local_seed);
+	log_msg("net: the match starts: reloading level %d for %d players, this PC's is player %d (RNG %08x/%08x)", level,
+	        g_nplayers, g_slot + 1, g_match_seed, g_match_local_seed);
 	g_match_pending = 1;
 	session_end("match starting");
+	players_set_count(g_nplayers);
 	reload_level(level, 1);
 }
 
@@ -2294,64 +2839,66 @@ static u32 lobby_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
 		g_ready = !g_ready;
 		log_msg("net: %s", g_ready ? "ready" : "not ready");
 		if (g_mode == NET_JOIN) send_hello();
-		else if (g_peer_seen) send_lobby(0);
+		else send_lobby_all(0);
 	}
 	if (g_mode == NET_JOIN) {
 		if (now - g_last_hello >= HELLO_MS) send_hello();
-		if (g_host_heard && (int)(now - g_last_recv) > LOST_MS) {
+		if (g_host_heard && (int)(now - g_link[0].last_recv) > LOST_MS) {
 			log_msg("net: nothing from the host for %d s", LOST_MS / 1000);
+			server_line(mp_name(0), "left the game");
 			g_host_heard = 0;
 		}
 	} else {
-		if (g_peer_seen && (int)(now - g_last_recv) > LOST_MS) {
-			log_msg("net: the joiner left the lobby");
-			g_peer_seen = g_peer_ready = 0;
-		}
+		for (int l = NPL - 1; l >= 1; l--)
+			if (g_link[l].used && (int)(now - g_link[l].last_recv) > LOST_MS) lobby_leave(l);
 		u32 players = lobby_players(), ready = lobby_ready();
 		int enough = players >= 2 && ready * 100 >= players * 51;
 		if (enough && !g_countdown_end) {
 			g_countdown_end = now + COUNTDOWN_MS;
 			if (!g_countdown_end) g_countdown_end = 1;
 			log_msg("net: %d of %d players ready: the match starts in %d s", ready, players, COUNTDOWN_MS / 1000);
-			send_lobby(0);
+			send_lobby_all(0);
 		} else if (!enough && g_countdown_end) {
 			g_countdown_end = 0;
 			log_msg("net: countdown stopped (%d of %d players ready)", ready, players);
-			send_lobby(0);
+			send_lobby_all(0);
 		}
 		if (g_countdown_end && (int)(now - g_countdown_end) >= 0) {
 			start_match();
 			if (ticks_run) *ticks_run = 0;
 			return 0;
 		}
-		if (g_peer_seen && now - g_last_lobby >= HELLO_MS) send_lobby(0);
+		for (int l = 1; l < NPL; l++)
+			if (g_link[l].used && now - g_link[l].last_lobby >= HELLO_MS) send_lobby(l, 0);
 	}
 	if (g_state != S_LOBBY) {   /* "go" arrived in receive(): the level is being reloaded */
 		if (ticks_run) *ticks_run = 0;
 		return 0;
 	}
 
-	/* warm-up: this PC's player plays alone, the other one stands */
+	/* warm-up: this PC's player plays alone, the others stand (a joiner's is player 2 here) */
 	if (g_mode == NET_HOST) {
 		players_net_frame(0, 0);
 		err = ONrGameState_Update(count, actions, ticks_run);
 	} else {
 		wanted = GS_SERVER_TIME(gs) - GS_TICK(gs);
 		n = wanted > 6 ? 6 : wanted;
+		memset(g_frames, 0, sizeof g_frames);
 		for (u32 k = 0; k < n; k++) {
+			u32 *f = g_frames[1][k];
 			if (k == 0 && (count & 0xffff) && actions) {
-				memcpy(g_frame_p2[0], actions, 0x30);
-				strip(g_frame_p2[0]);
-				memcpy(g_last_local, g_frame_p2[0], 0x30);
+				memcpy(f, actions, 0x30);
+				strip(f);
+				memcpy(g_last_local, f, 0x30);
 			} else {
-				memcpy(g_frame_p2[k], g_last_local, 0x30);   /* the buttons stay held, no aim */
-				g_frame_p2[k][7] = g_frame_p2[k][8] = g_frame_p2[k][9] = g_frame_p2[k][10] = 0;
+				memcpy(f, g_last_local, 0x30);   /* the buttons stay held, no aim */
+				f[7] = f[8] = f[9] = f[10] = 0;
 			}
-			if (live_menu_open() || char_menu_open()) memset(g_frame_p2[k], 0, 0x30);
-			g_frame_p2[k][11] = char_menu_record_word();
+			if (live_menu_open() || char_menu_open()) memset(f, 0, 0x30);
+			f[11] = char_menu_record_word();
 		}
 		GS_SYNC_BEHIND(gs) = 0;
-		players_net_frame(g_frame_p2, n);
+		players_net_frame(g_frames, n);
 		err = ONrGameState_Update(0, actions, ticks_run);   /* Konoko: no record */
 	}
 	g_last_tick = GS_TICK(gs);
@@ -2364,17 +2911,24 @@ void net_hud(NetHud *h)
 	u32 now = GetTickCount();
 
 	memset(h, 0, sizeof *h);
+	for (int p = 0; p < NPL; p++) h->ping_ms[p] = -1;
 	h->state = g_mode == NET_OFF ? NETHUD_OFF : g_state == S_LOBBY ? NETHUD_LOBBY :
 	           g_state == S_WAIT ? NETHUD_STARTING : g_state == S_RUN || g_state == S_LOST || g_state == S_OVER ? NETHUD_MATCH :
 	           NETHUD_OFF;
-	h->local_player = g_mode == NET_JOIN ? 1 : 0;
+	h->local_player = g_mode == NET_JOIN ? g_slot : 0;
+	h->local_char = local_char();
+	h->joiner = g_mode == NET_JOIN;
 	h->ready = g_ready;
 	h->countdown_ms = -1;
+	if (g_mode == NET_OFF) return;
+	h->present = present_mask() | (1u << h->local_player);
 	if (g_mode == NET_HOST) {
 		h->connected = 1;
 		h->players = lobby_players();
 		h->ready_count = lobby_ready();
 		if (g_countdown_end) h->countdown_ms = (int)(g_countdown_end - now) > 0 ? (int)(g_countdown_end - now) : 0;
+		for (int l = 1; l < NPL; l++)
+			if (g_link[l].used) h->ping_ms[l] = g_link[l].ping;
 	} else {
 		h->connected = g_host_heard;
 		h->players = g_lobby_players;
@@ -2383,24 +2937,38 @@ void net_hud(NetHud *h)
 			int left = (int)g_lobby_countdown - (int)(now - g_lobby_rx);
 			h->countdown_ms = left > 0 ? left : 0;
 		}
+		for (int p = 1; p < NPL; p++) h->ping_ms[p] = g_peer_ping[p];
+		h->ping_ms[0] = g_link[0].ping;   /* the host's row: this PC's own round trip to it */
+		h->ping_ms[g_slot] = -1;
 	}
 	h->needed = (h->players * 51 + 99) / 100;
 	if (h->needed < 2) h->needed = 2;
 	if (g_problem && g_problem_at && now - g_problem_at < PROBLEM_MS) h->problem = g_problem;
 	h->desynced = (g_state == S_RUN || g_state == S_LOST) && g_bad_checks;
-	if (g_state == S_RUN && (int)(now - g_last_recv) > 1500) h->silent_ms = (int)(now - g_last_recv);
+	if (g_state != S_LOBBY) {
+		h->gone = g_gone;
+		h->left = g_left;
+	}
+	if (g_state == S_RUN) {
+		for (int l = 0; l < NPL; l++) {
+			int quiet = (int)(now - g_link[l].last_recv);
+			if (live(l) && (g_mode == NET_JOIN || l < (int)g_nplayers) && quiet > 1500 && quiet > h->silent_ms) {
+				h->silent_ms = quiet;
+				h->silent_who = l;
+			}
+		}
+	}
 	if (g_state == S_LOST) h->lost = g_lost_left ? 2 : 1;
 	h->time_limit = g_time_limit;
 	h->score_limit = g_score_limit;
-	h->ping_ms = g_state == S_RUN || g_state == S_OVER ? g_ping : -1;
-	h->peer_present = g_state == S_LOBBY ? (g_mode == NET_HOST ? g_peer_seen : g_host_heard) :
-	                  g_state == S_WAIT || g_state == S_RUN || (g_state == S_OVER && !g_over_lost);
+	if (g_state != S_RUN && g_state != S_OVER)
+		for (int p = 0; p < NPL; p++) h->ping_ms[p] = -1;
 	if (g_state == S_OVER) {
 		h->over = 1;
 		h->over_ready = g_end_ready;
 		if (g_mode == NET_HOST) {
-			h->over_players = 1 + !g_over_lost;
-			h->over_ready_count = (g_end_ready != 0) + (!g_over_lost && g_peer_end_ready);
+			h->over_players = end_players();
+			h->over_ready_count = end_ready_count();
 			h->over_left_ms = now - g_over_at < END_MS ? (int)(END_MS - (now - g_over_at)) : 0;
 		} else {
 			h->over_players = g_end_players;
@@ -2420,46 +2988,112 @@ static int same_input(const u32 *a, const u32 *b)
 	return 1;
 }
 
-/* The inputs of ticks g_ticks.. g_ticks+n-1 into the frame records: ours, and the peer's real one
- * or, past g_remote, a guess: its last real input with its buttons held and no stick or mouse
- * movement (as make_input repeats ours). The peer's input each tick runs with goes to g_pred. */
+/* The inputs of ticks g_ticks.. g_ticks+n-1 into the frame records: ours, and each other
+ * player's real one or, past what's here of it, a guess: its last real input with its buttons
+ * held and no stick or mouse movement (as make_input repeats ours). The input each other player's
+ * tick runs with goes to g_pred. */
 static void rb_fill_frames(u32 n)
 {
-	u32 guess[12];
-	if (g_remote) memcpy(guess, g_remote_in[(g_remote - 1) % RING], sizeof guess);
-	else memset(guess, 0, sizeof guess);
-	guess[7] = guess[8] = guess[9] = guess[10] = 0;
+	static u32 guess[NPL][12];
+	for (int p = 0; p < (int)g_nplayers; p++) {
+		if (!remote(p)) continue;
+		if (g_have[p]) memcpy(guess[p], g_in[p][(g_have[p] - 1) % RING], sizeof guess[p]);
+		else memset(guess[p], 0, sizeof guess[p]);
+		guess[p][7] = guess[p][8] = guess[p][9] = guess[p][10] = 0;
+	}
+	memset(g_frames, 0, sizeof g_frames);
 	for (u32 k = 0; k < n; k++) {
 		u32 t = g_ticks + k, slot = t % RING;
-		const u32 *mine = g_local_in[slot], *theirs = t < g_remote ? g_remote_in[slot] : guess;
-		memcpy(g_pred[slot], theirs, 0x30);
-		memcpy(g_frame_p1[k], g_mode == NET_HOST ? mine : theirs, 0x30);
-		memcpy(g_frame_p2[k], g_mode == NET_HOST ? theirs : mine, 0x30);
+		for (int p = 0; p < (int)g_nplayers; p++) {
+			const u32 *in = !remote(p) || t < g_have[p] ? g_in[p][slot] : guess[p];
+			if (remote(p)) memcpy(g_pred[p][slot], in, 0x30);
+			memcpy(g_frames[p][k], in, 0x30);
+		}
 	}
 }
 
 /* Run the ticks again from g_ticks (just put back) up to to, silently */
 static void rb_resimulate(u32 to)
 {
-	rollback_impulses(0);   /* one-shot sounds already played; ambients start again */
+	rollback_impulses(0);   /* one-shot sounds play only if the first run didn't play them; ambients start again */
 	while (g_ticks < to) {
 		u32 n = to - g_ticks, before = g_ticks;
 		if (n > 6) n = 6;
 		rb_fill_frames(n);
-		players_net_frame(g_frame_p2, n);
+		players_net_frame(g_frames, n);
 		run_update(n, 0);
 		if (g_ticks == before) break;   /* the update ran nothing: don't spin */
 	}
 	rollback_impulses(1);
 }
 
+/* rollback.c's check of a rollback: the same ticks put back and run once more with the same
+ * inputs, the two runs compared (anything that differs is state a rollback leaves behind) */
+#define RB_CHECK_FIRST 40   /* every rollback of a match's first 40 */
+#define RB_CHECK_EVERY 16   /* then one in 16 */
+
+static void rb_check(u32 t, u32 to, int player)
+{
+	char what[120];
+	if (g_ticks != to || !rollback_check_begin()) return;
+	if (!rollback_restore_tick(t)) return;
+	g_ticks = t;
+	rb_resimulate(to);
+	if (g_ticks != to) return;   /* the update ran fewer ticks: nothing to compare */
+	fmt(what, "rollback %d, player %d's input at tick %d guessed wrong, ticks %d-%d run again", g_rollbacks,
+	    player + 1, t, t, to - 1);
+	rollback_check_end(what);
+}
+
+/* Time sync: how many ticks this PC runs ahead of the others in real time (a joiner: of the
+ * host; the host: of the joiner furthest ahead), 0 when not known */
+static int ahead(void)
+{
+	int best = 0x7fffffff, any = 0;
+	for (int l = 0; l < NPL; l++) {
+		Link *k = &g_link[l];
+		if (!live(l) || !k->adv_known || (g_mode == NET_HOST && (l >= (int)g_nplayers || gone(l)))) continue;
+		int a = ((int)g_ticks - (int)g_have[l] - k->adv) / 2;
+		if (a < best) best = a;
+		any = 1;
+	}
+	return any ? best : 0;
+}
+
+static const char *others(void) { return g_mode == NET_HOST ? "joiners" : "others"; }
+
+/* The 30 s log line's ping part: each link's average and worst */
+static void ping_log(char *out, u32 size)
+{
+	out[0] = 0;
+	for (int l = 0; l < NPL; l++) {
+		Link *k = &g_link[l];
+		char one[64];
+		if (!live(l)) continue;
+		fmt(one, "%splayer %d %d ms (max %d)", out[0] ? ", " : "", g_mode == NET_HOST ? l + 1 : 1,
+		    k->ping_n ? (int)(k->ping_sum / k->ping_n) : -1, k->ping_max);
+		if (str_len(out) + str_len(one) < size) fmt(out + str_len(out), "%s", one);
+		k->ping_sum = k->ping_n = k->ping_max = 0;
+	}
+}
+
 static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u32 now)
 {
-	/* the peer's inputs that came in: were the guesses right? */
-	u32 upto = g_remote < g_ticks ? g_remote : g_ticks;
-	for (u32 t = g_verified; t < upto; t++) {
-		if (same_input(g_pred[t % RING], g_remote_in[t % RING])) continue;
-		u32 to = g_ticks, t0 = counter();
+	/* the inputs that came in: were the guesses right? From the first wrong one on, again */
+	u32 bad = 0xffffffffu;
+	int bad_player = 0;
+	for (int p = 0; p < (int)g_nplayers; p++) {
+		if (!remote(p)) continue;
+		u32 upto = g_have[p] < g_ticks ? g_have[p] : g_ticks;
+		for (u32 t = g_verified; t < upto && t < bad; t++)
+			if (!same_input(g_pred[p][t % RING], g_in[p][t % RING])) {
+				bad = t;
+				bad_player = p;
+				break;
+			}
+	}
+	if (bad != 0xffffffffu) {
+		u32 t = bad, to = g_ticks, t0 = counter();
 		if (rollback_restore_tick(t)) {
 			u32 t1 = us(counter() - t0);
 			g_ticks = t;
@@ -2472,47 +3106,50 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 			g_rollbacks++;
 			g_resim_ticks += to - t;
 			if (to - t > g_rb_deepest) g_rb_deepest = to - t;
+			if (g_rollbacks <= RB_CHECK_FIRST || !(g_rollbacks % RB_CHECK_EVERY)) rb_check(t, to, bad_player);
 		} else if (!g_rb_failed++) {
 			log_msg("net: rollback: tick %d isn't kept any more (now %d): this game will come apart", t, g_ticks);
 		}
-		break;
 	}
-	g_verified = g_remote < g_ticks ? g_remote : g_ticks;
+	{
+		u32 m = remote_min();
+		g_verified = m < g_ticks ? m : g_ticks;
+	}
 	publish_verified();
 
 	/* this frame's ticks: as many as the clock asks, one fewer now and then while ahead of the
-	 * peer (time sync), and never further past the peer's last real input than the snapshots reach */
-	u32 n = wanted;
+	 * others (time sync), and never further past the last real input of any player than the
+	 * snapshots reach */
+	u32 n = wanted, avail = remote_min();
 	if (n > 6) n = 6;
-	if (n && g_peer_adv_known && ((int)g_ticks - (int)g_remote - g_peer_adv) / 2 >= 2 &&
-	    (int)(g_ticks - g_sync_skip_at) >= SYNC_EVERY) {
+	if (n && ahead() >= 2 && (int)(g_ticks - g_sync_skip_at) >= SYNC_EVERY) {
 		n--;
 		g_sync_skip_at = g_ticks;
 		g_sync_skipped++;
 	}
-	if (g_ticks + n > g_remote + RB_AHEAD) {
-		u32 can = g_remote + RB_AHEAD > g_ticks ? g_remote + RB_AHEAD - g_ticks : 0;
+	if (g_ticks + n > avail + RB_AHEAD) {
+		u32 can = avail + RB_AHEAD > g_ticks ? avail + RB_AHEAD - g_ticks : 0;
 		g_stall_frames++;
 		g_stall_ticks += n - can;
 		n = can;
 	}
 	if ((count & 0xffff) && actions) take_record((const u32 *)actions);
 	while (g_gen < g_ticks + n) make_input();
-	if (g_gen != g_sent_gen || now - g_last_send >= RESEND_MS) send_inputs();
+	send_inputs_due(now);
 	if (now - g_last_stall_log >= STALL_LOG_MS) {
+		char pings[200];
+		ping_log(pings, sizeof pings);
 		if (g_stall_frames)
-			log_msg("net: in the last %d s, %d frames waited for the %s's inputs (%d ticks in all)",
-			        STALL_LOG_MS / 1000, g_stall_frames, g_mode == NET_HOST ? "joiner" : "host", g_stall_ticks);
+			log_msg("net: in the last %d s, %d frames waited for the %s' inputs (%d ticks in all)",
+			        STALL_LOG_MS / 1000, g_stall_frames, others(), g_stall_ticks);
 		if (g_rb_started)
 			log_msg("net: rollback so far: %d rollbacks, %d ticks run again (deepest %d), %d pages kept per tick, "
-			        "%d ambient sounds stopped; time sync left out %d ticks, now %d ahead of the %s; ping %d ms (max %d); "
+			        "%d ambient sounds stopped; time sync left out %d ticks, now %d ahead of the %s; ping %s; "
 			        "a rollback took %d.%d ms on average, at most %d.%d ms (putting back at most %d.%d ms)",
 			        g_rollbacks, g_resim_ticks, g_rb_deepest, rollback_known_pages(), rollback_ambients_stopped(),
-			        g_sync_skipped, ((int)g_ticks - (int)g_remote - g_peer_adv) / 2, g_mode == NET_HOST ? "joiner" : "host",
-			        g_ping_n ? g_ping_sum / g_ping_n : -1, g_ping_max,
+			        g_sync_skipped, ahead(), others(), pings[0] ? pings : "-",
 			        g_rb_timed ? g_rb_us_sum / g_rb_timed / 1000 : 0, g_rb_timed ? g_rb_us_sum / g_rb_timed / 100 % 10 : 0,
 			        g_rb_us_max / 1000, g_rb_us_max / 100 % 10, g_rb_restore_us_max / 1000, g_rb_restore_us_max / 100 % 10);
-		g_ping_sum = g_ping_n = g_ping_max = 0;
 		g_rb_us_sum = g_rb_us_max = g_rb_restore_us_max = g_rb_timed = 0;
 		g_stall_frames = g_stall_ticks = 0;
 		g_last_stall_log = now;
@@ -2520,8 +3157,15 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 	if (n) {
 		g_last_status = now;
 	} else if (now - g_last_status >= 1000) {
-		log_msg("net: waiting at tick %d: the %s's inputs up to %d; packets sent %d, received %d",
-		        g_ticks, g_mode == NET_HOST ? "joiner" : "host", g_remote, g_npackets_sent, g_npackets_recv);
+		char line[160] = "";
+		for (int p = 0; p < (int)g_nplayers; p++) {
+			char one[40];
+			if (!remote(p)) continue;
+			fmt(one, "%splayer %d's up to %d", line[0] ? ", " : "", p + 1, g_have[p]);
+			if (str_len(line) + str_len(one) < sizeof line) fmt(line + str_len(line), "%s", one);
+		}
+		log_msg("net: waiting at tick %d: inputs %s; packets sent %d, received %d", g_ticks, line, g_npackets_sent,
+		        g_npackets_recv);
 		g_last_status = now;
 	}
 
@@ -2529,12 +3173,12 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 	if (n && !g_rb_started) {   /* the match's first tick */
 		lockstep_set_seeds(g_seed, g_local_seed);
 		g_sound_on = ONgSoundOn;
+		hud_textures_prepare();   /* a rewind mustn't see them made */
 		g_rb_started = rollback_net_begin();
-		log_msg("net: rollback %s: no input delay, the %s's input guessed and corrected up to %d ticks back%s",
-		        g_rb_started ? "on" : "FAILED", g_mode == NET_HOST ? "joiner" : "host", RB_AHEAD,
-		        g_record ? " (recording is off with rollback)" : "");
+		log_msg("net: rollback %s: no input delay, the %s' inputs guessed and corrected up to %d ticks back%s",
+		        g_rb_started ? "on" : "FAILED", others(), RB_AHEAD, g_record ? " (recording is off with rollback)" : "");
 	}
-	players_net_frame(g_frame_p2, n);
+	players_net_frame(g_frames, n);
 	return run_update(n, ticks_run);
 }
 
@@ -2581,9 +3225,9 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	}
 
 	receive();
-	now = GetTickCount();   /* after receive(), which stamps g_last_recv: now - g_last_recv mustn't wrap */
-	if (g_have_peer && (g_name_sent != mp_name_serial() || now - g_last_name >= NAME_MS)) send_name();
-	if (g_chat_out_n && now - g_chat_sent_at >= CHAT_RESEND_MS) chat_send_queued();
+	now = GetTickCount();   /* after receive(), which stamps last_recv: now - last_recv mustn't wrap */
+	send_names(now);
+	chat_resend_due(now);
 	u32 wanted = GS_SERVER_TIME(gs) - GS_TICK(gs);
 	if (wanted > 6) wanted = 6;
 
@@ -2595,18 +3239,37 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 
 	if (g_state == S_WAIT) {
 		if (g_mode == NET_JOIN && now - g_last_hello >= HELLO_MS) send_hello();
-		if (now - g_last_status >= 5000) {
-			log_msg("net: still waiting for the %s (packets sent %d, received %d)", g_mode == NET_HOST ? "joiner" : "host",
+		if (g_mode == NET_HOST && now - g_wait_since >= LOST_MS) {   /* the ones still loading don't play */
+			int any = 0;
+			for (int l = 1; l < (int)g_nplayers; l++) {
+				if (!g_link[l].arrived) mark_gone(l, 0, "didn't load the match in time", 0);   /* still in the lobby */
+				any |= !gone(l);
+			}
+			if (!any) {
+				back_to_lobby("no joiner came to the match");
+				if (ticks_run) *ticks_run = 0;
+				return 0;
+			}
+			host_begin();
+		} else if (now - g_last_status >= 5000) {
+			log_msg("net: still waiting for the %s (packets sent %d, received %d)", g_mode == NET_HOST ? "joiners" : "host",
 			        g_npackets_sent, g_npackets_recv);
 			g_last_status = now;
 		}
-		players_net_frame(0, 0);
-		return run_update(0, ticks_run);   /* the clock stands until the game starts */
+		if (g_state == S_WAIT) {
+			players_net_frame(0, 0);
+			u32 err = run_update(0, ticks_run);   /* the clock stands until the game starts */
+			wait_camera(count, actions, now);
+			return err;
+		}
 	}
 
-	if (g_state == S_RUN && (int)(now - g_last_recv) > LOST_MS) {
-		log_msg("net: nothing from the %s for %d s; their player stands still (packets sent %d, received %d, inputs received %d)",
-		        g_mode == NET_HOST ? "joiner" : "host", LOST_MS / 1000, g_npackets_sent, g_npackets_recv, g_ninputs_recv);
+	if (g_mode == NET_HOST && (g_state == S_RUN || g_state == S_OVER)) host_check_silence(now);
+	if (g_mode == NET_HOST) fill_gone();
+	if (g_mode == NET_JOIN && g_state == S_RUN && (int)(now - g_link[0].last_recv) > LOST_MS) {
+		log_msg("net: nothing from the host for %d s; the other players stand still (packets sent %d, received %d, inputs received %d)",
+		        LOST_MS / 1000, g_npackets_sent, g_npackets_recv, g_ninputs_recv);
+		server_line(mp_name(0), "left the game");
 		g_lost_left = 0;
 		g_state = S_LOST;
 	}
@@ -2618,9 +3281,9 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 
 	/* The ticks this frame runs, then this PC's inputs up to the delay past them: an input made
 	 * now is always used g_delay ticks later. Making them ahead by wall-clock time instead let
-	 * the queue grow (up to delay + 6 ticks) whenever the peer's inputs came late, and it never
+	 * the queue grow (up to delay + 6 ticks) whenever the others' inputs came late, and it never
 	 * shrank back. A frame that makes no input merges its record into the next one. */
-	u32 remote_avail = g_state == S_LOST ? 6 : g_remote - g_ticks;
+	u32 remote_avail = g_state == S_LOST ? 6 : remote_min() - g_ticks;
 	u32 n = wanted;
 	if (n > remote_avail) {
 		g_stall_frames++;
@@ -2630,40 +3293,41 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	if (n > 6) n = 6;
 	if ((count & 0xffff) && actions) take_record((const u32 *)actions);
 	while (g_gen < g_ticks + g_delay + n) make_input();
+	if (g_mode == NET_HOST) fill_gone();
 	if (n > g_gen - g_ticks) n = g_gen - g_ticks;
-	if (g_state == S_RUN && (g_gen != g_sent_gen || now - g_last_send >= RESEND_MS)) send_inputs();
+	if (g_state == S_RUN) send_inputs_due(now);
 	if (now - g_last_stall_log >= STALL_LOG_MS) {
 		if (g_stall_frames)
-			log_msg("net: in the last %d s, %d frames waited for the %s's inputs (%d ticks late in all)",
-			        STALL_LOG_MS / 1000, g_stall_frames, g_mode == NET_HOST ? "joiner" : "host", g_stall_ticks);
+			log_msg("net: in the last %d s, %d frames waited for the %s' inputs (%d ticks late in all)",
+			        STALL_LOG_MS / 1000, g_stall_frames, others(), g_stall_ticks);
 		g_stall_frames = g_stall_ticks = 0;
 		g_last_stall_log = now;
 	}
 	if (n || g_state != S_RUN) {
 		g_last_status = now;
 	} else if (now - g_last_status >= 1000) {   /* stuck waiting: say on what */
-		log_msg("net: waiting at tick %d: our inputs up to %d, the %s's up to %d; packets sent %d, received %d",
-		        g_ticks, g_gen, g_mode == NET_HOST ? "joiner" : "host", g_remote, g_npackets_sent, g_npackets_recv);
+		log_msg("net: waiting at tick %d: our inputs up to %d, the %s' up to %d; packets sent %d, received %d",
+		        g_ticks, g_gen, others(), remote_min(), g_npackets_sent, g_npackets_recv);
 		g_last_status = now;
 	}
 
+	memset(g_frames, 0, sizeof g_frames);
 	for (u32 k = 0; k < n; k++) {
 		u32 slot = (g_ticks + k) % RING;
-		const u32 *mine = g_local_in[slot];
-		static const u32 none[12];
-		const u32 *theirs = g_state == S_LOST ? none : g_remote_in[slot];
-		memcpy(g_frame_p1[k], g_mode == NET_HOST ? mine : theirs, 0x30);
-		memcpy(g_frame_p2[k], g_mode == NET_HOST ? theirs : mine, 0x30);
+		for (int p = 0; p < (int)g_nplayers; p++)
+			if (p == g_slot || g_state != S_LOST) memcpy(g_frames[p][k], g_in[p][slot], 0x30);
 	}
 	if (n && !g_ticks) {
 		lockstep_set_seeds(g_seed, g_local_seed);
-		if (g_record) {
+		if (g_record && g_nplayers == 2) {
 			const char *path = g_mode == NET_HOST ? "Arklite-net-host.akr" : "Arklite-net-join.akr";
 			if (lockstep_net_record_begin(g_level, path)) log_msg("net: recording this game to %s", path);
+		} else if (g_record) {
+			log_msg("net: not recording this game: recordings hold two players, this match has %d", g_nplayers);
 		}
 	}
-	players_net_frame(g_frame_p2, n);
-	lockstep_net_record_frame(n, g_frame_p1, g_frame_p2);
+	players_net_frame(g_frames, n);
+	lockstep_net_record_frame(n, g_frames[0], g_frames[1]);
 	u32 err = run_update(n, ticks_run);
 	lockstep_net_record_frame_end();
 	return err;
@@ -2671,13 +3335,13 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 
 /* ---- Each PC's own view ------------------------------------------------------------------- */
 
-/* The character this PC plays: player 2 on the joiner */
+/* The character this PC plays: a joiner's own player */
 static u8 *view_character(u8 *konoko)
 {
-	u8 *p2;
+	u8 *mine;
 	if (g_mode != NET_JOIN || !ONgGameState || konoko != GS_PLAYER(ONgGameState)) return konoko;
-	p2 = players_p2();
-	return p2 ? p2 : konoko;
+	mine = players_char(local_char());
+	return mine ? mine : konoko;
 }
 
 static void ONI_FC camera_update(u32 ticks, u32 edx, u32 arg)
@@ -2876,8 +3540,8 @@ static void sounds_join_install(void)
 		b[5] = 0x90;
 		patch_write(0x4faa09, b, 6);
 	} else ok = 0;
-	log_msg(ok ? "net: pickup, overheal and error sounds follow player 2"
-	           : "net: some player sounds couldn't be moved to player 2 (game code changed)");
+	log_msg(ok ? "net: pickup, overheal and error sounds follow this PC's player"
+	           : "net: some player sounds couldn't be moved to this PC's player (game code changed)");
 }
 
 static void sounds_install(void)
@@ -2893,11 +3557,11 @@ static void view_install(void)
 {
 	if (patch_call(0x4fb141, (u32)ONrCamera_Update, (u32)camera_update) &&
 	    patch_call(0x4fb170, (u32)ONrCamera_Update, (u32)camera_update))
-		log_msg("net: the camera follows player 2");
+		log_msg("net: the camera follows this PC's player");
 	if (patch_call(0x4fb1f4, (u32)ONrListener_PositionAlt, (u32)listener_position_alt) &&
 	    patch_call(0x4fb1fb, (u32)ONrListener_Position, (u32)listener_position) &&
 	    patch_call(0x4fb20f, (u32)ONrListener_Facing, (u32)listener_facing))
-		log_msg("net: sound is heard from player 2");
+		log_msg("net: sound is heard from this PC's player");
 	{
 		static const u8 entry[8] = { 0x83, 0xec, 0x6c, 0xa1, 0x7c, 0xce, 0x5e, 0x00 };
 		u8 b[8] = { 0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
@@ -2905,7 +3569,7 @@ static void view_install(void)
 		if (code_matches(ONcDisplay, entry, sizeof entry)) {
 			memcpy(b + 1, &rel, 4);
 			patch_write(ONcDisplay, b, sizeof b);
-			log_msg("net: the HUD, laser sight and crosshair show player 2");
+			log_msg("net: the HUD, laser sight and crosshair show this PC's player");
 			if (!patch_call(ONcTick_HUDCall, (u32)ONrHUD_Tick, (u32)hud_tick))
 				log_msg("net: HUD tick call 0x%x changed, the health ring follows Konoko", ONcTick_HUDCall);
 		} else {
@@ -2975,16 +3639,20 @@ static int net_open(void)
 	if (!g_images)
 		g_images = VirtualAlloc(0, HASH_SLOTS * IMG_CHARS * sizeof(CharImage), 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
 	if (g_mode == NET_JOIN) {
-		if (!resolve(g_join, &g_peer)) {
+		memset(&g_link[0], 0, sizeof g_link[0]);
+		g_slot = 1;   /* until the host's lobby says which player this PC is */
+		if (!resolve(g_join, &g_link[0].addr)) {
 			log_msg("net: can't find host %s, networking off", g_join);
 			closesocket(g_sock);
 			g_sock = INVALID_SOCKET;
 			return 0;
 		}
-		g_have_peer = 1;
-		const u8 *ip = (const u8 *)&g_peer.addr;
-		log_msg("net: joining %d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ntohs(g_peer.port));
+		g_link[0].used = 1;
+		link_reset(&g_link[0]);
+		const u8 *ip = (const u8 *)&g_link[0].addr.addr;
+		log_msg("net: joining %d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ntohs(g_link[0].addr.port));
 	} else {
+		g_slot = 0;
 		log_msg("net: hosting on UDP port %d", g_port);
 	}
 	return 1;
@@ -3011,13 +3679,22 @@ static void join_install(void)
 	sounds_join_install();
 }
 
+/* Leaving a lobby: the others hear it at once instead of after LOST_MS of silence (a match's
+ * goodbye is session_end's) */
+static void lobby_goodbye(void)
+{
+	if (g_state == S_LOBBY && g_sock != INVALID_SOCKET) send_bye();
+}
+
 /* Out of the network game this PC was in (the main menu's Custom Game picks the next mode) */
 static void net_leave(void)
 {
+	lobby_goodbye();
 	session_end("left from the menu");
 	if (g_sock != INVALID_SOCKET) closesocket(g_sock);
 	g_sock = INVALID_SOCKET;
-	g_have_peer = g_peer_seen = g_peer_ready = 0;
+	memset(g_link, 0, sizeof g_link);
+	names_push();
 	g_match_pending = 0;
 	g_problem = 0;
 	g_mode = NET_OFF;
@@ -3041,15 +3718,14 @@ void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectato
 	g_mode = NET_HOST;
 	g_port = (u16)(port >= 1 && port <= 65535 ? port : DEFAULT_PORT);
 	str_cpy(g_server_name, sizeof g_server_name, name && name[0] ? name : "New Oni multiplayer game");
-	g_max_players = max_players;
+	g_max_players = max_players >= 2 && max_players <= NET_PLAYERS_MAX ? max_players : NET_PLAYERS_MAX;
 	g_max_spectators = max_spectators;
 	g_time_limit = time_limit;
 	g_score_limit = score_limit;
 	g_server_id = GetTickCount() * 2654435761u ^ (u32)GetCurrentProcessId();
 	net_prepare();
-	log_msg("net: hosting \"%s\" on UDP port %d, %d players (%d for now), %d spectators, %d min, %d points", g_server_name,
-	        g_port, g_max_players, g_max_players < NET_MAX_PLAYERS ? g_max_players : NET_MAX_PLAYERS, g_max_spectators,
-	        g_time_limit, g_score_limit);
+	log_msg("net: hosting \"%s\" on UDP port %d, %d players, %d spectators, %d min, %d points", g_server_name, g_port,
+	        g_max_players, g_max_spectators, g_time_limit, g_score_limit);
 }
 
 void net_menu_join(const char *address)
@@ -3219,7 +3895,8 @@ void net_install(void)
 
 	/* The server's description, as the Host dialog saved it */
 	GetPrivateProfileStringA("host", "name", g_server_name, g_server_name, sizeof g_server_name, ini_path());
-	g_max_players = GetPrivateProfileIntA("host", "max_players", 8, ini_path());
+	g_max_players = GetPrivateProfileIntA("host", "max_players", NET_PLAYERS_MAX, ini_path());
+	if (g_max_players < 2 || g_max_players > NET_PLAYERS_MAX) g_max_players = NET_PLAYERS_MAX;   /* (an older Arklite allowed 64) */
 	g_max_spectators = GetPrivateProfileIntA("host", "max_spectators", 0, ini_path());
 	g_time_limit = GetPrivateProfileIntA("host", "time_limit", 10, ini_path());
 	g_score_limit = (int)GetPrivateProfileIntA("host", "score_limit", 20, ini_path());
@@ -3279,11 +3956,13 @@ void net_install(void)
  * and the goodbye at process exit came after Winsock was gone. The mode stays for the next level. */
 void net_main_menu(void)
 {
+	lobby_goodbye();
 	session_end("left to the main menu");
 }
 
 void net_exit(void)
 {
+	lobby_goodbye();
 	session_end("game closed");
 	net_query_close();
 	if (g_sock != INVALID_SOCKET) closesocket(g_sock);

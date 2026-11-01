@@ -49,7 +49,7 @@ AE="${AE%/}"
 [ -f "$AE/binkw32.dll" ] || die "$AE has no binkw32.dll; install Anniversary Edition (it brings the Daodan DLL)"
 if command -v sha256sum >/dev/null; then
 	sum="$(sha256sum "$AE/Oni.exe" | cut -d' ' -f1)"
-	[ "$sum" = "$ONI_SHA256" ] || echo "warning: AE/Oni.exe is not the one Arklite was made for; patches that don't match will be skipped (see AE/Arklite.log)"
+	[ "$sum" = "$ONI_SHA256" ] || echo "warning: AE/Oni.exe is not the one Arklite was made for; patches that don't match will be skipped (see the newest log in AE/logs/)"
 fi
 
 # Release zip or source repository?
@@ -87,4 +87,4 @@ else
 	fi
 fi
 echo "Arklite $(cat "$SRC/VERSION" 2>/dev/null || cat "$HERE/VERSION" 2>/dev/null || echo) installed into $AE ($MODE)"
-echo "Start Oni as usual; AE/Arklite.log lists what was patched."
+echo "Start Oni as usual; the newest log in AE/logs/ lists what was patched."

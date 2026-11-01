@@ -30,7 +30,10 @@
  *   - No dream-lab classes in random costumes (random_class.c): AE's shared level0 put the
  *     half-size striker_dream_lab in every level's striker_easy random pool.
  *   - No skybox seams (texture_clamp.c): clamped textures use GL_CLAMP_TO_EDGE, not GL_CLAMP,
- *     whose black border lined every edge of the skybox cube.
+ *     whose black border lined every edge of the skybox cube. Textures can be 1024x1024: the
+ *     upload's conversion buffer stopped at 256x256.
+ *   - Levels can add particle classes (particle_table.c): stock Oni never set up any class but
+ *     level 0's, and its lookups ran off the sorted table's end, so such a level crashed loading.
  *   - 255 characters, all active at once (char_limit.c): the stock 64 active slots crash the
  *     game when more AIs than that go into combat.
  *   - Player 2 on a gamepad (players.c): multiplayer step 2.
@@ -152,6 +155,8 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	hud_scale_install();
 	random_class_install();
 	texture_clamp_install();
+	particle_table_install();
+	respawn_fx_install();
 	char_limit_install();
 	players_install();
 	items_install();

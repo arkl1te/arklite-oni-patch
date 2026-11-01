@@ -97,6 +97,10 @@ __declspec(dllimport) u32  WINAPI GetTickCount(void);
 #define LIrMode_SetGameInput    ((void (ONI_FC *)(u32))0x403f70)
 #define ONrLevel_GetCurrent     ((u16 (ONI_FC *)(void))0x5054c0)
 #define ONgGameState            (*(u8 **)0x5ece7c)
+#define WMrCursor_Get           ((u8 *(ONI_FC *)(u32))0x4687d0)          /* ECX type: {type, PSpc} */
+#define PSrPartSpec_Draw        ((void (ONI_FC *)(void *, u32, const float *, u32, u32, u32))0x46a610)   /* ECX partspec, EDX parts, [at], [w], [h], [alpha] */
+#define WM_CURSOR_ARROW         1
+#define PS_MIDDLE_MIDDLE        0x10
 
 #define ONCC_BODY(c)            (*(u8 **)((c) + 0xc34))
 #define ONCC_TEXTURES(c)        (*(u8 **)((c) + 0xc38))
@@ -113,6 +117,7 @@ __declspec(dllimport) u32  WINAPI GetTickCount(void);
 #define TXMP_H(t)               (*(u16 *)((t) + 0x86))
 #define TXMP_TYPE(t)            (*(u32 *)((t) + 0x88))
 #define TXMP_TEXELS(t)          (*(u8 **)((t) + 0x94))
+#define TXMP_DIRTY(t)           (*(u8 *)((t) + 0xa0))      /* uploaded again when set (0x41a460); +0x9c the GL name */
 #define TXMP_TEXELS_LOADED      0x2000
 #define PIXEL_ARGB1555          2
 
@@ -210,6 +215,7 @@ typedef struct {
 	u8 *voncc[MAX_VARS];
 	u32 vnumber[MAX_VARS];
 	u8 *vpicture[MAX_VARS];     /* texture, 0: not rendered (or failed) */
+	u8 *vtex[MAX_VARS];         /* its texture, kept for the next size */
 	u8 vtried[MAX_VARS];
 	int x, y, w, h;             /* the cell, from the last draw */
 	int vy;                     /* its "< 2 / 7 >" line */
@@ -219,13 +225,13 @@ static Entry g_roster[MAX_ROSTER];
 static int g_count, g_resolved, g_any_vars;
 static int g_choice = -1;       /* roster index chosen, -1: the map's class */
 static int g_choice_var;        /* its variation */
-static int g_name_y = -1;       /* the name line, from the last draw */
+static int g_name_y = -1, g_name_h;   /* the name line, from the last draw */
 static u8 g_mute[256];          /* keys that typing used: no press or release until they're up */
 static int g_was_editing;
 static int g_open, g_sel, g_saved_input;
 static u32 g_level;
 static int g_pic_w, g_pic_h;    /* the pictures' size */
-static u8 *g_panel, *g_cell, *g_hilite, *g_cursor;
+static u8 *g_panel, *g_cell, *g_hilite;
 static int g_mx = -1, g_my = -1, g_mouse_moved, g_in_window;
 static u8 g_down[256];
 
@@ -432,32 +438,64 @@ static void roster_resolve(void)
 
 /* ---- Textures ------------------------------------------------------------------------------ */
 
-/* An 8x8 texture from Oni (a real instance: a slot and a few bytes of the dynamic file), given
- * w x h texels (rounded up to powers of two) of our own memory. The dynamic file's pixel memory
- * is small and fixed (1 MB) and Oni's own runtime textures come from it: full-size pictures
- * there ran it out ("Unable to allocate the pixels" in debugger.txt), and the game froze later. */
-static u8 *texture_new(int w, int h, const char *name)
+/* An 8x8 TXMP of Oni's (a real instance: a slot and a few bytes of the dynamic file), kept out
+ * of rollback's restores: the struct holds the size, the pixels pointer, the GL texture name
+ * (+0x9c, given by glGenTextures at 0x40cfdb) and the dirty flag (+0xa0), after the instance's
+ * 8-byte header */
+static u8 *texture_make(const char *name)
 {
-	u8 *t = 0, *texels;
-	int tw = 8, th = 8;
-
-	while (tw < w) tw <<= 1;
-	while (th < h) th <<= 1;
+	u8 *t = 0;
 	if (M3rTextureMap_New(8, 8, PIXEL_ARGB1555, 3, 0, name, &t) || !t || !TXMP_TEXELS(t)) {
 		log_msg("char menu: can't make texture %s", name);
 		return 0;
 	}
-	if (tw > 8 || th > 8) {
+	rollback_keep(t - 8, 8 + 0xa4);
+	return t;
+}
+
+/* Textures made before a networked match starts (hud_textures_prepare): a rewind puts back the
+ * dynamic file's own bookkeeping too, so a texture made during the match could get the slot of
+ * one made after the tick it rewound to, and the two drew each other (the menu's cells full of
+ * character pictures, on the joiner). */
+static u8 *g_pool[MAX_ROSTER * MAX_VARS + 16];
+static int g_npool;
+
+/* A texture given w x h texels (rounded up to powers of two) of our own memory. The dynamic
+ * file's pixel memory is small and fixed (1 MB) and Oni's own runtime textures come from it:
+ * full-size pictures there ran it out ("Unable to allocate the pixels" in debugger.txt), and the
+ * game froze later. */
+static int texture_size(u8 *t, int w, int h)
+{
+	u8 *texels;
+	int tw = 8, th = 8;
+
+	while (tw < w) tw <<= 1;
+	while (th < h) th <<= 1;
+	if (tw > TXMP_W(t) || th > TXMP_H(t)) {
 		texels = VirtualAlloc(0, (u32)(tw * th * 2), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 		if (!texels) {
-			log_msg("char menu: no memory for texture %s", name);
+			log_msg("char menu: no memory for texture %s", (const char *)t);
 			return 0;
 		}
 		TXMP_W(t) = (u16)tw;
 		TXMP_H(t) = (u16)th;
 		TXMP_TEXELS(t) = texels;
 	}
-	return t;
+	TXMP_DIRTY(t) = 1;   /* uploaded again when next drawn */
+	return 1;
+}
+
+static u8 *texture_new(int w, int h, const char *name)
+{
+	u8 *t;
+
+	if (g_npool) {
+		t = g_pool[--g_npool];
+		str_cpy((char *)t, 0x80, name);
+	} else if (!(t = texture_make(name))) {
+		return 0;
+	}
+	return texture_size(t, w, h) ? t : 0;
 }
 
 static u8 *solid(u16 color, const char *name)
@@ -756,8 +794,8 @@ static u8 *picture(Entry *e)
 	if (e->vtried[v] || !g_idle) return e->vpicture[v];
 	e->vtried[v] = 1;
 	fmt(name, "arklite_char_%d", serial++);
-	u8 *t = texture_new(g_pic_w, g_pic_h, name);
-	if (!t) return 0;
+	u8 *t = e->vtex[v];   /* a new size draws into the same texture */
+	if (t ? !texture_size(t, g_pic_w, g_pic_h) : !(t = e->vtex[v] = texture_new(g_pic_w, g_pic_h, name))) return 0;
 	u16 *px = (u16 *)TXMP_TEXELS(t);
 	memset(px, 0, TXMP_W(t) * TXMP_H(t) * 2);
 	if (render(e, v, px, TXMP_W(t), g_pic_w, g_pic_h)) e->vpicture[v] = t;
@@ -881,8 +919,8 @@ void char_menu_frame(void)
 			g_my = my;
 		}
 	}
-	int hover = -1, lh = mp_hud_line_height();
-	int on_name = g_in_window && g_name_y >= 0 && g_my >= g_name_y && g_my < g_name_y + lh;
+	int hover = -1;
+	int on_name = g_in_window && g_name_y >= 0 && g_my >= g_name_y && g_my < g_name_y + g_name_h;
 	if (g_in_window)
 		for (int i = 0; i < g_count; i++) {
 			const Entry *e = &g_roster[i];
@@ -929,6 +967,25 @@ static void rect(u8 *t, int x, int y, int w, int h, u32 alpha)
 	if (t && w > 0 && h > 0) M3rDraw_Bitmap(t, at, (u32)w, (u32)h, 0xffffffffu, alpha);
 }
 
+/* net.c, before rollback starts: enough textures for every picture and the HUD's rectangles */
+void hud_textures_prepare(void)
+{
+	static int done;
+	int want = 16;
+
+	if (done) return;
+	done = 1;
+	if (!g_resolved) roster_resolve();
+	for (int i = 0; i < g_count; i++) want += g_roster[i].nvar;
+	while (g_npool < want && g_npool < (int)(sizeof g_pool / sizeof g_pool[0])) {
+		char name[32];
+		fmt(name, "arklite_hud_%d", g_npool);
+		if (!(g_pool[g_npool] = texture_make(name))) break;
+		g_npool++;
+	}
+	log_msg("char menu: %d textures made before the match", g_npool);
+}
+
 /* For chat.c and mp_names.c (one color only: M3rDraw_Bitmap repeats a texture past its size) */
 u8 *hud_solid(u16 argb1555, const char *name) { return solid(argb1555, name); }
 void hud_rect(u8 *texture, int x, int y, int w, int h, u32 alpha) { rect(texture, x, y, w, h, alpha); }
@@ -952,7 +1009,6 @@ void char_menu_draw(int width, int height)
 		g_panel = solid(0x8000, "arklite_char_panel");          /* black */
 		g_cell = solid(0x8000 | 6 << 10 | 6 << 5 | 7, "arklite_char_cell");
 		g_hilite = solid(0x8000 | 31 << 10 | 26 << 5 | 6, "arklite_char_hilite");
-		g_cursor = solid(0xffff, "arklite_char_cursor");
 	}
 
 	/* layout: up to 8 columns, cells as tall as fits */
@@ -978,6 +1034,7 @@ void char_menu_draw(int width, int height)
 
 	/* the name: Tab or a click types a new one */
 	g_name_y = top - 3 * lh + gap / 2;
+	g_name_h = lh;
 	if (mp_name_editing()) {
 		fmt(line, "Name: %s%s", mp_name_edit_text(), GetTickCount() / 400 & 1 ? "_" : " ");
 		mp_hud_text(line, width / 2, g_name_y, MP_CENTER, YELLOW);
@@ -988,7 +1045,7 @@ void char_menu_draw(int width, int height)
 
 	NetHud h;
 	net_hud(&h);
-	int now = players_can_change(h.state == NETHUD_OFF ? 0 : h.local_player);
+	int now = players_can_change(h.state == NETHUD_OFF ? 0 : h.local_char);
 	char chosen[96];
 	if (g_choice >= 0) label(chosen, g_choice, g_choice_var);
 	else str_cpy(chosen, sizeof chosen, "the map's character");
@@ -1017,9 +1074,10 @@ void char_menu_draw(int width, int height)
 	            g_any_vars ? "Arrows/mouse: pick   Q/E or < >: variation   Enter/click: choose   F2/Esc: close" :
 	            "Arrows or mouse: pick   Enter or click: choose   F2 or Esc: close",
 	            width / 2, bottom + lh, MP_CENTER, GREY);
-	if (g_in_window) {
-		rect(g_panel, g_mx - 1, g_my - 1, 12, 12, 255);
-		rect(g_cursor, g_mx, g_my, 10, 10, 255);
+	if (g_in_window) {   /* the menus' arrow, as WMrCursor_Draw (0x468770) draws it */
+		const u8 *cursor = WMrCursor_Get(WM_CURSOR_ARROW);
+		float at[4] = { (float)(g_mx - 16), (float)(g_my - 16), 0.5f, 2.0f };
+		if (cursor && *(void **)(cursor + 4)) PSrPartSpec_Draw(*(void **)(cursor + 4), PS_MIDDLE_MIDDLE, at, 32, 32, 255);
 	}
 }
 
