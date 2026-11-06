@@ -94,6 +94,12 @@ static int fx_make(const FxData *fx, const u8 *stock, u8 *dest)
 	return at == fx->made_size;
 }
 
+void respawn_fx_level0_changed(void)
+{
+	for (u32 i = 0; i < FX_COUNT; i++) g_stock_at[i] = 0;
+	g_stock_used = 0;
+}
+
 const char *respawn_fx_root(void) { return RESPAWN_FX_ROOT; }
 
 void respawn_fx_load(u32 level)

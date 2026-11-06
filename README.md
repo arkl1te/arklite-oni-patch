@@ -10,17 +10,18 @@ Arklite's aim is to be the Oni update that never came.
 
 ## Features
 
-- **Network multiplayer** for 2 to 4 players (as many as the map has spawn points). Host a map from the menu, or join one from your server list or your local network. Matches have a lobby, time and score limits, a scoreboard (F1) and chat (Enter), which also says when someone enters or leaves the game. The other players are predicted, so there's no input delay.
+- **Network multiplayer** for 2 to 4 players (as many as the map has spawn points). Host a map from the menu, or join one from your server list or your local network. Players fight in a warm-up until enough of them are ready (F3), and anyone can join while a warm-up or match is on; matches have time and score limits, a kill feed under the score (who killed whom, and how, in icons), a scoreboard (F1) and chat (Enter), which also says when someone enters or leaves the game. Type /help in the chat for its commands: /name, /w (whisper), /moves (your character's move list), /t and /t2 (taunts), /sneeze, /i (idle), /clear. The other players are predicted, so there's no input delay.
 - **Pick your character with F2**, from Konoko to Mad Bomber, with their outfits and colors. Type your name there too, and it shows over your head.
+- **Barabas can regenerate** when you play him: crouch, let go of crouch, then press Action.
 - **Custom Game** on the main menu lists every custom level. Play it alone or host it. Joiners who don't have the map download it from the host.
-- **A HUD that scales** from 50% to 300%, and stays sharp. The stock HUD gets tiny at high resolutions.
-- **Separate Sound, Music and Voice volume**, with all character speech and taunts on Voice.
+- **HUD scaling** from 50% to 300%, and stays (almost) sharp. The stock HUD gets tiny at high resolutions.
+- **Sound, Music and Voice volume bars**, with all character speech and taunts on Voice.
 - **An FPS counter**, off by default, in Options > More...
-- **A see-through pause menu**, and the level music keeps playing behind it if you like.
-- **Up to 255 characters**, all active at once, so big fights no longer crash the game.
-- **No more seams** along the edges of the sky.
-- **No more tiny strikers** outside the dream lab.
-- **Player 2 on a gamepad**, next to Konoko on keyboard and mouse.
+- **Mouse wheel in the menus**: it scrolls lists, moves the slider under the cursor and turns the pages of the F1 screen.
+- **Transparent pause menu**, and the level music keeps playing behind it if you like.
+- **255 characters**, all active at once, so big fights no longer crash the game.
+- **Fixed skybox** along the edges of the sky.
+- **Fixed tiny strikers** outside the dream lab.
 - **A crash log** in `AE/logs/`, dated, with the last three games kept, for when something goes wrong.
 
 Everything is in Options → **More...** and in the **Custom Game** menu. Press F1 in a match for the scoreboard, and F2 to change character.
@@ -28,7 +29,10 @@ Everything is in Options → **More...** and in the **Custom Game** menu. Press 
 ## For modders
 
 - **A folder per custom level.** Drop it in `GameDataFolder/CustomLevels/`. A level doesn't need its own level number, and its files never replace the original levels. It can bring its own BSL scripts (`IGMD/`) and up to 8 plugin `.dat` files.
-- **Dynamic vertex lighting.** Lights pulse, flicker or break down, from a `vertexlight.bin` next to the level.
+- **Dynamic vertex lighting.** Lights pulse, flicker or break down, from a `vertexlight.bin` next to the level, and can play a sound on each pulse or failure.
+- **Spinning particles.** Particles in a Catwalk level's spinning groups turn with the group, from a `spinparticles.bin` next to the level.
+- **A floor for the sky.** A sky with a sixth texture draws it under the box.
+- **Kill cameras in multiplayer.** A level's `cm_detach` keeps only the dead player's camera in place, until they respawn.
 - **255 characters, 255 active, 255 shadows**, up from 128, 64 and 32.
 - **Multiplayer maps from any level.** Every character with the IsPlayer flag is a spawn point, and each weapon or power-up can set its own respawn time.
 - **Maps travel by themselves.** A joiner whose map differs or is missing gets the host's copy.

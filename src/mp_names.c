@@ -188,16 +188,27 @@ void mp_name_edit_begin(void)
 	g_editing = 1;
 }
 
+/* This PC's player's new name (cleaned; empty keeps the old one), saved and announced (net.c
+ * net_name_changed): typed in the F2 menu or the chat's /name. 0: nothing changed. */
+int mp_name_change(const char *name)
+{
+	char before[MP_NAME_MAX];
+
+	str_cpy(before, sizeof before, g_name);
+	clean(g_name, name, before);
+	if (same(g_name, before)) return 0;
+	g_serial++;
+	WritePrivateProfileStringA("multiplayer", "name", g_name, ini_path());
+	log_msg("names: this PC's player is now %s (saved in Arklite.ini)", g_name);
+	net_name_changed(before, g_name);
+	return 1;
+}
+
 void mp_name_edit_end(int keep)
 {
 	if (!g_editing) return;
 	g_editing = 0;
-	if (!keep) return;
-	clean(g_name, g_edit, g_before);
-	if (same(g_name, g_before)) return;
-	g_serial++;
-	WritePrivateProfileStringA("multiplayer", "name", g_name, ini_path());
-	log_msg("names: this PC's player is now %s (saved in Arklite.ini)", g_name);
+	if (keep) mp_name_change(g_edit);
 }
 
 const char *mp_name_edit_text(void) { return g_editing ? g_edit : g_name; }

@@ -178,6 +178,7 @@ void net_install(void);        /* ARKLITE_HOST / ARKLITE_JOIN: two PCs in lockst
 void net_exit(void);
 void net_main_menu(void);      /* the main menu opened: the network game this PC was in is over */
 int  net_active(void);
+int  net_synced(void);   /* in a session every PC runs the same (warm-up or match): multiplayer rules, players or not */
 /* Custom Game picks what the next level is: alone, hosting, or joining */
 #define NET_DEFAULT_PORT    27777
 #define NET_SERVER_NAME_MAX 48
@@ -219,6 +220,8 @@ typedef struct {
 	int local_char;            /* players_char() of this PC's character (a joiner's lobby: 1) */
 	int joiner;                /* this PC joined (else it hosts) */
 	int ready, connected;      /* this PC pressed F3; the host is / is heard */
+	int warmup;                /* the synced session is the warm-up, not the match */
+	int match_on;              /* lobby: a match is on without this PC, it plays from the next one */
 	u32 players, ready_count, needed;
 	int countdown_ms;          /* -1: none */
 	u32 problem;               /* NETBAD_*: what keeps the joiner out (joiner: of the host's game; host: a joiner) */
@@ -234,6 +237,8 @@ typedef struct {
 	int over_ready;            /* this PC's player pressed fire */
 	u32 over_players, over_ready_count;
 	int over_left_ms;          /* until everyone goes back to the lobby anyway */
+	int joining;               /* joiner: 1 catching up with the session in progress, 2 in sync, not in the game yet */
+	int joining_pct;           /* joining 1: how far (0..100) */
 } NetHud;
 /* What differs between the two PCs, so the host doesn't let the joiner in */
 enum {
@@ -242,6 +247,7 @@ enum {
 };
 #define NETBAD_LAST NETBAD_FULL
 void net_hud(NetHud *h);
+int  net_watching(void);         /* this PC's player watches: the player it shows, -2 free flight; -1 not watching */
 u8  *net_swapped_konoko(void);   /* Konoko while the joiner's display runs with player 2 in gs+0xac, else 0 */
 const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
 
@@ -312,6 +318,8 @@ void mp_board_goal(char *out, u32 minutes, int score);   /* that goal, one sente
 void mp_hud_install(void);     /* lobby text ("Press F3 to be ready"), countdown and score on screen */
 enum { MP_LEFT, MP_CENTER, MP_RIGHT };
 void mp_hud_text(const char *s, int x, int y, int align, u32 color);   /* only while the HUD draws */
+void mp_hud_text_plain(const char *s, int x, int y, int align, u32 color);   /* not bold */
+u32  mp_hud_style(u32 style);   /* the HUD text style from here on (0 plain, the HUD's bold); returns the one before */
 int  mp_hud_line_height(void);
 int  mp_hud_text_width(const char *s, int n);   /* the first n characters (n < 0: all), trailing spaces included */
 
@@ -323,6 +331,8 @@ const char *mp_name(int who);  /* 0: Konoko (the host), 1..: the other players *
 const char *mp_name_local(void);          /* this PC's player's */
 u32  mp_name_serial(void);                /* changes with this PC's name */
 void mp_name_set(int who, const char *name);   /* net.c: another PC's player's ("" unknown) */
+int  mp_name_change(const char *name);    /* this PC's player's new name: saved and announced; 0 unchanged */
+void net_name_changed(const char *before, const char *after);   /* net.c: "Before is now known as After" */
 int  mp_name_editing(void);               /* typed in the F2 menu */
 void mp_name_edit_begin(void);
 void mp_name_edit_end(int keep);          /* keep: saved in Arklite.ini */
@@ -336,6 +346,7 @@ void mp_names_say(int who, const char *text);   /* chat.c: a message over that p
 #define CHAT_MAX 128                  /* characters + 1 */
 void mp_sound(const char *impulse);   /* a level 0 impulse by name, no position; outside a tick */
 void chat_install(void);              /* Arklite.ini [chat] */
+void menu_wheel_install(void);        /* menu_wheel.c: the mouse wheel in Oni's menus */
 void chat_frame(void);                /* every frame, after the update */
 void chat_draw(int width, int height);   /* from the HUD */
 int  chat_blocking(void);             /* open (or Enter/Esc that closed it still down): the game gets the mouse but no keyboard */
@@ -343,6 +354,8 @@ void chat_receive(int who, const char *text);   /* net.c: player who (another PC
 void chat_server(const char *text);   /* net.c: a server line ("Name entered the game") */
 int  chat_wrap(const char *s, int width, int *starts, int max);   /* line starts of s wrapped to width (HUD text); returns the count */
 int  net_chat_send(const char *text); /* net.c: to the other PCs; 0 if there's nobody */
+int  net_chat_whisper(int to, const char *text);   /* net.c: to player to only (through the host); 0 if it can't go */
+void chat_whisper_receive(int who, const char *text);   /* net.c: player who whispered it to this PC's player */
 int  chat_muted(int who);             /* the F1 scoreboard muted that player's messages */
 void chat_set_muted(int who, int on);
 
@@ -350,9 +363,39 @@ void chat_set_muted(int who, int on);
 
 /* Word 11 of an action record (never read by the tick): PLAYERS_CHOICE_TAG | (ONCC instance
  * number + 1) is the class that record's player comes back as, the tag alone the map's class */
-#define PLAYERS_CHOICE_TAG 0x7fac0000u
-#define PLAYERS_CHOICE_MASK 0xffff0000u
+#define PLAYERS_CHOICE_TAG 0x7fa00000u
+#define PLAYERS_CHOICE_MASK 0xffe00000u
+/* In the host's (Konoko's) word 11 of a network game: PLAYERS_PRESENT_FLAG | the players who
+ * have a character, a bit per player at PLAYERS_PRESENT_SHIFT (players.c adds and removes them in
+ * that tick; net.c sets it, see "Joining a game in progress") */
+#define PLAYERS_PRESENT_FLAG 0x00100000u
+#define PLAYERS_PRESENT_SHIFT 16
+/* Bits 12-15 of anyone's word 11: an emote for that tick (PLAYERS_EMOTE_*, players.c); bit 11:
+ * that player watches (/spectate, a state in every record, not a request); so the class number
+ * is the low 11 bits */
+#define PLAYERS_CLASS_MASK  0x000007ffu
+#define PLAYERS_SPECTATE_FLAG 0x00000800u
+#define PLAYERS_EMOTE_MASK  0x0000f000u
+#define PLAYERS_EMOTE_SHIFT 12
+enum { PLAYERS_EMOTE_TAUNT = 1, PLAYERS_EMOTE_TAUNT2, PLAYERS_EMOTE_SNEEZE, PLAYERS_EMOTE_IDLE /* .. +n-1: idle n */ };
+#define PLAYERS_EMOTE_IDLES 3
+void *players_emote_anim(u8 *c, int emote);   /* the animation it plays on that character, or 0 */
+void players_emote_request(int emote);        /* chat.c: this PC's player, at its next record */
+u32  players_emote_take(void);                /* net.c: the request's word 11 bits (once) */
+/* Spectating (/spectate, /join): this PC's wish rides in every record (players_spectate_word);
+ * every PC applies it in the same tick (players.c "Spectating") */
+void players_spectate_want(int on);           /* chat.c: this PC's player watches (1) or plays (0) */
+int  players_spectate_wanted(void);
+u32  players_spectate_word(void);             /* net.c make_input: PLAYERS_SPECTATE_FLAG or 0 */
+int  players_spectating(int who);             /* tick state: slot who watches */
+u32  players_spectators(void);                /* a bit per slot */
+int  players_hidden(u8 *c);                   /* not drawn: a watching host's parked Konoko */
 void char_menu_install(void);
+void char_menu_level0_changed(void);   /* class numbers changed: the roster is resolved again */
+void respawn_fx_level0_changed(void);  /* its base classes come from the new level 0 */
+void level0_swap_install(void);
+char *level0_swap_ref(char *ref);      /* the file to open for a level file table entry */
+int  level0_swap(const char *dir);     /* with no level loaded: level 0 from dir (level0_swap.c) */
 int  char_menu_open(void);     /* the F2 menu is up: this PC's player gets no input */
 void hud_textures_prepare(void);   /* net.c, before rollback starts: the HUD's textures made */
 u8  *hud_solid(u16 argb1555, const char *name);   /* an 8x8 texture of one color (kept until Oni exits) */
@@ -382,6 +425,7 @@ u32  players_respawn_ticks(void);             /* [multiplayer] respawn_delay, in
 void players_set_respawn_ticks(u32 ticks);    /* the network host's, on the joiner */
 void players_reset_scores(void);              /* and the class choices: the match starts */
 void players_tick_record(const u32 *record);  /* in the tick: Konoko's record (its choice word) */
+int  players_can_join(int who);               /* the map has a spawn placement for slot who */
 /* A network match's limits (net.c): on from the match's start (0 ticks / score 0: none); a
  * negative score limit is reached going down (suicides). Checked in ticks, so rollback corrects it. */
 void players_set_limits(int on, u32 ticks, int score);
@@ -389,12 +433,33 @@ u32  players_over_tick(void);                 /* tick + 1 in which a limit was r
 int  players_time_left(void);                 /* ticks, -1: no time limit */
 int  players_winner(u32 mask);                /* the best of mask's players (a bit per slot), -1 for a draw */
 int  players_ranking(u32 mask, int *out);     /* mask's players, best first; returns how many */
+int  players_killcam(u8 *c);                  /* c fell to the level's kill camera: this PC's camera stays */
 int  multiplayer_active(void);                /* a player 2 is in the game: no pausing, no auto-aim */
 int  multiplayer_map(void);                   /* two or more Player-flagged characters (spawn points) */
+
+/* ---- obituary.c -------------------------------------------------------------------------- */
+
+/* How a death was caused: the kill feed's icon (OBIT_SKULL 0, so a zeroed cause is a skull) */
+enum { OBIT_SKULL, OBIT_MELEE, OBIT_SUPER, OBIT_BLAST, OBIT_FALL, OBIT_WEAPON };
+void obituary_install(void);   /* the kill feed; super moves told apart from other melee hits */
+int  obit_hit_cause(u8 *attacker, u32 owner, u8 **weapon);   /* in TakeDamage: OBIT_*, *weapon its ONWC */
+u8  *obit_weapon_class(u8 *c);                 /* the ONWC of the weapon c holds, or 0 */
+void obit_add(int killer, int victim, int kind, u8 *weapon);   /* in a tick; killer -1: nobody */
+void obit_reset(void);
+void obit_textures_prepare(void);              /* hud_textures_prepare: before rollback starts */
+void obit_draw(int x, int y, int local);       /* from the HUD: lines from y down, right edge x */
 
 /* ---- mp_rules.c -------------------------------------------------------------------------- */
 
 void mp_rules_install(void);   /* multiplayer maps: free for all, damage x1.25, overhealing drains 1.25x faster */
+void mp_rules_level(void);     /* a level's characters are about to be made: Ninjabot's weapon hand */
+
+/* ---- regen.c ----------------------------------------------------------------------------- */
+
+void regen_install(void);      /* players' Barabas regeneration: crouch, let go of crouch, Action */
+/* A player's tick input on its way into the character (players.c): in itself, or copy (12 words)
+ * changed while the character regenerates */
+u32 *regen_input(u8 *chr, u32 *in, u32 *copy);
 
 /* ---- items.c ----------------------------------------------------------------------------- */
 
@@ -421,7 +486,9 @@ u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u
 /* ---- vertex_light.c ---------------------------------------------------------------------- */
 
 void bench_frame(void);           /* every frame: ARKLITE_BENCH timing (bench.c) */
+void vertex_light_level_end(void);   /* from any level unload */
 void vertex_light_frame(void);   /* every frame: animated corners of a custom level (vertexlight.bin) */
+void spin_particle_frame(void);  /* every frame: particles in a custom level's spinning groups (spin_particle.c) */
 
 /* ---- crash_log.c -------------------------------------------------------------------------- */
 

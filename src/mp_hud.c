@@ -144,6 +144,40 @@ static void corner_end(void *ctx, u32 size) { TSrContext_SetSize(ctx, size); }
 void mp_hud_text(const char *s, int x, int y, int align, u32 color) { text(s, x, y, align, color); }
 int  mp_hud_line_height(void) { return g_line_height; }
 
+/* The same in the plain style (the HUD's context is bold): the context's style (+0x14, 0 plain)
+ * and its size again, which picks the font for it (0x42ed50); both put back after */
+void mp_hud_text_plain(const char *s, int x, int y, int align, u32 color)
+{
+	void *ctx = ONgTextContext;
+	u32 *style = ctx ? (u32 *)((u8 *)ctx + 0x14) : 0, was;
+
+	if (!ctx) return;
+	was = *style;
+	*style = 0;
+	if (TSrContext_SetSize(ctx, CONTEXT_SIZE(ctx)) == 0) text(s, x, y, align, color);
+	*style = was;
+	TSrContext_SetSize(ctx, CONTEXT_SIZE(ctx));
+}
+
+/* chat.c: the context's style from here on (0 plain; the HUD's is bold), its font picked again
+ * for its size (0x42ed50); returns the style before. A style the size has no font for is put
+ * back. */
+u32 mp_hud_style(u32 style)
+{
+	void *ctx = ONgTextContext;
+	u32 *at = ctx ? (u32 *)((u8 *)ctx + 0x14) : 0, was;
+
+	if (!ctx) return 0;
+	was = *at;
+	if (was == style) return was;
+	*at = style;
+	if (TSrContext_SetSize(ctx, CONTEXT_SIZE(ctx)) != 0) {
+		*at = was;
+		TSrContext_SetSize(ctx, CONTEXT_SIZE(ctx));
+	}
+	return was;
+}
+
 /* The width text() gives the first n characters of s (n < 0: all). Measured with a '|' after
  * them, less the '|' alone, so trailing spaces count (the caret goes after them). */
 int mp_hud_text_width(const char *s, int n)
@@ -163,33 +197,43 @@ int mp_hud_text_width(const char *s, int n)
 	return ((rect[2] - rect[0]) - (bar[2] - bar[0])) * (g_fine_height ? 1 : TEXT_SCALE);
 }
 
-static void draw_lobby(const NetHud *h, int width, int height)
+/* The lines in the middle of the screen go one under another from height / 5: each of these
+ * draws at y and returns the y under it */
+#define LINE_GAP 4
+
+static int draw_lobby(const NetHud *h, int width, int y)
 {
 	char line[128];
-	int x = width / 2, y = height / 5;
+	int x = width / 2;
 
-	text(h->ready ? "Press F3 to be unready" : "Press F3 to be ready", x, y, CENTER, h->ready ? GREEN : RED);
+	if (players_spectate_wanted() && h->state != NETHUD_LOBBY)   /* spectators don't ready up (net.c ready_frame) */
+		text("Watching: /join to play", x, y, CENTER, WHITE);
+	else
+		text(h->ready ? "Press F3 to be unready" : "Press F3 to be ready", x, y, CENTER, h->ready ? GREEN : RED);
 	y += g_line_height + 4;
-	if (h->countdown_ms >= 0)
+	if (h->match_on)
+		fmt(line, "A match is on: you play when it ends");
+	else if (h->countdown_ms >= 0)
 		fmt(line, "The match starts in %d", (h->countdown_ms + 999) / 1000);
 	else if (!h->connected)
 		fmt(line, h->joiner ? "Connecting to the host..." : "Waiting for players to join");
 	else if (h->players < 2)
 		fmt(line, "Waiting for players to join");
 	else
-		fmt(line, "%d of %d players ready (%d needed)", h->ready_count, h->players, h->needed);
+		fmt(line, "Warm-up: %d of %d players ready (%d needed)", h->ready_count, h->players, h->needed);
 	text(line, x, y, CENTER, WHITE);
+	return y + g_line_height + LINE_GAP;
 }
 
 /* What keeps a joiner out, under the lobby text */
-static void draw_problem(const NetHud *h, int width, int height)
+static int draw_problem(const NetHud *h, int width, int y)
 {
-	int x = width / 2, y = height / 5 + 2 * (g_line_height + 4), joiner = h->joiner;
+	int x = width / 2, joiner = h->joiner;
 
-	if (!h->problem) return;
+	if (!h->problem) return y;
 	if (h->problem == NETBAD_FULL) {
 		text(joiner ? "Can't join: the server is full" : "A player can't join: the server is full", x, y, CENTER, RED);
-		return;
+		return y + g_line_height + LINE_GAP;
 	}
 	text(joiner ? "Can't join: not the same on both PCs:" : "A player can't join: not the same on both PCs:",
 	     x, y, CENTER, RED);
@@ -205,6 +249,7 @@ static void draw_problem(const NetHud *h, int width, int height)
 		fmt(line, "Copy it from one PC to the other (see %s)", log_path());
 		text(line, x, y, CENTER, WHITE);
 	}
+	return y + g_line_height + LINE_GAP;
 }
 
 /* The players listed: a network game's, or the ones on this PC */
@@ -217,6 +262,7 @@ static u32 players_shown(const NetHud *h)
 	return mask;
 }
 
+/* The score's lines, then the kill feed (obituary.c) under them */
 static void draw_score(const NetHud *h, int local, int width)
 {
 	char line[64];
@@ -225,7 +271,8 @@ static void draw_score(const NetHud *h, int local, int width)
 	if (show_fps()) y += g_line_height + 2;
 	for (int who = 0; who < PLAYERS_MAX; who++) {
 		if (!(players_shown(h) >> who & 1)) continue;
-		fmt(line, local == who ? "%s (you)   %d" : "%s   %d", mp_name(who), players_score(who));
+		if (players_spectating(who)) fmt(line, local == who ? "%s (you, watching)" : "%s (watching)", mp_name(who));
+		else fmt(line, local == who ? "%s (you)   %d" : "%s   %d", mp_name(who), players_score(who));
 		text(line, x, y, RIGHT, local == who ? YELLOW : WHITE);
 		y += g_line_height + 2;
 	}
@@ -233,7 +280,9 @@ static void draw_score(const NetHud *h, int local, int width)
 		left = (left + 59) / 60;
 		fmt(line, "%d:%02d", left / 60, left % 60);
 		text(line, x, y, RIGHT, left <= 30 ? RED : WHITE);
+		y += g_line_height + 2;
 	}
+	obit_draw(x, y + g_line_height / 2, local);
 }
 
 /* The match is over: the result until everyone pressed fire (net.c) */
@@ -267,36 +316,31 @@ static void draw_over(const NetHud *h, int width, int height)
 }
 
 /* Another PC went quiet or is gone */
-static void draw_connection(const NetHud *h, int width, int height)
+static void draw_connection(const NetHud *h, int width, int y)
 {
 	char line[96];
-	int x = width / 2, y = height / 5;
+	int x = width / 2;
 
 	if (h->lost) {   /* a joiner without the host: nobody else moves */
 		fmt(line, h->lost == 2 ? "%s left the game" : "Connection lost: %s stopped answering", mp_name(0));
 		text(line, x, y, CENTER, RED);
-		text("The other players stand still. Esc opens the menu to quit.", x, y + g_line_height + 4, CENTER, WHITE);
+		text("The other players stand still. Esc opens the menu to quit.", x, y + g_line_height + LINE_GAP, CENTER, WHITE);
 		return;
 	}
 	if (h->silent_ms) {
 		fmt(line, "Waiting for %s... (%d s)", mp_name(h->silent_who), (h->silent_ms + 999) / 1000);
 		text(line, x, y, CENTER, YELLOW);
-		y += g_line_height + 4;
+		y += g_line_height + LINE_GAP;
 	}
-	for (int who = 0; who < PLAYERS_MAX; who++) {
-		if (!(h->gone >> who & 1)) continue;
-		fmt(line, h->left >> who & 1 ? "%s left the game: their player stands still" :
-		    "%s stopped answering: their player stands still", mp_name(who));
-		text(line, x, y, CENTER, RED);
-		y += g_line_height + 2;
-	}
+	/* (players who left or stopped answering: the chat's server line says so once; no lasting
+	 * line here) */
 }
 
 static void ONI_FC timer_display(void *timer)
 {
 	NetHud h;
 	void *ctx = ONgTextContext;
-	int width, height;
+	int width, height, y;
 	u32 color, size;
 
 	hud_timer_display(timer);   /* Oni's timer, scaled with the HUD */
@@ -308,12 +352,34 @@ static void ONI_FC timer_display(void *timer)
 	height = M3rScreen_Height();
 	color = *(u32 *)((u8 *)ctx + 0xc);   /* the timer's color, put back after */
 	size = corner_begin(ctx);
+	y = height / 5;
 
-	if (h.state == NETHUD_LOBBY) draw_lobby(&h, width, height);
-	else if (h.state == NETHUD_STARTING) text("Starting the match...", width / 2, height / 5, CENTER, WHITE);
-	else draw_score(&h, h.state == NETHUD_MATCH ? h.local_player : -1, width);
-	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) draw_problem(&h, width, height);
+	/* first, so the screen's messages (warm-up, joining, connection) go over the names */
 	if (h.state != NETHUD_LOBBY && h.state != NETHUD_STARTING) mp_names_draw(width, height);
+	if (h.state == NETHUD_LOBBY) y = draw_lobby(&h, width, y);
+	else if (h.state == NETHUD_STARTING && h.joining) {
+		char line[80];
+		fmt(line, "Joining the %s: catching up (%d%%)", h.warmup ? "warm-up" : "match", h.joining_pct);
+		text(line, width / 2, y, CENTER, WHITE);
+		y += g_line_height + LINE_GAP;
+	} else if (h.state == NETHUD_STARTING) {
+		text(h.warmup ? "Starting the warm-up..." : "Starting the match...", width / 2, y, CENTER, WHITE);
+		y += g_line_height + LINE_GAP;
+	} else draw_score(&h, h.state == NETHUD_MATCH ? h.local_player : -1, width);
+	if (h.state == NETHUD_MATCH && h.warmup) y = draw_lobby(&h, width, y);
+	if (h.state == NETHUD_MATCH && h.joining == 2) {   /* in sync, its player comes in a moment later */
+		text("Joining the game...", width / 2, y, CENTER, WHITE);
+		y += g_line_height + LINE_GAP;
+	}
+	if (h.state == NETHUD_MATCH && !h.over && net_watching() != -1) {   /* /spectate */
+		char line[96];
+		int w = net_watching();
+		if (w >= 0) fmt(line, "Watching %s (click: next player, /join: play)", mp_name(w));
+		else fmt(line, "Free flight (click: watch a player, /join: play)");
+		text(line, width / 2, y, CENTER, WHITE);
+		y += g_line_height + LINE_GAP;
+	}
+	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING || h.warmup) y = draw_problem(&h, width, y);
 	chat_draw(width, height);
 	if (h.desynced) {
 		char line[MAX_PATH + 48];
@@ -321,7 +387,7 @@ static void ONI_FC timer_display(void *timer)
 		text(line, width / 2, 24, CENTER, RED);
 	}
 	if (h.state == NETHUD_MATCH && h.over) draw_over(&h, width, height);
-	else if (h.state == NETHUD_MATCH) draw_connection(&h, width, height);
+	else if (h.state == NETHUD_MATCH) draw_connection(&h, width, y);   /* under the warm-up's lines */
 	char_menu_draw(width, height);
 
 	corner_end(ctx, size);

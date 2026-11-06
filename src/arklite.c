@@ -40,11 +40,14 @@
  *   - Live pause menu (live_menu.c): in multiplayer games the game keeps running behind it.
  *   - Spawn points and respawning (players.c), item respawn (items.c): multiplayer maps.
  *   - Damage x1.25 and faster overhealing drain (mp_rules.c): multiplayer maps.
+ *   - Crouched weapons aim as low as the body bends, Ninjabot aims its weapons (mp_rules.c):
+ *     multiplayer maps.
  *   - Input record and replay (lockstep.c): the determinism test for multiplayer.
  *   - Two PCs over UDP (net.c): multiplayer step 3, lockstep with input delay; a lobby where F3
  *     readies up, a 7 s countdown, then the match. On-screen text and score (mp_hud.c).
  *   - Flickering and pulsing vertex lights in custom levels (vertex_light.c): Catwalk's
  *     vertexlight.bin, applied to the level's quad colors every frame.
+ *   - Particles that turn with Catwalk's spinning groups (spin_particle.c): spinparticles.bin.
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
 #include "arklite.h"
@@ -161,6 +164,9 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	players_install();
 	items_install();
 	mp_rules_install();
+	obituary_install();
+	regen_install();
+	level0_swap_install();
 	net_install();
 	mp_hud_install();
 	lockstep_install();
@@ -170,5 +176,6 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	mp_names_install();
 	chat_install();
 	mp_board_install();
+	menu_wheel_install();
 	return 1;
 }

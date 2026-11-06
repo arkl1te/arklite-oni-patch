@@ -58,9 +58,10 @@
  *   - view: orthographic, from the front-left and above (Catwalk's previews), fitted to the
  *     picture. Oni is Y up; the front is where the toes point.
  * Pictures and the menu's plain rectangles are ARGB1555 textures made with M3rTextureMap_New
- * (0x41eb00: CX, DX the size, [pixel type], [3: in the first dynamic instance file, kept until
- * the game exits], [flags], [name], [texture out]; it rounds the size up to powers of two) at
- * 8x8, then pointed at texels Arklite allocates (see texture_new),
+ * (0x41eb00: CX, DX the size, [pixel type], [where: bit 0 makes a new instance, bit 1 puts it in
+ * the file a level load empties (0x5711a0, 1 MB), without it in the one kept until the game exits
+ * (0x5711a4, 2 MB), both 256 instances], [flags], [name], [texture out]; it rounds the size up to
+ * powers of two) at 8x8, then pointed at texels Arklite allocates (see texture_new),
  * drawn with M3rDraw_Bitmap (0x41f4a0: ECX texture, EDX top-left {x, y, z, 1/w}, [width],
  * [height], [shade], [alpha]; texels 1:1). ARGB1555 because the GL upload converts it (the
  * converter table at 0x535a90 has no ARGB8888 to RGBA bytes). */
@@ -445,7 +446,9 @@ static void roster_resolve(void)
 static u8 *texture_make(const char *name)
 {
 	u8 *t = 0;
-	if (M3rTextureMap_New(8, 8, PIXEL_ARGB1555, 3, 0, name, &t) || !t || !TXMP_TEXELS(t)) {
+	/* 1: the file that outlives levels. With 3 a level load (0x4217d0) emptied the file, so the
+	 * next picture made got the panel's slot, and the menu's background tiled a character. */
+	if (M3rTextureMap_New(8, 8, PIXEL_ARGB1555, 1, 0, name, &t) || !t || !TXMP_TEXELS(t)) {
 		log_msg("char menu: can't make texture %s", name);
 		return 0;
 	}
@@ -975,8 +978,10 @@ void hud_textures_prepare(void)
 
 	if (done) return;
 	done = 1;
+	obit_textures_prepare();   /* the kill feed's icons */
 	if (!g_resolved) roster_resolve();
-	for (int i = 0; i < g_count; i++) want += g_roster[i].nvar;
+	for (int i = 0; i < g_count; i++)
+		for (int v = 0; v < g_roster[i].nvar; v++) want += !g_roster[i].vtex[v];   /* the rest are made */
 	while (g_npool < want && g_npool < (int)(sizeof g_pool / sizeof g_pool[0])) {
 		char name[32];
 		fmt(name, "arklite_hud_%d", g_npool);
@@ -1079,6 +1084,13 @@ void char_menu_draw(int width, int height)
 		float at[4] = { (float)(g_mx - 16), (float)(g_my - 16), 0.5f, 2.0f };
 		if (cursor && *(void **)(cursor + 4)) PSrPartSpec_Draw(*(void **)(cursor + 4), PS_MIDDLE_MIDDLE, at, 32, 32, 255);
 	}
+}
+
+void char_menu_level0_changed(void)
+{
+	roster_load();
+	g_resolved = 0;
+	g_any_vars = 0;
 }
 
 void char_menu_install(void)

@@ -334,7 +334,10 @@ static void textures_only(char *ref, void *file)
  * number's file index. Rewrite them to the slot's index before the engine resolves them. */
 static u16 ONI_FC open_level_file_hook(char *ref, void **out)
 {
-	u16 error = TMrLevel_OpenFile(ref, out);
+	u16 error;
+
+	ref = level0_swap_ref(ref);
+	error = TMrLevel_OpenFile(ref, out);
 
 	if (g_slot < 0) return error;
 	for (u32 i = 0; i < TMgLevelFileCount; i++) {

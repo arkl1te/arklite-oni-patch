@@ -27,7 +27,8 @@
  * Scoreboard: on top, the time left (in the lobby the time limit) and the score limit on one
  * row; then Player (the host marked), Score, Ping (each player's last round trip to the host,
  * match only; on a joiner the host's row has its own) and a Mute box (chat.c) for every other
- * player of a network game, players who left in blue; under them the result once the match is
+ * player of a network game, players who left in blue; under them, when anyone watches
+ * (/spectate), a Spectator list with Ping and Chat (no score); then the result once the match is
  * over. This PC's player in white, the others orange. */
 #include "arklite.h"
 
@@ -158,7 +159,7 @@ static void draw_limits(const NetHud *h)
 		text_at("No score or time limit on one PC.", 0, 0, UI_LEFT, UI_ORANGE, AREA_W);
 		return;
 	}
-	if (h->state == NETHUD_LOBBY || h->state == NETHUD_STARTING) {
+	if (h->state == NETHUD_LOBBY || h->state == NETHUD_STARTING || h->warmup) {
 		if (!h->time_limit) str_cpy(line, sizeof line, "Time limit: none");
 		else fmt(line, "Time limit: %d min", h->time_limit);
 	} else if ((left = players_time_left()) < 0) {
@@ -173,55 +174,88 @@ static void draw_limits(const NetHud *h)
 	text_at(line, AREA_W, 0, UI_RIGHT, UI_ORANGE, AREA_W - (w < AREA_W / 2 ? w : AREA_W / 2) - 12);
 }
 
+/* One row of a list at y: name (the host marked), the score (players only), ping and the Mute box */
+static void draw_row(const NetHud *h, int who, int y, int score)
+{
+	WMtWindow *box = g_mute[who];
+	u32 color = h->state != NETHUD_OFF && who == h->local_player ? WHITE : (h->gone >> who & 1) ? UI_BLUE : UI_ORANGE;
+	char line[32];
+
+	if (h->state != NETHUD_OFF && who == 0) {   /* the host plays player 1 */
+		static const char tag[] = "(host)";
+		char fit[64];
+		int tw = ui_text_width(tag);
+		ui_fit(fit, sizeof fit, mp_name(who), COL_SCORE - 60 - tw - 6);
+		text_at(fit, 0, y, UI_LEFT, color, COL_SCORE - 60);
+		text_at(tag, ui_text_width(fit) + 6, y, UI_LEFT, UI_BLUE, tw);
+	} else {
+		text_at(mp_name(who), 0, y, UI_LEFT, color, COL_SCORE - 60);
+	}
+	if (score) {
+		fmt(line, "%d", players_score(who));
+		text_at(line, COL_SCORE, y, UI_RIGHT, color, 60);
+	}
+	if (h->state == NETHUD_OFF) return;
+	if (who != h->local_player && h->ping_ms[who] >= 0) fmt(line, "%d", h->ping_ms[who]);
+	else str_cpy(line, sizeof line, "-");
+	text_at(line, COL_PING, y, UI_RIGHT, color, 45);
+	if (box && who != h->local_player) {
+		ui_set_frame(box, AREA_X + COL_MUTE, AREA_Y + y, MUTE_W, 20);
+		WMrCheckBox_SetCheck(box, chat_muted(who));
+	}
+}
+
+/* A list's column names at y: Player (Score, Ping, Chat) or Spectator (Ping, Chat) */
+static void draw_header(const NetHud *h, const char *title, int y, int score)
+{
+	text_at(title, 0, y, UI_LEFT, UI_BLUE, 150);
+	if (score) text_at("Score", COL_SCORE, y, UI_RIGHT, UI_BLUE, 60);
+	if (h->state != NETHUD_OFF) {
+		text_at("Ping", COL_PING, y, UI_RIGHT, UI_BLUE, 45);
+		text_at("Chat", COL_MUTE, y, UI_LEFT, UI_BLUE, AREA_W - COL_MUTE);
+	}
+}
+
 static void draw_board(void)
 {
 	NetHud h;
 	char line[96];
-	int row = 0, y;
+	int row = 0, y, nspect = 0;
+	u32 shown = 0;
 
 	net_hud(&h);
 	draw_limits(&h);
-	text_at("Player", 0, HEADER_Y, UI_LEFT, UI_BLUE, 150);
-	text_at("Score", COL_SCORE, HEADER_Y, UI_RIGHT, UI_BLUE, 60);
-	if (h.state != NETHUD_OFF) {
-		text_at("Ping", COL_PING, HEADER_Y, UI_RIGHT, UI_BLUE, 45);
-		text_at("Chat", COL_MUTE, HEADER_Y, UI_LEFT, UI_BLUE, AREA_W - COL_MUTE);
-	}
+	/* players, then (when anyone watches: /spectate) the spectators in a list of their own */
+	draw_header(&h, "Player", HEADER_Y, 1);
 	for (int who = 0; who < PLAYERS_MAX; who++) {
-		WMtWindow *box = g_mute[who];
-		int show = 0;
-		if (listed(&h, who)) {
-			u32 color = h.state != NETHUD_OFF && who == h.local_player ? WHITE : (h.gone >> who & 1) ? UI_BLUE : UI_ORANGE;
-			y = ROWS_Y + row * ROW_H;
-			if (h.state != NETHUD_OFF && who == 0) {   /* the host plays player 1 */
-				static const char tag[] = "(host)";
-				char fit[64];
-				int tw = ui_text_width(tag);
-				ui_fit(fit, sizeof fit, mp_name(who), COL_SCORE - 60 - tw - 6);
-				text_at(fit, 0, y, UI_LEFT, color, COL_SCORE - 60);
-				text_at(tag, ui_text_width(fit) + 6, y, UI_LEFT, UI_BLUE, tw);
-			} else {
-				text_at(mp_name(who), 0, y, UI_LEFT, color, COL_SCORE - 60);
-			}
-			fmt(line, "%d", players_score(who));
-			text_at(line, COL_SCORE, y, UI_RIGHT, color, 60);
-			if (h.state != NETHUD_OFF) {
-				if (who != h.local_player && h.ping_ms[who] >= 0) fmt(line, "%d", h.ping_ms[who]);
-				else str_cpy(line, sizeof line, "-");
-				text_at(line, COL_PING, y, UI_RIGHT, color, 45);
-				if (box && who != h.local_player) {
-					show = 1;
-					ui_set_frame(box, AREA_X + COL_MUTE, AREA_Y + y, MUTE_W, 20);
-					WMrCheckBox_SetCheck(box, chat_muted(who));
-				}
-			}
-			row++;
+		if (!listed(&h, who)) continue;
+		if (players_spectating(who)) {
+			nspect++;
+			continue;
 		}
+		draw_row(&h, who, ROWS_Y + row++ * ROW_H, 1);
+		shown |= 1u << who;
+	}
+	y = ROWS_Y + (row > 1 ? row : 1) * ROW_H + 10;
+	if (nspect) {
+		draw_header(&h, "Spectator", y, 0);
+		y += ROWS_Y - HEADER_Y;
+		for (int who = 0; who < PLAYERS_MAX; who++) {
+			if (!listed(&h, who) || !players_spectating(who)) continue;
+			draw_row(&h, who, y, 0);
+			y += ROW_H;
+			shown |= 1u << who;
+		}
+		row = (y - ROWS_Y) / ROW_H;
+	}
+	for (int who = 0; who < PLAYERS_MAX; who++) {   /* Mute boxes only on listed rows, not this PC's */
+		WMtWindow *box = g_mute[who];
+		int show = h.state != NETHUD_OFF && (shown >> who & 1) && who != h.local_player;
 		if (box && (WIN_VISIBLE(box) != 0) != show) WMrWindow_SetVisible(box, show);
 	}
 
 	y = ROWS_Y + (row > 2 ? row : 2) * ROW_H + 14;
-	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING) {
+	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING || h.warmup) {
 		text_wrapped("Warm-up: the match starts when enough players are ready (F3).", y, WHITE, 1);
 		return;
 	}

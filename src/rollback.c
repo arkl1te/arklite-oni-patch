@@ -419,6 +419,7 @@ typedef struct {
 	u32 grow, grown, grow_logs;    /* rb_grow: Oni took memory the snapshots don't cover; pages added; logged */
 	u32 freed, freed_logs;         /* rb_forget: pages of allocations Oni gave back */
 	u32 reused, heap_pages, heap_logs, heap_walked;   /* rb_check_allocs, rb_heaps_guard */
+	u32 seg_kept;                  /* rb_restore_page: Wine heap segment links a restore would have rewound */
 	u32 dropped[RB_MAX_DROPPED], ndropped;            /* rb_heaps_guard's pages, for rollback checks */
 	u8 *vpages, *vdropped;         /* rollback checks: known pages and dropped pages after the first re-run */
 	u32 vn, vnd, vchecks, vbad, vlogs;
@@ -709,7 +710,7 @@ static void rb_start(void)
 	e->nnotes = e->notes_logged = 0;
 	e->amb_stopped = e->acm_hits = e->acm_logs = 0;
 	e->grow = e->grown = e->grow_logs = e->plist_logs = e->plist_cuts = e->freed = e->freed_logs = 0;
-	e->reused = e->heap_pages = e->heap_logs = e->heap_walked = e->ndropped = 0;
+	e->reused = e->heap_pages = e->heap_logs = e->heap_walked = e->ndropped = e->seg_kept = 0;
 	e->vchecks = e->vbad = e->vlogs = 0;
 	e->main_tid = GetCurrentThreadId();
 	if (!e->main_thread) e->main_thread = OpenThread(0x1fffff /* THREAD_ALL_ACCESS */, 0, e->main_tid);
@@ -801,6 +802,18 @@ void rollback_keep(const void *p, u32 n)
 	}
 }
 
+/* Under Wine a segment of a heap starts on a 64 KB boundary with 0x20 bytes of its own bookkeeping:
+ * +0x0c {next, prev} in the heap's segment list, +0x14 the heap. Oni's runtime heap is game memory,
+ * so such a page gets rewound, but the list isn't the game's: when a tick emptied a segment, Wine
+ * unmapped it and wrote the neighbour's next, which made the neighbour's page known with the old
+ * link in its snapshot. Put back, that link pointed at unmapped memory, and the next walk of the
+ * heap (rb_find_oni, at the next match's first tick) faulted in ntdll. Windows keeps other words
+ * there, so this finds nothing on Windows. */
+static int rb_wine_segment(u32 a, const u32 *page)
+{
+	return !(a & 0xffff) && page[5] == (u32)ONgCrtHeap;
+}
+
 static void rb_keep_mask(u32 p)
 {
 	u32 a = p << PAGE_SHIFT;
@@ -832,6 +845,8 @@ static void rb_lock_mask(u32 p)
 		if (*(const u16 *)d != 0) continue;   /* debug record Type: RTL_CRITSECT_TYPE */
 		for (u32 n = k; n < k + 6 && n < 1024; n++) g_e->mask[n] = 1;   /* 24 bytes */
 	}
+	if (rb_wine_segment(p << PAGE_SHIFT, page))
+		for (u32 k = 0; k < 8; k++) g_e->mask[k] = 1;
 	rb_keep_mask(p);
 }
 
@@ -842,6 +857,9 @@ static void rb_restore_page(u32 i, const u8 *from)
 	u32 *page = (u32 *)a;
 	const u32 *src = (const u32 *)from;
 	rb_lock_mask(p);
+	if (rb_wine_segment(a, page) && (page[3] != src[3] || page[4] != src[4]) && e->seg_kept++ < 8)
+		log_msg("rollback: heap segment %08x's links kept in a restore: next %08x prev %08x, the snapshot had %08x %08x",
+		        a, page[3], page[4], src[3], src[4]);
 	if (e->flag[p] & PF_SHARED) {   /* only what ticks alone wrote */
 		const u8 *m = e->omask + i * 128, *t = e->tmask + i * 128;
 		for (u32 k = 0; k < 1024; k++)

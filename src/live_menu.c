@@ -34,9 +34,11 @@
  *     live, set up as 0x504c40 does it (the psui_oniUI part set, game input off). Its param
  *     points at {TxtC, page 0} on that function's stack, so the request keeps a copy. In a
  *     network match it opens only on the PC whose player used the console: Oni fires a console's
- *     events (and two other object types') through 0x4f3cc0 with the character that did it in edx,
- *     and its script's text_console runs inside that call. A page asked for outside such a call
- *     (a script that sleeps first, or one no character started) still opens on both PCs;
+ *     events (and two other object types') through 0x4f3cc0 with the character that did it in edx.
+ *     An "Execute Script" event only queues the script with that character's name; the queue runs
+ *     later in the tick (0x4f2120), so each queued script is run with the character its name
+ *     belongs to. A page asked for outside such a call (a script that sleeps first, or one no
+ *     player started) still opens on both PCs;
  *   - the game's own pause flag (gs+0x1679ac, read by the main loop through 0x4fc960) is
  *     cleared every frame;
  *   - the help screen doesn't turn the sound down: 0x5018c0 halves the master volume
@@ -76,6 +78,9 @@
 #define SSrSetPaused            ((void (ONI_FC *)(u32))0x514e60)
 #define ONcHelp_VolumeDownCall  0x501922
 static const u32 ONcEventList_FireCalls[] = { 0x4c0934, 0x4c28d6, 0x4cbb0a };   /* console used, and two other objects' events */
+#define ONrScript_RunDeferredOne 0x5100b0                  /* (ecx script, edx character name): runs it now */
+#define ONcDeferred_RunCall     0x4f21a4                   /* in 0x4f2120, the deferred-script runner */
+#define CHR_NAME                0x14                       /* char[32]: the name a deferred script gets */
 #define SSrSetMasterVolume      ((float (__stdcall *)(float))0x483e00)
 #define SSgMasterVolumeNow      (*(float *)0x5eb744)
 
@@ -205,6 +210,29 @@ static u16 ONI_FC fire_events(void *events, u8 *who)
 	return r;
 }
 
+/* A console's "Execute Script" event (0x4f3d40) doesn't run the script: it queues it with the
+ * character's name (0x4f2070: script, name, "eventlist"; up to 128 entries at 0x632540), and
+ * 0x4f2120 runs the queue later in the tick, one 0x5100b0 call per entry. Player characters'
+ * names are unique (players.c name_apart), so the name finds whose events these are */
+static u16 ONI_FC run_deferred(const char *script, const char *name)
+{
+	u8 *outer = g_event_char, *who = 0;
+	u16 r;
+
+	for (int s = 0; s < PLAYERS_MAX && name && !who; s++) {
+		u8 *c = players_char(s);
+		const char *n = c ? (const char *)c + CHR_NAME : 0;
+		int k = 0;
+		if (!n) continue;
+		while (k < 32 && n[k] == name[k] && n[k]) k++;
+		if (k == 32 || n[k] == name[k]) who = c;
+	}
+	g_event_char = who;
+	r = ((u16 (ONI_FC *)(const char *, const char *))ONrScript_RunDeferredOne)(script, name);
+	g_event_char = outer;
+	return r;
+}
+
 /* After the main loop's update: open a requested menu outside the tick */
 static void main_loop_sound(void)
 {
@@ -213,6 +241,7 @@ static void main_loop_sound(void)
 	char_menu_frame();
 	chat_frame();
 	vertex_light_frame();
+	spin_particle_frame();
 	bench_frame();
 	if (g_pending) {
 		g_pending = 0;
@@ -340,6 +369,8 @@ void live_menu_install(void)
 	for (u32 i = 0; i < sizeof ONcEventList_FireCalls / sizeof *ONcEventList_FireCalls; i++)
 		if (!patch_call(ONcEventList_FireCalls[i], ONrEventList_Fire, (u32)fire_events))
 			log_msg("live menu: event call at 0x%x changed, its text console pages show on both PCs", ONcEventList_FireCalls[i]);
+	if (!patch_call(ONcDeferred_RunCall, ONrScript_RunDeferredOne, (u32)run_deferred))
+		log_msg("live menu: deferred script call at 0x%x changed, console pages show on both PCs", ONcDeferred_RunCall);
 	if (!patch_call(ONcHelp_VolumeDownCall, (u32)SSrSetMasterVolume, (u32)help_volume_down))
 		log_msg("live menu: help screen code changed, it turns the sound down in multiplayer too");
 	log_msg("live menu: in multiplayer games the game keeps running behind the pause menu");

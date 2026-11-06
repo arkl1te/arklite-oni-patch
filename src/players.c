@@ -75,6 +75,18 @@
  * health is MP_HEALTH (100) for every player and class, set at each spawn; the in-place class
  * change (0x4d7c30) doesn't touch health, so it stays.
  *
+ * Kill camera (a level's cm_detach, as in Level 3's vat: the camera stays and the dead player drops
+ * out of view). Stock cm_detach is written for one player and a level reload: it leaves follow mode
+ * on the PC that runs it and nothing brings it back, and a tick's script runs on every PC, with
+ * chr_is_player true only for gs+0xac, Konoko, in every tick. So in a multiplayer game
+ * chr_is_player is true for every player, and cm_detach (0x4bbfd0) moves no camera: it marks the
+ * player chr_is_player was just asked about, which is why a level must ask first (stock has no
+ * better source: ONgCurrentlyActiveTrigger_Cause, 0x5ecbbc, is the last character the trigger loop
+ * looked at by the time the deferred scripts run). The
+ * mark is tick state, so every PC has it and a rollback takes it back. net.c's camera update asks
+ * players_killcam each time and leaves this PC's camera where it is while the character it shows
+ * is marked and dead. The respawn clears the mark, and the camera follows again from there.
+ *
  * Arklite.ini [players]: p2=0 turns it off, p2_pad (0..3), p2_aim_speed (8: aim per tick at
  * full right stick), p2_invert_y. [multiplayer] respawn_delay (1.5 seconds). The camera follows
  * Konoko. */
@@ -123,6 +135,8 @@ typedef unsigned long long u64;
 #define CHR_INUSE       0x8000
 #define CHR_NOINPUT     0x400000   /* the tick drops the player's record */
 #define CHR_TYPE(c)     (*(u32 *)((c) + 0x1e8))   /* 0 player, 2 AI */
+#define CHR_NAME_OFFSET 0x14                      /* char[32], what scripts find a character by */
+#define CHR_NAME_MAX    32
 #define CHR_HELD(c)     (*(u32 *)((c) + 0x162c))  /* no aiming while set */
 #define CHR_DEAD        0x1
 #define CHR_NOCORPSE    0x80000   /* the character update makes no corpse for it either */
@@ -176,6 +190,11 @@ static u8 *g_map_class[PL] TICK_STATE;            /* the ONCC each player was la
 static int g_hit_by[PL] TICK_STATE = { -1, -1, -1, -1 };
 static u32 g_hit_tick[PL] TICK_STATE;
 static u32 g_last_owner[PL] TICK_STATE;           /* last hit's owner handle that credited no one */
+/* The kill feed's icon (obituary.c, OBIT_*): of the hit g_hit_by credits, and of the last hit that
+ * credited no one (0, a skull: none); the weapon's ONWC for OBIT_WEAPON */
+static u8 g_hit_cause[PL] TICK_STATE, g_last_cause[PL] TICK_STATE;
+static u8 *g_hit_weapon[PL] TICK_STATE, *g_last_weapon[PL] TICK_STATE;
+static u8 *g_held[PL] TICK_STATE;                 /* the last weapon each player held */
 #define BLAST_CREDIT    300     /* 5 s: a death effect's blast (mad_bomber's goes off 3.5 s after) */
 #define BLAST_REACH     150.0f  /* from where the player died (mad_x01's radius is 75) */
 static u32 g_death_tick[PL] TICK_STATE;           /* tick + 1 of each player's last death, 0: none */
@@ -183,7 +202,13 @@ static float g_death_pos[PL][3] TICK_STATE;
 /* The network match's limits (net.c, the host's Host dialog): see "Score" below */
 static int g_limits_on, g_limit_score;
 static u32 g_limit_ticks, g_limit_start;
+static u8 g_killcam[PL] TICK_STATE;              /* the level's cm_detach marked this player's death */
+/* The players who have a character, as the network host's record says (see "Joining and
+ * leaving"); g_present_known: a record said it since the level loaded */
+static u32 g_present TICK_STATE;
+static int g_present_known TICK_STATE;
 static u32 g_over_tick TICK_STATE;               /* tick + 1 in which a limit was reached, 0: not yet */
+static u32 g_spect TICK_STATE;                   /* players watching (/spectate), a bit per slot */
 /* Attack buttons in the input state (record bits 29 punch, 30 kick; 38-40 fire1-3) */
 #define ATTACK_LO       0x60000000u
 #define ATTACK_HI       0x1c0u
@@ -226,6 +251,7 @@ static int find_unclaimed(void)
 int multiplayer_active(void)
 {
 	if (!g_enabled || !ONgGameState) return 0;
+	if (net_synced() && ONrLevel_GetCurrent()) return 1;   /* a network session, even with no one else in it yet */
 	for (int s = 1; s < PL; s++)
 		if (slot_valid(s)) return 1;
 	return 0;
@@ -293,12 +319,16 @@ static void new_level_check(void)
 			g_score[s] = 0;
 			g_hit_by[s] = -1;
 			g_class[s] = -1;
+			g_held[s] = 0;   /* weapon classes: a level 0 swap frees the old ones */
 		}
+		obit_reset();
 		g_level = level;
 	}
 	if (!level) return;
 	for (int s = 1; s < PL && s < (int)g_count; s++) {
 		if (slot_valid(s)) continue;
+		if (g_present_known && !(g_present >> s & 1)) continue;   /* left: no character (the tick decides) */
+		if (g_spect >> s & 1) continue;                            /* watching: no character */
 		if (g_pl[s] >= 0) memset(g_input[s], 0, sizeof g_input[s]);
 		g_pl[s] = find_unclaimed();
 		if (g_pl[s] >= 0) {
@@ -356,14 +386,160 @@ void players_replay_frame(const u32 *rec)
 	}
 }
 
+/* ---- Emotes (chat.c: /taunt, /taunt2, /sneeze, /idle) ------------------------------------- *
+ * A player's chat command asks for one animation (PLAYERS_EMOTE_*). The request rides in bits
+ * 12-15 of word 11 of that player's record for one tick (players_emote_take: net.c make_input and
+ * the lobby's frames), so every PC plays it in the same tick, and rollback's guesses clear those
+ * bits (net.c rb_fill_frames) so a guessed tick never repeats it. In the tick (note_choice), if
+ * the character is alive, takes input and stands in the animation's from-state (standing), it
+ * plays as a script's chr_animate does (0x4b6e10, and the sound code's player animation):
+ * ONrForceActiveCharacter 0x4f11b0 (ECX the character), ONrCharacter_SetAnimation_External
+ * 0x4eb340 (ECX the character, DX the active character's curFromState +0x1afe, [animation],
+ * [interpolation -1]; ret 8), the character's ChrAnimate flag 0x200000, animationLockFrames
+ * (+0x1c90) 0 so any key ends it. A taunt first enters fight mode (0x4eb0b0): it's the Combat
+ * variant, and out of fight mode it didn't show (user report). The animation is looked up in the character's animation
+ * collection chain (child first), by type (TRAM +0x15a: 93 Idle, 94 Taunt, checked in level0's
+ * TRAMKONOKOidle_spec3) and name: taunt N ends in "tauntN" (Konoko, Ninja and Tanker have a
+ * taunt2: the ninja's moonwalk, weight 5 against 100, so rare from the taunt key), the sneeze is
+ * Konoko's special idle idle_spec3 (head jerks 45 degrees in 6 frames at frame 56; idle_spec2
+ * is slow), idle N the Nth special idle but the sneeze (Comguy idle15, Striker idle6, Tanker idle16,
+ * Konoko idle_spec2). */
+
+#define ONrForceActiveCharacter ((u8 *(ONI_FC *)(u8 *))0x4f11b0)
+#define ONrCharacter_EnterFightMode ((void (ONI_FC *)(u8 *))0x4eb0b0)   /* ONrCharacter_FightMode (as regen.c) */
+#define ONrCharacter_SetAnimation_External ((void (ONI_FC *)(u8 *, u32, void *, int))0x4eb340)
+#define ACT_FROM_STATE(a)       (*(u16 *)((a) + 0x1afe))
+#define ACT_LOCK_FRAMES(a)      (*(u32 *)((a) + 0x1c90))
+#define CHR_CHRANIMATE          0x200000
+#define ONCC_ANIMATIONS(c)      (*(u8 **)((c) + 0xc80))    /* TRAC */
+#define TRAC_PARENT(t)          (*(u8 **)((t) + 0x10))
+#define TRAC_COUNT(t)           (*(u16 *)((t) + 0x16))
+#define TRAC_ANIMATION(t, i)    (*(u8 **)((t) + 0x20 + 12 * (i)))
+#define TRAM_TYPE(a)            (*(u16 *)((a) + 0x15a))
+#define TRAM_FROM(a)            (*(u16 *)((a) + 0x15e))
+#define ANIM_IDLE               93
+#define ANIM_TAUNT              94
+#define ANIM_STAND              6
+#define TRAM_HEIGHTS(a)         (*(float **)((a) + 4))      /* per frame: the pelvis over the feet */
+#define TRAM_VARIENT(a)         (*(u16 *)((a) + 0x168))    /* 0: the plain stance (no Combat, no weapon) */
+
+/* The character's own plain stance (the first plain Stand from Standing in its chain) and whether
+ * an idle stands at its height. Idles are made for one body: the base collection strikercore
+ * holds Striker's idle6 (pelvis 11.17), which Ninja (10.44), Comguy's family (10.37) and Tanker
+ * (10.26) inherit, and played on them the character hangs in the air until it ends (user report).
+ * The game only plays an idle its own class has; here: within 0.05 of the stance's height. */
+static int idle_fits(u8 *c, u8 *idle)
+{
+	float hi = TRAM_HEIGHTS(idle) ? TRAM_HEIGHTS(idle)[0] : 0, d;
+	for (u8 *trac = ONCC_ANIMATIONS(CHR_CLASS(c)); trac; trac = TRAC_PARENT(trac))
+		for (u32 i = 0; i < TRAC_COUNT(trac); i++) {
+			u8 *a = TRAC_ANIMATION(trac, i);
+			if (!a || TRAM_TYPE(a) != ANIM_STAND || TRAM_FROM(a) != TRAM_FROM(idle) || TRAM_VARIENT(a) || !TRAM_HEIGHTS(a)) continue;
+			d = TRAM_HEIGHTS(a)[0] - hi;
+			return d < 0.05f && d > -0.05f;
+		}
+	return 0;
+}
+
+static u32 g_emote_req;   /* this PC's request, until a record carries it (not game state) */
+
+static int ends_i(const char *s, const char *end)
+{
+	int n = str_len(s), k = str_len(end);
+	return n >= k && str_ieq_n(s + n - k, end, k);
+}
+
+void *players_emote_anim(u8 *c, int emote)
+{
+	u8 *seen[16];
+	int nseen = 0, want = emote >= PLAYERS_EMOTE_IDLE ? emote - PLAYERS_EMOTE_IDLE + 1 : 0;
+	char end[16];
+
+	if (!c || !CHR_CLASS(c)) return 0;
+	if (emote == PLAYERS_EMOTE_TAUNT || emote == PLAYERS_EMOTE_TAUNT2) fmt(end, "taunt%d", emote == PLAYERS_EMOTE_TAUNT ? 1 : 2);
+	for (u8 *trac = ONCC_ANIMATIONS(CHR_CLASS(c)); trac; trac = TRAC_PARENT(trac))
+		for (u32 i = 0; i < TRAC_COUNT(trac); i++) {
+			u8 *a = TRAC_ANIMATION(trac, i);
+			const char *n = a ? TMrInstance_GetInstanceName(a) : 0;
+			int dup = 0;
+			if (!n) continue;
+			switch (emote) {
+			case PLAYERS_EMOTE_TAUNT:
+			case PLAYERS_EMOTE_TAUNT2:
+				if (TRAM_TYPE(a) == ANIM_TAUNT && ends_i(n, end)) return a;
+				break;
+			case PLAYERS_EMOTE_SNEEZE:
+				if (TRAM_TYPE(a) == ANIM_IDLE && ends_i(n, "idle_spec3") && idle_fits(c, a)) return a;
+				break;
+			default:
+				if (TRAM_TYPE(a) != ANIM_IDLE || !want || ends_i(n, "idle_spec3") || !idle_fits(c, a)) break;   /* the sneeze has its own */
+				for (int k = 0; k < nseen; k++) dup |= seen[k] == a;
+				if (dup || nseen == 16) break;
+				seen[nseen++] = a;
+				if (nseen == want) return a;
+			}
+		}
+	if (emote == PLAYERS_EMOTE_TAUNT)   /* no taunt1: the first taunt */
+		for (u8 *trac = ONCC_ANIMATIONS(CHR_CLASS(c)); trac; trac = TRAC_PARENT(trac))
+			for (u32 i = 0; i < TRAC_COUNT(trac); i++) {
+				u8 *a = TRAC_ANIMATION(trac, i);
+				if (a && TRAM_TYPE(a) == ANIM_TAUNT) return a;
+			}
+	return 0;
+}
+
+void players_emote_request(int emote) { g_emote_req = (u32)emote & 0xf; }
+
+u32 players_emote_take(void)
+{
+	u32 w = g_emote_req << PLAYERS_EMOTE_SHIFT;
+	g_emote_req = 0;
+	return w;
+}
+
+static u8 *player_char(int who);
+
+/* In the tick: the emote this record asks for */
+static void emote_tick(int who, u32 word)
+{
+	int e = (int)((word & PLAYERS_EMOTE_MASK) >> PLAYERS_EMOTE_SHIFT);
+	u8 *c, *act, *anim;
+
+	if (!e || !ONgGameState) return;
+	c = player_char(who);
+	if (!c || (CHR_FLAGS(c) & (CHR_DEAD | CHR_NOINPUT)) || !(anim = players_emote_anim(c, e))) return;
+	if (!(act = ONrForceActiveCharacter(c))) return;
+	if (ACT_FROM_STATE(act) != TRAM_FROM(anim)) {
+		log_msg("players: player %d's %s waits for standing still: not played", who + 1, TMrInstance_GetInstanceName(anim));
+		return;
+	}
+	/* taunts are the Combat variant: out of fight mode the next update swaps the animation for the
+	 * plain stance's (no taunt there), so it never shows; the taunt key's taunt is in fight mode too */
+	if (TRAM_TYPE(anim) == ANIM_TAUNT) ONrCharacter_EnterFightMode(c);
+	ONrCharacter_SetAnimation_External(c, ACT_FROM_STATE(act), anim, -1);
+	CHR_FLAGS(c) |= CHR_CHRANIMATE;
+	ACT_LOCK_FRAMES(act) = 0;
+	log_msg("players: player %d plays %s", who + 1, TMrInstance_GetInstanceName(anim));
+}
+
+static void spectate_tick(int who, u32 word);
+
 static void note_choice(int who, const u32 *rec)
 {
-	if ((rec[11] & PLAYERS_CHOICE_MASK) == PLAYERS_CHOICE_TAG) g_class[who] = (int)(rec[11] & 0xffff) - 1;
+	if ((rec[11] & PLAYERS_CHOICE_MASK) != PLAYERS_CHOICE_TAG) return;
+	if (who == 0) spectate_tick(0, rec[11]);   /* the others' in set_input: they may have no character */
+	g_class[who] = (int)(rec[11] & PLAYERS_CLASS_MASK) - 1;
+	emote_tick(who, rec[11]);
 }
+
+static void present_tick(u32 present);
 
 void players_tick_record(const u32 *rec)
 {
-	if (g_enabled && rec) note_choice(0, rec);
+	if (!g_enabled || !rec) return;
+	note_choice(0, rec);
+	if ((rec[11] & PLAYERS_CHOICE_MASK) == PLAYERS_CHOICE_TAG && (rec[11] & PLAYERS_PRESENT_FLAG) && ONgGameState)
+		present_tick((rec[11] >> PLAYERS_PRESENT_SHIFT) & 0xf);
 }
 
 /* Slot s's tick input, as the tick builds Konoko's (tick: this tick's index in the frame) */
@@ -421,7 +597,8 @@ static void player_tick(int s, int tick)
 		in[5] &= 0xfffffe3f;
 		in[8] = in[9] = in[10] = in[11] = 0;
 	}
-	ONrCharacter_SetInput(p2, in);
+	u32 regen_copy[12];
+	ONrCharacter_SetInput(p2, regen_input(p2, in, regen_copy));   /* g_input[s] itself stays as built */
 }
 
 static void respawn_tick(const u32 *p1_input);
@@ -429,7 +606,13 @@ static void score_tick(void);
 
 static void ONI_FC set_input(u8 *chr, u32 *input)
 {
-	ONrCharacter_SetInput(chr, input);   /* Konoko */
+	u32 regen_copy[12];
+	ONrCharacter_SetInput(chr, regen_input(chr, input, regen_copy));   /* Konoko; gs+0xb8 stays as built */
+	if (g_net_records && (u32)g_tick_index < g_net_count)
+		for (int s = 1; s < PL; s++) {
+			u32 w = g_net_records[s][g_tick_index][11];
+			if ((w & PLAYERS_CHOICE_MASK) == PLAYERS_CHOICE_TAG) spectate_tick(s, w);
+		}
 	for (int s = 1; s < PL; s++) player_tick(s, g_tick_index);
 	g_tick_index++;
 	if (multiplayer_active()) {
@@ -488,6 +671,29 @@ int multiplayer_map(void)
 	return g_nspawn >= 2;   /* collected by every level's player spawn walk */
 }
 
+/* Maps often give every spawn placement the same Name, and scripts find characters by name (a
+ * trigger volume's script gets the name): chr_set_health on "player" would hit whichever comes
+ * first in the list, not the one who walked in. A clashing extra player gets a name of its own. */
+static void name_apart(u32 index)
+{
+	char *name = (char *)character(index) + CHR_NAME_OFFSET;
+	char tail[16];
+	int clash = 0;
+
+	for (u32 i = 0; i < ONgCharacterSlots && !clash; i++) {
+		u8 *o = character(i);
+		const char *other = (const char *)o + CHR_NAME_OFFSET;
+		int k = 0;
+		if (i == index || !(CHR_FLAGS(o) & CHR_INUSE)) continue;
+		while (k < CHR_NAME_MAX && name[k] == other[k] && name[k]) k++;
+		clash = k == CHR_NAME_MAX || name[k] == other[k];
+	}
+	if (!clash) return;
+	fmt(tail, "_%u", index);
+	name[CHR_NAME_MAX - 1 - str_len(tail)] = 0;
+	str_cpy(name + str_len(name), (unsigned)(CHR_NAME_MAX - str_len(name)), tail);
+}
+
 /* Spawns the character of placement obj at spawn point `point`; keeps gs+0xac (player 1) when
  * asked, since NewCharacter makes any charType 0 character the player (0x4fc8f0 at 0x4db785) */
 static int spawn_at(u8 *obj, int point, int keep_player, u32 *index)
@@ -510,6 +716,7 @@ static int spawn_at(u8 *obj, int point, int keep_player, u32 *index)
 	}
 	*index &= 0xffff;
 	if (err) log_msg("players: can't spawn %s (error %d)", OBJ_NAME(obj), err);
+	else if (keep_player) name_apart(*index);
 	return !err;
 }
 
@@ -562,8 +769,11 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 	u32 r, seen = 0;
 
 	g_nspawn = 0;
+	memset(g_killcam, 0, sizeof g_killcam);
+	g_spect = 0;   /* everyone is spawned; watchers' records park them again in the first tick */
 	g_spawn_level = ONrLevel_GetCurrent();
 	OBJrEnumerate(OBJcType_CHAR, collect_spawn, 0);
+	mp_rules_level();   /* multiplayer_map() is known now, and no character is made yet */
 	g_ntaken = 0;
 	for (int s = 1; s < PL; s++) g_pl[s] = -1;
 	if (multiplayer_map()) {
@@ -595,6 +805,10 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 		g_map_class[0] = CHR_CLASS(GS_PLAYER(ONgGameState));
 	}
 	OBJrEnumerate(OBJcType_CHAR, spawn_player, (u32)&seen);
+	g_present = 1;
+	for (int s = 1; s < PL; s++)
+		if (g_pl[s] >= 0) g_present |= 1u << s;
+	g_present_known = 0;
 	return r;
 }
 
@@ -660,6 +874,7 @@ static int respawn(u8 *c, int who)
 	int point = choose_spawn(avoid, navoid, (u32)who + 1);
 	if (CHR_ACTIVE(c) && !(CHR_FLAGS(c) & CHR_NOCORPSE)) ONrCharacter_MakeCorpse(c);
 	ONrGameState_DeleteCharacter(c);
+	g_killcam[who] = 0;
 	int index = make_player(who, point);
 	if (index >= 0) items_player_respawned(CHR_POS(character(index)));
 	return index;
@@ -682,6 +897,179 @@ static void change_class(int who, u8 *c)
 	if (!oncc || oncc == CHR_CLASS(c)) return;
 	ONrCharacter_SetClass(c, oncc);
 	log_msg("players: player %d changed to %s, health %d/%d (tick %u)", who + 1, TMrInstance_GetInstanceName(oncc), CHR_HEALTH(c), CHR_MAX_HEALTH(c), GS_TICK(ONgGameState));
+}
+
+/* ---- Joining and leaving ------------------------------------------------------------------- *
+ * In a network game the host's record (Konoko's, the tick's action) carries in word 11 the
+ * players who have a character (PLAYERS_PRESENT_FLAG, a bit per player). Every PC reads it at
+ * the tick's start (players_tick_record, from lockstep.c's tick body), so a player comes in or
+ * goes at the same tick everywhere, and a rollback that takes the tick back takes that back too.
+ * A record without the flag (a guess made before any of the host's came, a lobby, a single-player
+ * game) changes nothing. A player whose bit comes on gets a new character, made as a respawn
+ * makes one (its placement's class, at a spawn point no living player is near) with the score,
+ * class choice and hits of whoever had the slot before wiped; one whose bit goes off loses its
+ * character (a dead one leaves its corpse). Konoko (player 1, the host) never changes. */
+
+int players_can_join(int who) { return who > 0 && who < PL && multiplayer_map() && who < g_nspawn; }
+
+static void join_player(int who)
+{
+	const float *avoid[PL];
+	int navoid = 0, point, index;
+
+	g_score[who] = 0;
+	g_class[who] = g_as[who] = -1;
+	g_hit_by[who] = -1;
+	g_hit_tick[who] = g_last_owner[who] = g_death_tick[who] = 0;
+	g_last_cause[who] = OBIT_SKULL;
+	g_held[who] = 0;
+	g_killcam[who] = 0;
+	g_was_dead[who] = 0;
+	memset(g_input[who], 0, sizeof g_input[who]);
+	if (!players_can_join(who)) {
+		log_msg("players: player %d can't come in: the map has no spawn placement for them (tick %u)", who + 1,
+		        GS_TICK(ONgGameState));
+		return;
+	}
+	for (int s = 0; s < PL; s++) {
+		u8 *o = player_char(s);
+		if (s != who && alive(o)) avoid[navoid++] = CHR_POS(o);
+	}
+	point = choose_spawn(avoid, navoid, (u32)who + 1);
+	index = make_player(who, point);
+	g_pl[who] = index;
+	if (index < 0) return;
+	items_player_respawned(CHR_POS(character(index)));
+	log_msg("players: player %d came into the game at spawn point %d (tick %u)", who + 1, point, GS_TICK(ONgGameState));
+}
+
+static void leave_player(int who)
+{
+	u8 *c = slot_valid(who) ? character(g_pl[who]) : 0;
+
+	if (c) {
+		if (CHR_ACTIVE(c) && (CHR_FLAGS(c) & CHR_DEAD) && !(CHR_FLAGS(c) & CHR_NOCORPSE)) ONrCharacter_MakeCorpse(c);
+		ONrGameState_DeleteCharacter(c);
+		log_msg("players: player %d left the game (tick %u)", who + 1, GS_TICK(ONgGameState));
+	}
+	g_pl[who] = -1;
+	g_killcam[who] = 0;
+	memset(g_input[who], 0, sizeof g_input[who]);
+}
+
+static void present_tick(u32 present)
+{
+	present |= 1;
+	if (g_present_known && present == g_present) return;
+	for (int s = 1; s < PL; s++) {
+		int on = (present >> s & 1) != 0, has = slot_valid(s);
+		if (!on) g_spect &= ~(1u << s);   /* gone: the place's next player plays */
+		if (on && !has && !(g_spect >> s & 1)) join_player(s);
+		else if (!on && (has || g_pl[s] >= 0)) leave_player(s);
+	}
+	g_present = present;
+	g_present_known = 1;
+}
+
+/* ---- Spectating (/spectate, /join) ------------------------------------------------------------ *
+ * A player who watches has no part in the game: no character to hit, no score, not in the match's
+ * result. Each PC's wish (chat.c sets it, players_spectate_want) is bit 11 of word 11 of every
+ * record its player sends (PLAYERS_SPECTATE_FLAG; net.c make_input), a state rather than a
+ * request, so a guessed record keeps it, a replay join rebuilds it and the first records after a
+ * reload into the match park the player again. Every PC applies a change in the tick whose record
+ * shows it (Konoko's at the tick's start in note_choice, the others' in set_input before their
+ * input), so rollback takes it back like anything else. Either way the player's score goes to 0.
+ *
+ *   players 2..4: their character goes as a leaver's does (a dead one leaves its corpse); /join
+ *     brings them in as a newcomer (join_player: a spawn point no living player is near).
+ *   Konoko (the host): gs+0xac can't be emptied (the tick, HUD, camera and sounds all read it), so
+ *     she is parked: dies in place (ONrCharacter_Die 0x4eb550, ECX the character, EDX 0, as
+ *     chr_set_health 0 does at 0x4da601) with her class's death particle (ONCC +0xc2c) and her
+ *     death/defeat scripts (+0x88, +0xe8) held off for the call, isn't drawn on any PC
+ *     (players_hidden, net.c's draw-pass hook), and doesn't respawn while watching. /join respawns
+ *     her as a death does, without leaving a corpse (NoCorpse).
+ *
+ * What a watcher sees is each PC's own business (net.c: the camera, HUD and listener follow the
+ * player watched, left click picks the next). */
+
+#define ONrCharacter_Die        ((void (ONI_FC *)(u8 *, u8 *))0x4eb550)
+#define ONCC_DEATH_PARTICLE(o)  (*(void **)((o) + 0xc2c))
+#define CHR_DIE_SCRIPT(c)       ((char *)(c) + 0x88)
+#define CHR_DEFEAT_SCRIPT(c)    ((char *)(c) + 0xe8)
+
+static int g_spect_want;   /* this PC's player asks to watch (not game state: it goes out in the records) */
+
+void players_spectate_want(int on) { g_spect_want = on != 0; }
+int  players_spectate_wanted(void) { return g_spect_want; }
+u32  players_spectate_word(void) { return g_spect_want ? PLAYERS_SPECTATE_FLAG : 0; }
+int  players_spectating(int who) { return who >= 0 && who < PL && (g_spect >> who & 1); }
+u32  players_spectators(void) { return g_spect; }
+
+int players_hidden(u8 *c) { return (g_spect & 1) && c && c == player_char(0); }
+
+static void forget_player(int who)
+{
+	g_score[who] = 0;
+	g_hit_by[who] = -1;
+	g_hit_tick[who] = g_last_owner[who] = 0;
+	g_last_cause[who] = OBIT_SKULL;
+	g_killcam[who] = 0;
+}
+
+static void park_konoko(void)
+{
+	u8 *c = player_char(0), *oncc;
+	void *particle;
+	char die, defeat;
+
+	if (!c || !(CHR_FLAGS(c) & CHR_INUSE)) return;
+	g_was_dead[0] = 1;   /* no death to count */
+	if (CHR_FLAGS(c) & CHR_DEAD) return;
+	oncc = CHR_CLASS(c);
+	particle = oncc ? ONCC_DEATH_PARTICLE(oncc) : 0;
+	die = *CHR_DIE_SCRIPT(c);
+	defeat = *CHR_DEFEAT_SCRIPT(c);
+	if (oncc) ONCC_DEATH_PARTICLE(oncc) = 0;
+	*CHR_DIE_SCRIPT(c) = *CHR_DEFEAT_SCRIPT(c) = 0;
+	CHR_HEALTH(c) = 0;
+	ONrCharacter_Die(c, 0);
+	if (oncc) ONCC_DEATH_PARTICLE(oncc) = particle;
+	*CHR_DIE_SCRIPT(c) = die;
+	*CHR_DEFEAT_SCRIPT(c) = defeat;
+}
+
+static void spectate_tick(int who, u32 word)
+{
+	int want = (word & PLAYERS_SPECTATE_FLAG) != 0, is = (g_spect >> who & 1) != 0;
+	u8 *c;
+
+	if (want == is || !ONgGameState || !multiplayer_map()) return;
+	if (who > 0 && g_present_known && !(g_present >> who & 1)) return;   /* not in the game (left) */
+	forget_player(who);
+	if (want) {
+		g_spect |= 1u << who;
+		if (who == 0) {
+			park_konoko();
+		} else if ((c = slot_valid(who) ? character(g_pl[who]) : 0)) {
+			if (CHR_ACTIVE(c) && (CHR_FLAGS(c) & CHR_DEAD) && !(CHR_FLAGS(c) & CHR_NOCORPSE)) ONrCharacter_MakeCorpse(c);
+			ONrGameState_DeleteCharacter(c);
+			g_pl[who] = -1;
+			memset(g_input[who], 0, sizeof g_input[who]);
+		}
+		g_was_dead[who] = who == 0;
+		log_msg("players: player %d watches (tick %u)", who + 1, GS_TICK(ONgGameState));
+		return;
+	}
+	g_spect &= ~(1u << who);
+	log_msg("players: player %d plays again (tick %u)", who + 1, GS_TICK(ONgGameState));
+	if (who == 0) {
+		if (!(c = player_char(0))) return;
+		CHR_FLAGS(c) |= CHR_NOCORPSE;   /* the parked body goes, it leaves nothing */
+		respawn(c, 0);
+		g_was_dead[0] = 0;
+	} else if (!slot_valid(who)) {
+		join_player(who);
+	}
 }
 
 /* ---- Score ---------------------------------------------------------------------------------- *
@@ -713,6 +1101,62 @@ static int player_of(u8 *c)
 	for (int who = 0; who < PL; who++)
 		if (c == player_char(who)) return who;
 	return -1;
+}
+
+/* ---- Kill camera (see the top of this file) --------------------------------------------------- */
+
+#define ONrCamera_EnterDetached ((void (ONI_FC *)(void))0x4d7930)
+#define BSL_CM_DETACH_CALL      0x4bbfd0
+#define BSL_IS_PLAYER_TEST      0x4b8e34
+
+static int killcam_game(void) { return multiplayer_active() && multiplayer_map(); }
+
+static u8 *g_asked;   /* the player the running script just asked chr_is_player about */
+
+static void ONI_FC script_detach(void)
+{
+	int who;
+
+	if (!killcam_game()) { ONrCamera_EnterDetached(); return; }
+	who = player_of(g_asked);
+	if (who >= 0) g_killcam[who] = 1;
+	g_asked = 0;
+}
+
+/* chr_is_player's answer: EAX, the character, on entry to the patch below */
+static int script_is_player(u8 *c)
+{
+	int who = killcam_game() ? player_of(c) : -1;
+	if (who >= 0) g_asked = c;
+	return who >= 0 || c == GS_PLAYER(ONgGameState);
+}
+
+int players_killcam(u8 *c)
+{
+	int who = killcam_game() ? player_of(c) : -1;
+	return who >= 0 && g_killcam[who] && (CHR_FLAGS(c) & CHR_DEAD);
+}
+
+static void killcam_install(void)
+{
+	/* mov edx,[ONgGameState]; mov esi,[edx+0xac]; cmp esi,eax; pop esi; sete al */
+	static const u8 stock[] = { 0x8b, 0x15, 0x7c, 0xce, 0x5e, 0x00, 0x8b, 0xb2, 0xac, 0x00, 0x00, 0x00,
+	                            0x3b, 0xf0, 0x5e, 0x0f, 0x94, 0xc0 };
+	/* push ecx; push eax; call script_is_player; add esp,4; pop ecx; pop esi; nops */
+	u8 code[sizeof stock] = { 0x51, 0x50, 0xe8, 0, 0, 0, 0, 0x83, 0xc4, 0x04, 0x59, 0x5e,
+	                          0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+	u32 rel = (u32)script_is_player - (BSL_IS_PLAYER_TEST + 7);
+
+	if (!code_matches(BSL_IS_PLAYER_TEST, stock, sizeof stock)) {
+		log_msg("players: 0x%x changed, no kill camera", BSL_IS_PLAYER_TEST);
+		return;
+	}
+	if (!patch_call(BSL_CM_DETACH_CALL, (u32)ONrCamera_EnterDetached, (u32)script_detach)) {
+		log_msg("players: 0x%x changed, no kill camera", BSL_CM_DETACH_CALL);
+		return;
+	}
+	memcpy(code + 3, &rel, 4);
+	patch_write(BSL_IS_PLAYER_TEST, code, sizeof code);
 }
 
 /* The hit's owner as a player: through 0x51cda0 (attacker), else by the handle's slot (owner
@@ -749,19 +1193,29 @@ static int blast_player(u8 *victim, u32 owner)
 
 void players_note_hit(u8 *victim, u8 *attacker, u32 owner)
 {
-	int v = player_of(victim), a;
+	int v = player_of(victim), a, kind;
+	u8 *weapon;
 	if (v < 0 || !ONgGameState) return;
 	a = owner_player(attacker, owner);
-	if (a < 0 && (a = blast_player(victim, owner)) >= 0 && a != v && g_hit_by[v] != a)
-		log_msg("players: player %d caught in player %d's death blast (tick %u)", v + 1, a + 1, GS_TICK(ONgGameState));
+	kind = obit_hit_cause(attacker ? attacker : a >= 0 ? player_char(a) : 0, owner, &weapon);
+	if (kind == OBIT_WEAPON && !weapon && a >= 0) weapon = g_held[a];   /* dropped it since it fired */
+	if (a < 0 && (a = blast_player(victim, owner)) >= 0) {
+		kind = OBIT_BLAST;
+		if (a != v && g_hit_by[v] != a)
+			log_msg("players: player %d caught in player %d's death blast (tick %u)", v + 1, a + 1, GS_TICK(ONgGameState));
+	}
 	if (a < 0 || a == v) {
 		g_last_owner[v] = owner;   /* for the log if this player then dies with no credit */
+		g_last_cause[v] = kind;    /* and the kill feed's icon: a fall, their own weapon or blast */
+		g_last_weapon[v] = weapon;
 		return;
 	}
 	if (!attacker && owner >> 24 != 4) log_msg("players: player %d hit by owner %08x, credited to player %d by its slot (tick %u)", v + 1, owner,
 	                       a + 1, GS_TICK(ONgGameState));
 	g_hit_by[v] = a;
 	g_hit_tick[v] = GS_TICK(ONgGameState);
+	g_hit_cause[v] = kind;
+	g_hit_weapon[v] = weapon;
 }
 
 int players_can_change(int who) { return who >= 0 && who < PL && multiplayer_map() && alive(player_char(who)); }
@@ -798,6 +1252,7 @@ static int better(int a, int b) { return g_limit_score < 0 ? a < b : a > b; }
 int players_winner(u32 mask)
 {
 	int best = -1, tie = 0;
+	mask &= ~g_spect;   /* watchers aren't in the running */
 	for (int s = 0; s < PL; s++) {
 		if (!(mask >> s & 1)) continue;
 		if (best < 0 || better(g_score[s], g_score[best])) best = s, tie = 0;
@@ -810,6 +1265,7 @@ int players_winner(u32 mask)
 int players_ranking(u32 mask, int *out)
 {
 	int n = 0;
+	mask &= ~g_spect;
 	for (int s = 0; s < PL; s++) {
 		if (!(mask >> s & 1)) continue;
 		int k = n++;
@@ -825,12 +1281,16 @@ void players_reset_scores(void)
 		g_score[who] = 0;
 		g_hit_by[who] = -1;
 		g_last_owner[who] = 0;
+		g_last_cause[who] = OBIT_SKULL;
+		g_held[who] = 0;
 		g_death_tick[who] = 0;
 		g_class[who] = -1;
 		g_as[who] = -1;
+		g_killcam[who] = 0;
 		u8 *c = player_char(who);
 		g_was_dead[who] = c && (CHR_FLAGS(c) & CHR_DEAD);
 	}
+	obit_reset();
 }
 
 static int limit_reached(void)
@@ -845,23 +1305,27 @@ static void score_tick(void)
 {
 	if (g_over_tick) return;   /* the match is over: the score stays as it ended */
 	for (int who = 0; who < PL; who++) {
-		u8 *c = player_char(who);
+		u8 *c = player_char(who), *w;
 		int dead = c && (CHR_FLAGS(c) & CHR_INUSE) && (CHR_FLAGS(c) & CHR_DEAD);
+		if (c && !dead && (w = obit_weapon_class(c))) g_held[who] = w;
 		if (dead && !g_was_dead[who]) {
 			int killer = g_hit_by[who];
 			g_death_tick[who] = GS_TICK(ONgGameState) + 1;
 			memcpy(g_death_pos[who], CHR_POS(c), sizeof g_death_pos[who]);
 			if (killer >= 0 && GS_TICK(ONgGameState) - g_hit_tick[who] <= KILL_CREDIT) {
-				g_score[killer]++;
+				if (!(g_spect >> killer & 1)) g_score[killer]++;   /* a watcher's last grenade scores nothing */
+				obit_add(killer, who, g_hit_cause[who], g_hit_weapon[who]);
 				log_msg("players: player %d killed player %d (%d : %d : %d : %d)", killer + 1, who + 1, g_score[0], g_score[1],
 				        g_score[2], g_score[3]);
 			} else {
 				g_score[who]--;
+				obit_add(-1, who, g_last_cause[who], g_last_weapon[who]);
 				log_msg("players: player %d died on their own (%d : %d : %d : %d; last uncredited hit owner %08x)", who + 1,
 				        g_score[0], g_score[1], g_score[2], g_score[3], g_last_owner[who]);
 			}
 			g_hit_by[who] = -1;
 			g_last_owner[who] = 0;
+			g_last_cause[who] = OBIT_SKULL;
 		}
 		g_was_dead[who] = dead;
 	}
@@ -877,7 +1341,8 @@ static void respawn_tick(const u32 *p1_input)
 	u8 *gs = ONgGameState, *p1 = GS_PLAYER(gs);
 
 	if (!multiplayer_map()) return;
-	if (p1 && wants_respawn(p1, p1_input)) respawn(p1, 0);
+	if (g_spect & 1) ;   /* watching: Konoko stays parked (see "Spectating") */
+	else if (p1 && wants_respawn(p1, p1_input)) respawn(p1, 0);
 	else change_class(0, p1);
 	for (int s = 1; s < PL; s++) {
 		u8 *c = slot_valid(s) ? character(g_pl[s]) : 0;
@@ -934,6 +1399,7 @@ void players_install(void)
 	for (u32 i = 0; i < 3; i++) patch_call(spawn_sites[i], (u32)OBJrEnumerate, (u32)spawn_players);
 	for (u32 i = 0; i < 2; i++) patch_call(aim_sites[i], (u32)ONrCharacter_AutoAim, (u32)auto_aim);
 	patch_call(ONcTick_SetInputCall, (u32)ONrCharacter_SetInput, (u32)set_input);
+	killcam_install();
 	x = LoadLibraryA("xinput1_3.dll");
 	if (!x) x = LoadLibraryA("xinput9_1_0.dll");
 	g_xinput = x ? (XInputGetState_t)GetProcAddress(x, "XInputGetState") : 0;

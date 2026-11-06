@@ -123,11 +123,12 @@ says about itself (name, players connected, spectators, map) and **Play** to joi
 have its map, Play downloads it. **Add** makes a new entry: type its address (`192.168.1.10`, a
 name, and `:port` if it isn't 27777) in **Address**. **Remove** deletes the selected one.
 
-**Chat**: in a network game (the lobby and the match), press **Enter** to chat. A text field
+**Chat**: in a network game (the lobby, the warm-up and the match), press **Enter** to chat; a
+gray "Press ENTER to chat" says so whenever the match isn't running. A text field
 opens in the lower left, under the messages, both on a light dark background; type and press
 **Enter** to send (you hear a locked door) and close it, or **Shift+Enter** to send and keep
 typing. **Esc** closes it without sending what you typed, and so does **Enter** with nothing
-typed. While you type, the keyboard only goes to the chat, but the mouse still turns, aims and
+typed; a gray "ESC: close | ENTER: send" under the field says so. While you type, the keyboard only goes to the chat, but the mouse still turns, aims and
 attacks. **Up**/**Down** (or the mouse wheel, **Page Up**/**Page
 Down** a page at a time) scroll the messages; **Left**/**Right** move the cursor, and selecting
 and deleting text works as in the menus' text fields. When another player writes, you hear the
@@ -135,6 +136,24 @@ game-saved sound, and their message shows over their head (above their name, in 
 most two lines) for a few seconds. The chat also says, in green and without a sound, when someone
 enters or leaves the game. With the chat closed, messages stay on screen for 10 seconds, then fade
 (`fade` in `[chat]`).
+
+**Chat commands**: a line starting with `/` isn't sent, it's a command. Only you see their answers
+(in light blue).
+
+| Command | What it does |
+|---|---|
+| `/help` | Lists the commands |
+| `/name New Name` | Changes your name (saved, like typing it in F2); everyone sees "Old is now known as New" |
+| `/whisper Name text`, `/w Name text` | Only that player reads it (pink on both screens, no bubble over your head). A start of the name is enough when only one player's name fits |
+| `/movelist`, `/moves` | Your current character's moves, the move's name and its input in two columns (moves.md's list without the moves every character has); `/movelist` adds gray lines on what everyone has and on blocking, `/moves` leaves them out. The chat stays open so you can scroll it |
+| `/taunt` or `/t`, `/taunt2` or `/t2` | Plays your character's first taunt, or its rare second one: Konoko's, the Ninja's moonwalk, Tanker's (the taunt key picks one at random, the second seldom) |
+| `/sneeze` | Konoko sneezes (her rare idle; other characters have none) |
+| `/idle` or `/i` | Plays your character's special idle, one made for its body: Konoko's (also Red, Shinatama), Comguy's (also Griffin, Muro, Thug, Ninjabot), Striker's (also Barabas, Elite, TCTF SWAT), Tanker's. Ninja has none |
+| `/clear` | Empties the chat |
+| `\/text` | Sends "/text" as a message, not a command |
+
+A taunt first puts your character in its fighting stance (taunts belong to it, as with the taunt key). Taunts, the sneeze and idles play only while you stand, every player sees them, and any key stops
+them.
 
  Custom levels don't need a unique level number: each one
 gets a free number (31 or lower) when you pick it (a joiner takes the host's). Put each level in its own folder:
@@ -155,6 +174,22 @@ A level can't start if one of those files is missing.
 
 A level can bring its own particle classes and ambient and impulse sounds, which stock Oni never set
 up for any level but level 0. Textures can be up to 1024x1024.
+
+Catwalk writes these next to the level, and Arklite reads them:
+
+- `vertexlight.bin`: corners whose light pulses, flickers or breaks down. A light can also play an
+  impulse sound on each pulse, or when a flicker starts failing, with a pitch range and a seed so
+  that lights with the same timing flicker differently. Every PC plays the sound on the same tick.
+- `spinparticles.bin`: particles in a spinning group turn with it, in step with the group's
+  geometry. Decals stay where they are.
+
+A sky (ONSK) with a sixth texture draws it as a floor under the box. The game's own skies have
+five, so they look as before.
+
+**Kill camera**: on a multiplayer map, a level script's `cm_detach` doesn't move anyone's camera
+at once. It marks the player that `chr_is_player` was last asked about, so the script must ask
+first, as Level 3's vat does. That player's camera then stays where it is while they're dead, and
+cuts to them again when they respawn. The other players' cameras are unaffected.
 
 Known gaps: save points made in a custom level go to the persist.dat slot it was mounted in (when that
 slot has no save for a save point, the `source` level's is used); and what happens when a
@@ -182,6 +217,12 @@ player 2, on the first XInput gamepad. The camera follows Konoko.
 
 Without a gamepad (or when XInput doesn't load), player 2 stands still, but the game is still a
 multiplayer game.
+
+**Barabas regenerates** when a player plays him, in any game: crouch, let go of crouch, then press
+Action. While he holds the pose he heals 8% of his maximum health a second, up to the maximum, and
+the mouse still looks around. Any movement, attack or other action key ends it, and so do Action
+again or taking hits worth 5% of his maximum health. Only characters with a regeneration
+animation (Barabas) can do it.
 
 A game with player 2 is a **multiplayer game**, and in one:
 
@@ -218,6 +259,9 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
 - **Damage is x1.25**: every hit on a character does a quarter more (rounded).
 - **Unlimited taunts**: taunt whenever you like, not only right after a kill. Every player
   hears the same taunt line, and a new taunt cuts off your last one instead of waiting for it.
+- **Aiming down while crouched**: every character aims a rifle as low as Konoko does (the gun
+  used to stop halfway while the body kept bending). Ninjabot raises and aims the weapons it
+  picks up.
 - **Overhealing drains a quarter faster**: health above the maximum (from a hypo) goes down
   1 point every 8.8 ticks instead of every 11.
 
@@ -267,6 +311,11 @@ The host checks this when someone joins: if a joiner's Arklite, Daodan, `daodan.
 gameplay settings, `level0_Final` files or map folder (`GameDataFolder/CustomLevels/<map>`) aren't
 identical to the host's, the joiner stays out of the lobby and both screens say in red what
 differs. Copy that file or folder from one PC to the other and join again.
+When only `level0_Final` differs, a joiner can switch to the host's without restarting Oni. Put a
+copy of the host's `level0_Final.dat` and `level0_Final.raw` in
+`AE/cache/<dat hash>-<raw hash>/`; the joiner's log names the folder it looked in. The level then
+reloads with the host's level 0 until Oni closes. Menus and fonts keep the old file's look until
+then, and after three switches Oni needs a restart.
 When only the map folder differs, the joiner downloads the host's version instead: the level
 reloads, and its loading box shows `Downloading (files left/files in the map)` and the current
 file's progress and speed. Esc cancels. The joiner's old files go to
@@ -295,21 +344,33 @@ The log's `net:` lines say whether networking is on.
 
 Use the host's IP. On one PC, join `127.0.0.1`; `-noswitch` keeps both in windows.
 
-The level starts as a **lobby**: everyone plays the map on their own (the other players stand
-still; a joiner plays player 2 here, whichever player it will be in the match) while they wait. Press **F3** to be ready ("Press F3 to be ready" turns from red to green;
-F3 again to be unready). When at least two players are there and more than half of them are
-ready, a 7-second countdown starts (it stops if someone unreadies). At 0 the level reloads on
-every PC and the match begins, with everyone in step. The score (kills; dying on your own
-costs a point) is in the top right corner during the match, with the time left under it.
+Until a second player comes, you play the map alone (a joiner's first moments too, as player 2).
+Then the level reloads on every PC into the **warm-up**: everyone sees each other and fights, in
+step, with no limits. Kills are counted, but the match starts from 0. Press **F3** to be ready ("Press F3 to be ready"
+turns from red to green; F3 again to be unready). When more than half of the players are ready, a
+7-second countdown starts (it stops if someone unreadies). At 0 the level reloads on every PC and
+the match begins. The score (kills; dying on your own costs a point) is in the top right corner,
+with the time left under it during the match.
+
+With rollback (`delay=0`, the default), the host doesn't wait for a second player: it starts the
+warm-up alone at once. Anyone who joins a warm-up or a match then comes in without a reload. Their
+PC loads the level and replays the game so far, muted and as fast as it can ("Joining the match:
+catching up (n%)"), checking along the way that it matches the host's. Then they spawn at a spawn
+point no one is near. The host keeps the game's inputs for about 97 minutes; after that, and when a
+replay comes out different, a new player comes in the old way:
+
+With input delay, someone joining during the warm-up reloads the level on every PC a moment
+later, which starts the warm-up over (F3 stays as it was). If the countdown is running they come in
+with the match instead. Someone joining during a match plays alone until it ends.
 
 A match ends at the host's **Time limit** or **Score limit** (the Host dialog; 0 means none of
 that limit). A negative score limit is reached going down, so the players race to kill
 themselves. When it ends, the game stands still and shows who won, with the ranking if there were
 more than two players; press **fire** (the left mouse button) to go back. When everyone did, or after 30 seconds, the level reloads on every PC
-into the lobby, where F3 starts the next match.
+into the warm-up, where F3 starts the next match.
 
 **F1** opens the help screen as usual, with the game still running. In a multiplayer game its
-first tab is the **Scoreboard**: the time left (in the lobby, the time limit) and the score limit
+first tab is the **Scoreboard**: the time left (before the match, the time limit) and the score limit
 on top, then every player's name, score and ping to the host. The host is marked, and players who
 left are in blue. Tick **Mute** next to a player to hide their chat messages (until you untick it
 or close Oni). The **Objective** tab says in one sentence how to win the match.
@@ -330,8 +391,9 @@ With rollback, some rollbacks are checked during the match (the first 40, then o
 ticks run a second time and the two runs are compared. A difference goes to
 `AE/logs/Arklite-rollbackcheck_<date>_<time>.txt`.
 
-If a joiner leaves, or sends nothing for 10 seconds, its player stands still and the rest play on,
-and the chat says who left. If the host goes, a joiner plays on alone with everyone else standing
+If a joiner leaves, or sends nothing for 10 seconds, its character leaves the game (a dead one
+leaves its corpse), the rest play on, and the chat says who left. Their place goes to the next
+player who joins. If the host goes, a joiner plays on alone with everyone else standing
 still.
 
 Joining shows your IP address to the host, and hosting shows yours to whoever joins.
