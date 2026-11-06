@@ -56,7 +56,7 @@
  * Their answers are this screen's lines only, in light blue (INFO). After /help and /movelist
  * the chat stays open, scrolled to the list's first line.
  *
- * The move list is arklite/moves.md, put into the DLL whole at build time (#embed): its section
+ * The move list is arklite/moves.md, put into the DLL whole at build time (build.sh): its section
  * whose "Animation sets:" line starts with the character's animation collection (ONCC +0xc80,
  * the TRAC's name without "_animations"), so every version of a character, and any class sharing
  * its collection, finds the same table. Each row is a line with a tab between the move's name
@@ -325,14 +325,11 @@ void chat_whisper_receive(int who, const char *text)
 #define CHR_CLASS(c)            (*(u8 **)((c) + 0xc))      /* the ONCC */
 #define ONCC_ANIMATIONS(c)      (*(u8 **)((c) + 0xc80))    /* TRAC */
 
-/* arklite/moves.md, whole, with a 0 at the end */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wc23-extensions"
+/* arklite/moves.md, whole, with a 0 at the end (build.sh writes it to build/moves.inc as bytes) */
 static const char g_moves_md[] = {
-#embed "../moves.md"
-	, 0
+#include "moves.inc"
+	0
 };
-#pragma clang diagnostic pop
 
 static int ieq(const char *a, const char *b)
 {
