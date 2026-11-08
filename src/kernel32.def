@@ -31,6 +31,9 @@ EXPORTS
   GetCurrentProcessId@0
   CreateDirectoryA@8
   MoveFileExA@12
+  CreateHardLinkA@12
+  CopyFileA@12
+  GetLastError@0
   RemoveDirectoryA@4
   DeleteFileA@4
   SetFilePointer@16

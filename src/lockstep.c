@@ -241,6 +241,12 @@ static int sound_in_tick(void)
 	return g_in_tick && GetCurrentThreadId() == g_tick_tid;
 }
 
+/* live_menu.c: whether this is a tick's code (on the thread running it) */
+int lockstep_in_tick(void)
+{
+	return sound_in_tick();
+}
+
 static u32 tick_sound_seed(void)
 {
 	u32 h = GS_TICK(ONgGameState) * 0x9e3779b1u ^ g_tick_sounds * 0x85ebca77u ^ UUgRandomSeed;
@@ -535,6 +541,32 @@ static void ONI_FC visited_clear(u32 *v)
 	v[2] = 0;
 }
 
+/* Every tick starts with the three vectors empty. Oni leaves a query's marks set and clears them
+ * at the start of the next query, from the undo list; a set bit the list doesn't hold is never
+ * cleared and hides its quad from every later query. Rollback made such bits: the vectors are
+ * written inside ticks and between them (the camera's and drawing's queries, each PC its own), and
+ * a restore puts back only the words ticks alone change, so the bits and their undo list could
+ * come back from different moments. The joiner of the bot test of 2026-11-08 gathered 4 to 39
+ * of them over a session (the host none), its queries lost walls, and its player 2 went through
+ * a wall the host's stopped at: 4 wall contacts (active +0xb0) on the host, 0 on the joiner, with
+ * the same inputs and seeds. Wiped at the tick body's start (also the re-runs and the rollback
+ * check's), every PC starts each tick's queries from the same empty vectors: what the next query's
+ * own clear would leave, so the game plays as before. */
+static void visited_wipe(void)
+{
+	u32 *vs[3] = { *(u32 **)0x5ccebc, *(u32 **)0x5ccec0, *(u32 **)0x5ccec4 };
+	for (int i = 0; i < 3; i++) {
+		u32 *v = vs[i];
+		if (!v) continue;
+		for (int k = 0; k < 8; k++)
+			if (g_visited[k].v == v) {
+				memset((u8 *)v[0], 0, (g_visited[k].bits + 7) / 8);
+				g_visited[k].overflowed = 0;
+				v[2] = 0;
+			}
+	}
+}
+
 static void visited_install(void)
 {
 	static const u8 test_entry[] = { 0x56, 0x8b, 0xf1, 0x8b, 0x0e };    /* push esi; mov esi,ecx; mov ecx,[esi] */
@@ -552,7 +584,39 @@ static void visited_install(void)
 	for (u32 k = 0; k < 3; k++) patch_call(new_sites[k], (u32)ONrVisited_New, (u32)visited_new);
 	jump_to(ONcVisited_TestSet, test_entry, visited_entry);
 	jump_to(ONcVisited_Clear, clear_entry, visited_clear);
-	log_msg("collision: visited marks are always undone (walls no longer go missing)");
+	log_msg("collision: visited marks are always undone, and wiped at every tick's start (walls no longer go missing)");
+}
+
+/* ---- Two-sided quads ------------------------------------------------------------------- *
+ * Collision makes a second, flipped contact for a two-sided quad, one with any of the flags
+ * 0x2a0 (AKcGQ_Flag_2Sided: Transparent 0x80, DrawBothSides 0x200 and Jello 0x20). But Jello is
+ * the camera's own mark: each frame it sets 0x20 on the quads between it and the character it
+ * follows (to draw them see-through) and the next camera update clears them again (0x41aab0,
+ * from 0x4d5ca0, which also runs after every tick). So the walls near the character each PC's
+ * camera follows were two-sided on that PC only: in a network game one player's wall contacts
+ * (active +0xb0) came out different on the two PCs from identical state, 5 on one and 10 on
+ * the other, and the player ended up a little elsewhere (the out-of-syncs where only one
+ * player's position was off, by a few float steps up to 0.4 units). The four tests (wall
+ * contacts for characters 0x4ebf81, for objects 0x43b9ef, and the other two collision paths
+ * 0x443c3b, 0x49ed15) leave Jello out. Level data never keeps Jello: the camera's clear takes it
+ * off any quad it drew. Found with two bot-played instances (net.c's tick-by-tick dump and a
+ * temporary log of each move step's contacts before Oni's filter 0x43a9a0). */
+static void two_sided_install(void)
+{
+	static const struct { u32 at; u8 len; u8 code[3]; } sites[] = {
+		{ 0x4ebf81, 3, { 0xf7, 0x42, 0x30 } },   /* test [edx+0x30], 0x2a0 */
+		{ 0x43b9ef, 2, { 0xf7, 0xc7 } },         /* test edi, 0x2a0 */
+		{ 0x443c3b, 3, { 0xf7, 0x47, 0x30 } },   /* test [edi+0x30], 0x2a0 */
+		{ 0x49ed15, 3, { 0xf7, 0x40, 0x30 } },   /* test [eax+0x30], 0x2a0 */
+	};
+	const u32 n = sizeof sites / sizeof sites[0];
+	for (u32 i = 0; i < n; i++)
+		if (!code_matches(sites[i].at, sites[i].code, sites[i].len) || *(const u32 *)(sites[i].at + sites[i].len) != 0x2a0) {
+			log_msg("collision: two-sided test at 0x%x changed, skipped (the camera's see-through walls stay two-sided)", sites[i].at);
+			return;
+		}
+	for (u32 i = 0; i < n; i++) patch_byte(sites[i].at + sites[i].len, 0xa0, 0x80);
+	log_msg("collision: walls the camera shows see-through aren't two-sided (same walls on every PC)");
 }
 
 /* ---- Collision query log ---------------------------------------------------------------- *
@@ -1264,7 +1328,8 @@ static void session_end(const char *why)
 static void session_begin(u32 level)
 {
 	u8 *gs = ONgGameState;
-	RecHeader h = { REC_MAGIC, REC_VERSION, level, GS_TICK(gs), UUgRandomSeed, fpu_control_word(), g_tick_local_seed, 0 };
+	RecHeader h = { REC_MAGIC, REC_VERSION, level, GS_TICK(gs), UUgRandomSeed, fpu_control_word(), g_tick_local_seed,
+	                players_spawn_seed() };
 
 	g_level = level;
 	g_frames = g_ticks = 0;
@@ -1318,6 +1383,7 @@ static void session_begin(u32 level)
 /* One tick of the game, with its input record (rollback.c may run it twice) */
 static void tick_body(void *action)
 {
+	visited_wipe();                /* the same empty visited marks on every PC (see visited_wipe) */
 	players_tick_record(action);   /* Konoko's F2 choice */
 	g_tick_tid = GetCurrentThreadId();
 	g_tick_sounds = 0;
@@ -1428,6 +1494,7 @@ void lockstep_install(void)
 	speech_install();
 	channel_unlock_install();
 	visited_install();
+	two_sided_install();
 	col_install();
 	/* the tick hook tells the local RNG when a tick is running, so it's always in */
 	if (tick_ok) {
@@ -1503,6 +1570,25 @@ void lockstep_get_seeds(u32 *game, u32 *tick_local)
 {
 	*game = UUgRandomSeed;
 	*tick_local = g_tick_local_seed;
+}
+
+/* The level loads before the replay starts (session_begin, its first update), and its spawns
+ * are picked then: from the recording's header (reserved: the spawn seed; 0 in recordings made
+ * before it, the pick they were made with) */
+int lockstep_replay_spawn_seed(u32 *seed)
+{
+	RecHeader h;
+	u32 got = 0;
+	HANDLE f;
+
+	if (g_mode != MODE_REPLAY || g_session != SESSION_WAIT) return 0;
+	f = CreateFileA(g_path, 0x80000000 /* GENERIC_READ */, 1, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	ReadFile(f, &h, sizeof h, &got, 0);
+	CloseHandle(f);
+	if (got != sizeof h || h.magic != REC_MAGIC || h.version != REC_VERSION) return 0;
+	*seed = h.reserved;
+	return 1;
 }
 
 void lockstep_set_seeds(u32 game, u32 tick_local)

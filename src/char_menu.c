@@ -1,6 +1,7 @@
 /* Character choice in multiplayer games (F2): a menu over the running game, like the F1 help
  * screen (nothing pauses), with a picture of every character in the roster. The character picked
- * is the one this PC's player changes into at once (or comes back as, if dead).
+ * is the one this PC's player changes into at once in the warm-up, or comes back as at the next
+ * respawn in a match (or if dead).
  *
  * Only on a multiplayer map in a multiplayer game (players.c), in a level, while the pause menu
  * isn't open. While the menu is up this PC's player gets no game input (LIrMode_SetGameInput
@@ -31,8 +32,12 @@
  * choice is that class's number like any other, so the network and replays need nothing new.
  * The picture of a variation is rendered the first time it's shown, with the character's pose.
  *
- * Name: the line under the title is this PC's player's name (mp_names.c); Tab or a click on it
- * starts typing, Enter keeps the new name (saved in Arklite.ini), Esc puts the old one back.
+ * Name: under the title, a text field like the Host dialog's (name_field) with this PC's player's
+ * name (mp_names.c); Tab or a click on it starts typing, Enter keeps the new name (saved in
+ * Arklite.ini), Esc puts the old one back.
+ *
+ * The line under it says what a choice does now: "Playing as: X" where it changes a living player
+ * at once (the warm-up, a game alone), "Next respawn: X" in a match or while dead (players.c).
  *
  * Pictures: rendered once in software, the first time the menu opens, from the class's own
  * data in memory, then kept as textures:
@@ -101,7 +106,9 @@ __declspec(dllimport) u32  WINAPI GetTickCount(void);
 #define WMrCursor_Get           ((u8 *(ONI_FC *)(u32))0x4687d0)          /* ECX type: {type, PSpc} */
 #define PSrPartSpec_Draw        ((void (ONI_FC *)(void *, u32, const float *, u32, u32, u32))0x46a610)   /* ECX partspec, EDX parts, [at], [w], [h], [alpha] */
 #define WM_CURSOR_ARROW         1
-#define PS_MIDDLE_MIDDLE        0x10
+#define PS_MIDDLE_MIDDLE        0x10    /* alone: the middle part stretched over the whole size */
+#define PS_ALL                  0xffff  /* the nine parts: corners, edges, middle */
+#define TAG_PSpc                0x50537063
 
 #define ONCC_BODY(c)            (*(u8 **)((c) + 0xc34))
 #define ONCC_TEXTURES(c)        (*(u8 **)((c) + 0xc38))
@@ -152,6 +159,7 @@ __declspec(dllimport) u32  WINAPI GetTickCount(void);
 #define GREEN   0xff40ff40u
 #define YELLOW  0xffffe040u
 #define GREY    0xffb0b0b0u
+#define ORANGE  0xffff7f00u     /* the menus' titles and labels (255 127 0 in the stock WMDDs) */
 
 static const char g_default_roster[] =
 	"konoko_generic,griffin_generic,muro_generic,barabus,ninja_med_1,striker_med_1,tanker_med_1,"
@@ -226,7 +234,7 @@ static Entry g_roster[MAX_ROSTER];
 static int g_count, g_resolved, g_any_vars;
 static int g_choice = -1;       /* roster index chosen, -1: the map's class */
 static int g_choice_var;        /* its variation */
-static int g_name_y = -1, g_name_h;   /* the name line, from the last draw */
+static int g_name_x, g_name_y = -1, g_name_w, g_name_h;   /* the name's label and field, from the last draw */
 static u8 g_mute[256];          /* keys that typing used: no press or release until they're up */
 static int g_was_editing;
 static int g_open, g_sel, g_saved_input;
@@ -923,7 +931,8 @@ void char_menu_frame(void)
 		}
 	}
 	int hover = -1;
-	int on_name = g_in_window && g_name_y >= 0 && g_my >= g_name_y && g_my < g_name_y + g_name_h;
+	int on_name = g_in_window && g_name_y >= 0 && g_mx >= g_name_x && g_mx < g_name_x + g_name_w &&
+	              g_my >= g_name_y && g_my < g_name_y + g_name_h;
 	if (g_in_window)
 		for (int i = 0; i < g_count; i++) {
 			const Entry *e = &g_roster[i];
@@ -1003,6 +1012,55 @@ static void label(char *out, int i, int v)
 	else fmt(out, "%s", e->label);
 }
 
+static void *part(const char *name)
+{
+	void *p = 0;
+	return TMrInstance_GetDataPtr(TAG_PSpc, name, &p) ? 0 : p;
+}
+
+/* "Name: [Arkl1te   ]" centered at y (the text's top), drawn like the Host dialog's text fields
+ * (mp_menu.c): the box is psui_oniUI's EditField art, ps_oniUI_background, and while typing its
+ * focused art there, ps_oniUI_progressbar_track; the text is the dialogs' orange, the caret a
+ * 2-pixel white bar (ps_white_none_none) after the text. */
+static void name_field(int width, int y, int lh, int pad)
+{
+	static void *art, *focused, *white;
+	static int looked;
+	int editing = mp_name_editing();
+	const char *text = editing ? mp_name_edit_text() : mp_name_local();
+
+	if (!looked) {
+		looked = 1;
+		art = part("ps_oniUI_background");
+		focused = part("ps_oniUI_progressbar_track");
+		white = part("ps_white_none_none");
+		if (!art || !focused || !white) log_msg("char menu: text field art missing, the name is drawn without it");
+	}
+	/* a field as wide as a long name (MP_NAME_MAX - 1 characters), wider if this one is */
+	int label_w = mp_hud_text_width("Name:", -1), space = lh / 2, text_w = mp_hud_text_width(text, -1);
+	int box_w = mp_hud_text_width("Mmmmmmmmmmmmmmmmmmmmmmm", MP_NAME_MAX - 1) + 2 * pad;
+	if (box_w < text_w + 2 * pad + 4) box_w = text_w + 2 * pad + 4;
+	int x = (width - (label_w + space + box_w)) / 2, box_x = x + label_w + space;
+	int box_y = y - pad, box_h = lh + 2 * pad;
+
+	mp_hud_text("Name:", x, y, MP_LEFT, ORANGE);
+	void *box = editing && focused ? focused : art;
+	if (box) {
+		float at[4] = { (float)box_x, (float)box_y, 0.5f, 2.0f };
+		PSrPartSpec_Draw(box, PS_ALL, at, (u32)box_w, (u32)box_h, 255);
+	}
+	mp_hud_text(text, box_x + pad, y, MP_LEFT, ORANGE);
+	if (editing && white && GetTickCount() / 400 & 1) {
+		float at[4] = { (float)(box_x + pad + text_w + 1), (float)y, 0.5f, 2.0f };
+		PSrPartSpec_Draw(white, PS_MIDDLE_MIDDLE, at, 2, (u32)lh, 255);
+	}
+	/* the click that starts typing: the label or the box */
+	g_name_x = x;
+	g_name_y = box_y;
+	g_name_w = box_x + box_w - x;
+	g_name_h = box_h;
+}
+
 /* In the HUD (mp_hud.c), on top of everything else */
 void char_menu_draw(int width, int height)
 {
@@ -1019,8 +1077,10 @@ void char_menu_draw(int width, int height)
 	/* layout: up to 8 columns, cells as tall as fits */
 	int cols = g_count, rows = 1;
 	while (cols > 8) { rows++; cols = (g_count + rows - 1) / rows; }
-	int gap = height / 90 + 2, lines = g_any_vars ? 2 : 1;
-	int top = height / 8 + 4 * lh, bottom = height - height / 10 - 2 * lh;
+	/* the title, the Name field and the choice's line, then the grid */
+	int gap = height / 90 + 2, lines = g_any_vars ? 2 : 1, pad = gap / 3 + 2;
+	int title_y = height / 8, name_y = title_y + lh + gap, choice_y = name_y + lh + pad + gap;
+	int top = choice_y + lh + gap, bottom = height - height / 10 - 2 * lh;
 	int ch = (bottom - top - (rows - 1) * gap) / rows, cw = ch * 5 / 8;
 	if (cols * cw + (cols - 1) * gap > width * 9 / 10) {
 		cw = (width * 9 / 10 - (cols - 1) * gap) / cols;
@@ -1035,27 +1095,18 @@ void char_menu_draw(int width, int height)
 	int y0 = top + (bottom - top - (rows * ch + (rows - 1) * gap)) / 2;
 
 	rect(g_panel, 0, 0, width, height, 170);
-	mp_hud_text("Choose your character", width / 2, top - 4 * lh, MP_CENTER, WHITE);
+	mp_hud_text("Choose your character", width / 2, title_y, MP_CENTER, ORANGE);
+	name_field(width, name_y, lh, pad);
 
-	/* the name: Tab or a click types a new one */
-	g_name_y = top - 3 * lh + gap / 2;
-	g_name_h = lh;
-	if (mp_name_editing()) {
-		fmt(line, "Name: %s%s", mp_name_edit_text(), GetTickCount() / 400 & 1 ? "_" : " ");
-		mp_hud_text(line, width / 2, g_name_y, MP_CENTER, YELLOW);
-	} else {
-		fmt(line, "Name: %s   (Tab or click to change)", mp_name_local());
-		mp_hud_text(line, width / 2, g_name_y, MP_CENTER, WHITE);
-	}
-
+	/* what F2 does now: a match (not the warm-up) changes a living player at the respawn */
 	NetHud h;
 	net_hud(&h);
 	int now = players_can_change(h.state == NETHUD_OFF ? 0 : h.local_char);
 	char chosen[96];
 	if (g_choice >= 0) label(chosen, g_choice, g_choice_var);
 	else str_cpy(chosen, sizeof chosen, "the map's character");
-	fmt(line, now ? "You change at once (%s now)" : "Next respawn: %s", chosen);
-	mp_hud_text(line, width / 2, top - 2 * lh + gap, MP_CENTER, GREEN);
+	fmt(line, now ? "Playing as: %s" : "Next respawn: %s", chosen);
+	mp_hud_text(line, width / 2, choice_y, MP_CENTER, GREEN);
 
 	for (int i = 0; i < g_count; i++) {
 		Entry *e = &g_roster[i];
@@ -1076,8 +1127,7 @@ void char_menu_draw(int width, int height)
 		}
 	}
 	mp_hud_text(mp_name_editing() ? "Type your name   Enter: keep   Esc: cancel" :
-	            g_any_vars ? "Arrows/mouse: pick   Q/E or < >: variation   Enter/click: choose   F2/Esc: close" :
-	            "Arrows or mouse: pick   Enter or click: choose   F2 or Esc: close",
+	            g_any_vars ? "Q/E: variation   Tab: name   F2/Esc: close" : "Tab: name   F2/Esc: close",
 	            width / 2, bottom + lh, MP_CENTER, GREY);
 	if (g_in_window) {   /* the menus' arrow, as WMrCursor_Draw (0x468770) draws it */
 		const u8 *cursor = WMrCursor_Get(WM_CURSOR_ARROW);

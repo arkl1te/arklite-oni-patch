@@ -22,9 +22,10 @@
  * (the two PCs' files differ, net.c). Match (or a two-player game on one PC): the score in the
  * top right corner with the players' names (mp_names.c), this PC's player in yellow, the match's
  * time left under it when it has a time limit (red in the last 30 s), the result once a limit
- * was reached ("Press fire to go back to the lobby"), the name of
+ * was reached ("Press fire to go back to the lobby"), "FIGHT!" for 2 s as a match begins, the name of
  * the player this PC's player faces over their head, and "Out of sync" when a state check failed. The chat
- * (chat.c) in the lower left, in the lobby too. The F2 character menu
+ * (chat.c) in the lower left, in the lobby too. In the warm-up, "Press F2 to change character
+ * and name." at the very top, centered, in the chat hint's plain gray. The F2 character menu
  * (char_menu.c) is drawn last, over all of it.
  *
  * The FPS counter (Options > More...) is here for the same text, but not in the HUD, which is
@@ -62,12 +63,15 @@ __declspec(dllimport) int WINAPI QueryPerformanceFrequency(unsigned long long *)
 #define WHITE   0xffffffffu
 #define YELLOW  0xffffe040u
 #define SHADOW  0xff000000u
+#define HINT_GRAY 0xffa0a0a0u   /* chat.c's "Press ENTER to chat" */
+#define WARMUP_HINT_Y 4        /* the F2 hint's top: above the score and "Out of sync" (24) */
 
 #define FPS_REFRESH_FRAMES 6
 #define MARGIN  24
+#define LINE_GAP 4   /* between the lines in the middle of the screen */
 
 static int g_line_height;         /* on screen, set by corner_begin */
-static int g_scaling;
+static float g_scaling;           /* 0: Oni's own text */
 static float g_anchor_x, g_anchor_y;   /* the line's top-left, which stays put */
 
 /* A string is drawn in pieces (the loop back to 0x42dbd0); every piece is scaled about the same
@@ -78,8 +82,8 @@ static u32 ONI_FC text_sprite(const float *pts, const void *uv)
 	if (!g_scaling) return hud_text_sprite(pts, uv);   /* Oni's text: HUD scale (hud_scale.c) */
 	for (int i = 0; i < 8; i++) p[i] = pts[i];
 	for (int k = 0; k < 8; k += 4) {
-		p[k] = g_anchor_x + (p[k] - g_anchor_x) * TEXT_SCALE;
-		p[k + 1] = g_anchor_y + (p[k + 1] - g_anchor_y) * TEXT_SCALE;
+		p[k] = g_anchor_x + (p[k] - g_anchor_x) * g_scaling;
+		p[k + 1] = g_anchor_y + (p[k + 1] - g_anchor_y) * g_scaling;
 	}
 	return M3rDraw_Sprite(p, uv);
 }
@@ -89,8 +93,8 @@ static u32 ONI_FC text_sprite(const float *pts, const void *uv)
 #define RIGHT  MP_RIGHT
 
 /* One line of text at scale times the font's size; x is its left, center or right edge, y the top
- * of the line, height its height on screen */
-static void text_at(const char *s, int x, int y, int align, u32 color, int scale, int height)
+ * of the line, height the font's line height (unscaled) */
+static void text_at(const char *s, int x, int y, int align, u32 color, float scale, int height)
 {
 	void *ctx = ONgTextContext;
 	short rect[4] = { 0 }, at[2];
@@ -98,21 +102,21 @@ static void text_at(const char *s, int x, int y, int align, u32 color, int scale
 
 	if (!ctx) return;
 	TSrContext_Measure(ctx, s, rect);
-	w = (rect[2] - rect[0]) * scale;
+	w = (int)((rect[2] - rect[0]) * scale + 0.5f);
 	if (align == CENTER) x -= w / 2;
 	else if (align == RIGHT) x -= w;
 	/* the point is the line's bottom at Oni's size, the anchor its top-left */
-	g_scaling = scale > 1;
+	g_scaling = scale != 1.0f ? scale : 0.0f;
 	for (int pass = 0; pass < 2; pass++) {
 		int off = pass ? 0 : TEXT_SCALE;   /* shadow first */
 		g_anchor_x = (float)(x + off);
 		g_anchor_y = (float)(y + off);
 		at[0] = (short)(x + off);
-		at[1] = (short)(y + off + height / scale);
+		at[1] = (short)(y + off + height);
 		TSrContext_SetColor(ctx, pass ? color : SHADOW);
 		TSrContext_Draw(ctx, s, color >> 24, 0, at);   /* the color's alpha: chat.c fades lines */
 	}
-	g_scaling = 0;
+	g_scaling = 0.0f;
 }
 
 /* All of it is in the fine font: Tahoma 14 point as is, set by corner_begin. Without that size
@@ -121,8 +125,24 @@ static int g_fine_height;
 
 static void text(const char *s, int x, int y, int align, u32 color)
 {
-	if (g_fine_height) text_at(s, x, y, align, color, 1, g_fine_height);
-	else text_at(s, x, y, align, color, TEXT_SCALE, g_line_height);
+	if (g_fine_height) text_at(s, x, y, align, color, 1.0f, g_fine_height);
+	else text_at(s, x, y, align, color, TEXT_SCALE, g_line_height / TEXT_SCALE);
+}
+
+/* "FIGHT!" as a match begins (net.c fight_ms): the HUD's bold font (Tahoma 14, the largest Tahoma
+ * Oni has, the chat's size in plain) at FIGHT_SCALE times, centered; it fades out over its last
+ * FIGHT_FADE_MS. Returns the y under it. */
+#define FIGHT_SCALE   1.5f
+#define FIGHT_FADE_MS 500
+
+static int draw_fight(int ms, int width, int y)
+{
+	int base = g_fine_height ? g_fine_height : g_line_height / TEXT_SCALE;
+	float scale = g_fine_height ? FIGHT_SCALE : TEXT_SCALE * FIGHT_SCALE;
+	u32 alpha = ms >= FIGHT_FADE_MS ? 255u : (u32)(ms * 255 / FIGHT_FADE_MS);
+
+	text_at("FIGHT!", width / 2, y, CENTER, alpha << 24 | (WHITE & 0xffffff), scale, base);
+	return y + (int)(base * scale) + LINE_GAP;
 }
 
 /* Between corner_begin and corner_end the context has the fine font; all text drawn or measured
@@ -199,7 +219,6 @@ int mp_hud_text_width(const char *s, int n)
 
 /* The lines in the middle of the screen go one under another from height / 5: each of these
  * draws at y and returns the y under it */
-#define LINE_GAP 4
 
 static int draw_lobby(const NetHud *h, int width, int y)
 {
@@ -222,6 +241,11 @@ static int draw_lobby(const NetHud *h, int width, int y)
 	else
 		fmt(line, "Warm-up: %d of %d players ready (%d needed)", h->ready_count, h->players, h->needed);
 	text(line, x, y, CENTER, WHITE);
+	if (h->punch_me[0] && !h->connected) {   /* net.c "Hole punching" */
+		y += g_line_height + 2;
+		fmt(line, "Host outside your network? It types: /punch %s", h->punch_me);
+		text(line, x, y, CENTER, WHITE);
+	}
 	return y + g_line_height + LINE_GAP;
 }
 
@@ -262,7 +286,7 @@ static u32 players_shown(const NetHud *h)
 	return mask;
 }
 
-/* The score's lines, then the kill feed (obituary.c) under them */
+/* The score's lines in the top right; the kill feed (obituary.c) in the top left */
 static void draw_score(const NetHud *h, int local, int width)
 {
 	char line[64];
@@ -282,7 +306,7 @@ static void draw_score(const NetHud *h, int local, int width)
 		text(line, x, y, RIGHT, left <= 30 ? RED : WHITE);
 		y += g_line_height + 2;
 	}
-	obit_draw(x, y + g_line_height / 2, local);
+	obit_draw(MARGIN, MARGIN, local);
 }
 
 /* The match is over: the result until everyone pressed fire (net.c) */
@@ -366,6 +390,7 @@ static void ONI_FC timer_display(void *timer)
 		text(h.warmup ? "Starting the warm-up..." : "Starting the match...", width / 2, y, CENTER, WHITE);
 		y += g_line_height + LINE_GAP;
 	} else draw_score(&h, h.state == NETHUD_MATCH ? h.local_player : -1, width);
+	if (h.state == NETHUD_MATCH && h.fight_ms > 0 && !h.over) y = draw_fight(h.fight_ms, width, y);
 	if (h.state == NETHUD_MATCH && h.warmup) y = draw_lobby(&h, width, y);
 	if (h.state == NETHUD_MATCH && h.joining == 2) {   /* in sync, its player comes in a moment later */
 		text("Joining the game...", width / 2, y, CENTER, WHITE);
@@ -380,6 +405,10 @@ static void ONI_FC timer_display(void *timer)
 		y += g_line_height + LINE_GAP;
 	}
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING || h.warmup) y = draw_problem(&h, width, y);
+	/* the warm-up's F2 hint at the very top, in the chat hint's style (F2 does nothing while the
+	 * chat or the pause menu has the keyboard) */
+	if (h.state == NETHUD_MATCH && h.warmup && !h.over && !chat_blocking() && !live_menu_open() && !char_menu_open())
+		mp_hud_text_plain("Press F2 to change character and name.", width / 2, WARMUP_HINT_Y, MP_CENTER, HINT_GRAY);
 	chat_draw(width, height);
 	if (h.desynced) {
 		char line[MAX_PATH + 48];

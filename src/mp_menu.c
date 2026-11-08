@@ -4,16 +4,17 @@
  *                 "Start a NEW custom game, or JOIN one through the network!", New, Join, Cancel.
  *                 New is custom_game.c's level list.
  *   Host Game     the Options dialog (152) with its controls hidden and its three frames laid out
- *                 again: Server (Map, Server name, Port), Match (Max players, Max spectators, Time
- *                 limit in minutes, Score limit, a message line; 0 is no limit, a negative score
- *                 limit is reached by suicides) and the third frame holding Host and Dedicate;
- *                 Cancel under it. The values are the last ones used (Arklite.ini [host] name,
- *                 max_players, max_spectators, time_limit, score_limit and [net] port). Dedicate
+ *                 again: Server (Map, Server name, Port), Match (Max players, Time limit in
+ *                 minutes, Score limit, a message line; 0 is no limit, a negative score limit is
+ *                 reached by suicides; spectators have no limit) and the third frame holding Host
+ *                 and Dedicate; Cancel under it. The values are the last ones used (Arklite.ini
+ *                 [host] name, max_players, time_limit, score_limit and [net] port). Dedicate
  *                 (a server without a window) isn't built.
  *   Join Game     the Load Game dialog (151): its frame holds the bookmarked servers in three
- *                 columns (Ping, Name, Players); a second frame under it the selected one's Address
- *                 (typed) and what the server says: Name, Connected, Spectating, its map. Play, Add,
- *                 Remove, Back. Bookmarks are Arklite.ini [servers] count, 1, 2, ...
+ *                 columns (Ping, Name, Players) with + (add) and - (remove) under the list's lower
+ *                 left (small buttons, see below); a second frame under it what the selected server
+ *                 says (Name, Map, Connected with "(N spectating)" when any) and its Address (typed),
+ *                 then a status line. Play, Back. Bookmarks are Arklite.ini [servers] count, 1, 2, ...
  *
  * Oni's UI art is nine-slice (PSpc): a button's corners are 55 + 72 px wide, so a button narrower
  * than 127 px gets its corners squeezed. Buttons stay 130x40 like the stock ones; the dialogs and
@@ -232,9 +233,80 @@ WMtWindow *ui_label(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, const
 	              fit, 0, x, y, w, h);
 }
 
+/* ---- Small buttons -------------------------------------------------------------------------- */
+
+/* An 18x18 button (+, -) can't use the button art: its nine-slice corners are 55 + 72 px wide. It
+ * paints with Oni's own small squares instead, the checkbox's empty box (ps_oniUI_checkbox_off,
+ * one 18x18 slice, so the button must be exactly that size) and, pressed, ps_oniUI_hilite (a
+ * nine-slice). The button class proc (class record +4, shared by every button) is wrapped: for
+ * our buttons it swaps the UI context's button parts around the paint. */
+#define SMALL_BUTTON      18
+#define MAX_SMALL_BUTTONS 4
+#define UI_BUTTON_OFF     0x30   /* UI context: PSUI Button, ButtonOff (default), ButtonOn */
+#define UI_BUTTON_DEFAULT 0x34
+#define UI_BUTTON_ON      0x38
+
+typedef u32 (ONI_FC *WMtProc)(WMtWindow *, u32, u32, u32);
+static WMtWindow *g_small[MAX_SMALL_BUTTONS];
+static int g_nsmall;
+static WMtProc g_buttonProc;
+static void *g_smallOff, *g_smallOn;
+
+static u32 ONI_FC small_button_proc(WMtWindow *w, u32 msg, u32 p1, u32 p2)
+{
+	u8 *ctx;
+	void *saved[3];
+	u32 r;
+	int ours = 0;
+
+	for (int i = 0; i < g_nsmall && !ours; i++) ours = g_small[i] == w;
+	if (!ours || msg != WMcMessage_Paint || !(ctx = ONiUI_GetContext())) return g_buttonProc(w, msg, p1, p2);
+	saved[0] = *(void **)(ctx + UI_BUTTON_OFF);
+	saved[1] = *(void **)(ctx + UI_BUTTON_DEFAULT);
+	saved[2] = *(void **)(ctx + UI_BUTTON_ON);
+	*(void **)(ctx + UI_BUTTON_OFF) = *(void **)(ctx + UI_BUTTON_DEFAULT) = g_smallOff;
+	*(void **)(ctx + UI_BUTTON_ON) = g_smallOn;
+	r = g_buttonProc(w, msg, p1, p2);
+	*(void **)(ctx + UI_BUTTON_OFF) = saved[0];
+	*(void **)(ctx + UI_BUTTON_DEFAULT) = saved[1];
+	*(void **)(ctx + UI_BUTTON_ON) = saved[2];
+	return r;
+}
+
+/* The dialog's small buttons go when it closes */
+static void small_buttons_end(void)
+{
+	g_nsmall = 0;
+}
+
+/* src: a button of the dialog (its class, style and font) */
+static WMtWindow *small_button_add(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *src, const char *text, u32 id, int x, int y)
+{
+	WMtWindow *b;
+	u32 *proc;
+
+	g_smallOff = g_smallOn = 0;   /* looked up again for every dialog: level0 holds them */
+	if (TMrInstance_GetDataPtr(TAG_PSpc, "ps_oniUI_checkbox_off", &g_smallOff)) g_smallOff = 0;
+	if (TMrInstance_GetDataPtr(TAG_PSpc, "ps_oniUI_hilite", &g_smallOn)) g_smallOn = 0;
+	b = ui_add(dialog, anchor, src, 0, ~0u, text, id, x, y, SMALL_BUTTON, SMALL_BUTTON);
+	if (!b) return 0;
+	if (!g_smallOff || !g_smallOn) {
+		log_msg("menu: small button art missing, \"%s\" keeps the stock art", text);
+		return b;
+	}
+	proc = (u32 *)(*(u8 **)((u8 *)b + 0x14) + 4);
+	if (*proc != (u32)small_button_proc) {
+		g_buttonProc = (WMtProc)*proc;
+		*proc = (u32)small_button_proc;
+	}
+	if (g_nsmall < MAX_SMALL_BUTTONS) g_small[g_nsmall++] = b;
+	return b;
+}
+
 /* ---- Edit fields ---------------------------------------------------------------------------- */
 
 #define MAX_FIELDS 8
+#define FIELD_TEXT_RAISE 2   /* px our fields' text (and caret) sit above Oni's baseline */
 enum { FIELD_TEXT, FIELD_NUMBER, FIELD_SIGNED };   /* signed: a '-' may start it */
 typedef struct {
 	WMtWindow *w;
@@ -536,12 +608,18 @@ static void ONI_FC edit_key(WMtWindow *w, u32 key)
 /* The selection is drawn under the text: a white bar, the selected characters dark on it. The
  * field's paint (0x46bb5f) draws its text with one DCrDrawText at {left + 2, baseline}, with the
  * field's font current, left-aligned; pieces of it go at the same baseline. */
-static void ONI_FC edit_draw_text(void *dc, const char *text, u32 rect, short *pos)
+static void ONI_FC edit_draw_text(void *dc, const char *text, u32 rect, short *at_stock)
 {
 	UiField *f = g_painting;
 	char piece[128];
 	int len = str_len(text), lo, hi;
+	short raised[2], *pos = at_stock;
 
+	if (f && pos) {   /* Oni's baseline sits low in the box: ours go FIELD_TEXT_RAISE px up */
+		raised[0] = pos[0];
+		raised[1] = (short)(pos[1] - FIELD_TEXT_RAISE);
+		pos = raised;
+	}
 	if (!f || !g_white || !pos || !field_focused(f) || !field_selection(f, len, &lo, &hi) || len >= (int)sizeof piece) {
 		DCrDrawText(dc, text, rect, pos);
 		return;
@@ -651,6 +729,7 @@ static void ONI_FC caret_position(u32 x, u32 y)
 		u32 ascent = DCrFont_Ascent() & 0xffff, descent = DCrFont_Descent() & 0xffff;
 		WMgCaretHeight = (u16)(ascent + descent);
 		WMgCaretWidth = 2;
+		y -= FIELD_TEXT_RAISE;   /* with the text (edit_draw_text) */
 	}
 	WMrCaret_SetPosition(x, y);
 }
@@ -762,8 +841,7 @@ int mp_menu_choose(void)
 /* ---- Host ----------------------------------------------------------------------------------- */
 
 enum { ID_HOST_GO = 1, ID_HOST_CANCEL = 2, ID_HOST_DEDICATE = 3,
-       ID_HOST_NAME = 120, ID_HOST_PORT, ID_HOST_PLAYERS, ID_HOST_SPECTATORS, ID_HOST_TIME, ID_HOST_SCORE };
-#define MAX_SPECTATORS_SETTING 64
+       ID_HOST_NAME = 120, ID_HOST_PORT, ID_HOST_PLAYERS, ID_HOST_TIME, ID_HOST_SCORE };
 #define HOST_STR(x)  HOST_STR_(x)
 #define HOST_STR_(x) #x
 #define HOST_NOTE "2 to " HOST_STR(NET_PLAYERS_MAX) " players, if the map has room."
@@ -829,41 +907,38 @@ static void host_init(WMtWindow *dialog)
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("net", "port", NET_DEFAULT_PORT, ini_path()), 1, 65535));
 	add_field(dialog, row, row, ID_HOST_PORT, 90, 134, 80, 5, number, FIELD_NUMBER, 1, 65535);
 
-	/* Match: the player limits, the match's time and score limits (0: none; a negative score
-	 * limit is reached by suicides) and the message line */
-	ui_set_frame(frame[1], 5, 187, 300, 133);   /* the frame art needs 93 px (52 + 41 corners) */
+	/* Match: the player limit (spectators have none), the match's time and score limits (0: none;
+	 * a negative score limit is reached by suicides) and the message line */
+	ui_set_frame(frame[1], 5, 187, 300, 110);   /* the frame art needs 93 px (52 + 41 corners) */
 	ui_label(dialog, row, header, "Match", 50, 172, 150, 20, UI_LEFT);
 	ui_label(dialog, row, row, "Max players:", 25, 199, 120, 20, UI_LEFT);
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_players", NET_PLAYERS_MAX, ini_path()), 2, NET_PLAYERS_MAX));
 	add_field(dialog, row, row, ID_HOST_PLAYERS, 150, 199, 60, 1, number, FIELD_NUMBER, 2, NET_PLAYERS_MAX);
-	ui_label(dialog, row, row, "Max spectators:", 25, 222, 120, 20, UI_LEFT);
-	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "max_spectators", 0, ini_path()), 0, MAX_SPECTATORS_SETTING));
-	add_field(dialog, row, row, ID_HOST_SPECTATORS, 150, 222, 60, 2, number, FIELD_NUMBER, 0, MAX_SPECTATORS_SETTING);
-	ui_label(dialog, row, row, "Time limit:", 25, 245, 120, 20, UI_LEFT);
+	ui_label(dialog, row, row, "Time limit:", 25, 222, 120, 20, UI_LEFT);
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "time_limit", 10, ini_path()), 0, NET_TIME_LIMIT_MAX));
-	add_field(dialog, row, row, ID_HOST_TIME, 150, 245, 60, 3, number, FIELD_NUMBER, 0, NET_TIME_LIMIT_MAX);
-	ui_label(dialog, row, row, "minutes", 218, 245, 77, 20, UI_LEFT);
-	ui_label(dialog, row, row, "Score limit:", 25, 268, 120, 20, UI_LEFT);
+	add_field(dialog, row, row, ID_HOST_TIME, 150, 222, 60, 3, number, FIELD_NUMBER, 0, NET_TIME_LIMIT_MAX);
+	ui_label(dialog, row, row, "minutes", 218, 222, 77, 20, UI_LEFT);
+	ui_label(dialog, row, row, "Score limit:", 25, 245, 120, 20, UI_LEFT);
 	fmt(number, "%d", clamp((int)GetPrivateProfileIntA("host", "score_limit", 20, ini_path()), -NET_SCORE_LIMIT_MAX,
 	                        NET_SCORE_LIMIT_MAX));
-	add_field(dialog, row, row, ID_HOST_SCORE, 150, 268, 60, 4, number, FIELD_SIGNED, -NET_SCORE_LIMIT_MAX, NET_SCORE_LIMIT_MAX);
-	ui_label(dialog, row, row, "points", 218, 268, 77, 20, UI_LEFT);
-	g_hostStatus = ui_label(dialog, row, row, HOST_NOTE, 25, 291, 270, 20, UI_LEFT);
+	add_field(dialog, row, row, ID_HOST_SCORE, 150, 245, 60, 4, number, FIELD_SIGNED, -NET_SCORE_LIMIT_MAX, NET_SCORE_LIMIT_MAX);
+	ui_label(dialog, row, row, "points", 218, 245, 77, 20, UI_LEFT);
+	g_hostStatus = ui_label(dialog, row, row, HOST_NOTE, 25, 268, 270, 20, UI_LEFT);
 
 	/* The third frame: Host and Dedicate, full size; Cancel under it */
-	ui_set_frame(frame[2], 5, 325, 300, 95);
+	ui_set_frame(frame[2], 5, 302, 300, 95);
 	/* after "Quality:" like everything else: a window after a frame in the child list is drawn
 	 * under the frame's dark fill and looks disabled */
-	ui_add(dialog, row, close, 0, ~0u, "Host", ID_HOST_GO, 17, 352, BUTTON_W, BUTTON_H);
-	ui_add(dialog, row, close, 0, 0x30000, "Dedicate", ID_HOST_DEDICATE, 163, 352, BUTTON_W, BUTTON_H);
+	ui_add(dialog, row, close, 0, ~0u, "Host", ID_HOST_GO, 17, 329, BUTTON_W, BUTTON_H);
+	ui_add(dialog, row, close, 0, 0x30000, "Dedicate", ID_HOST_DEDICATE, 163, 329, BUTTON_W, BUTTON_H);
 	ui_set_text(close, "Cancel");
-	ui_set_frame(close, WIN_X(close), 430, BUTTON_W, BUTTON_H);
+	ui_set_frame(close, WIN_X(close), 407, BUTTON_W, BUTTON_H);
 
 	for (u32 i = 0; i < n; i++) WMrWindow_SetVisible(hidden[i], 0);
 }
 
 /* The fields, checked and saved; 0 (and why, on the dialog) if one isn't right */
-static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32 *spectators, u32 *minutes, int *score)
+static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32 *minutes, int *score)
 {
 	char value[16];
 	int v;
@@ -880,11 +955,6 @@ static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32
 		return 0;
 	}
 	*players = (u32)v;
-	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_SPECTATORS), &v) || v > MAX_SPECTATORS_SETTING) {
-		host_status("Max spectators: 0 to 64.");
-		return 0;
-	}
-	*spectators = (u32)v;
 	if (!edit_number(WMrDialog_GetItemByID(dialog, ID_HOST_TIME), &v) || v < 0 || v > NET_TIME_LIMIT_MAX) {
 		host_status("Time limit: 0 (none) to 999 minutes.");
 		return 0;
@@ -902,8 +972,7 @@ static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32
 	WritePrivateProfileStringA("net", "port", value, ini_path());
 	fmt(value, "%d", *players);
 	WritePrivateProfileStringA("host", "max_players", value, ini_path());
-	fmt(value, "%d", *spectators);
-	WritePrivateProfileStringA("host", "max_spectators", value, ini_path());
+	WritePrivateProfileStringA("host", "max_spectators", 0, ini_path());   /* an older Arklite's limit goes */
 	fmt(value, "%d", *minutes);
 	WritePrivateProfileStringA("host", "time_limit", value, ini_path());
 	fmt(value, "%d", *score);
@@ -915,7 +984,7 @@ static u8 ONI_FC host_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 {
 	u32 id = p1 & 0xffff, code = p1 >> 16;
 	char name[NET_SERVER_NAME_MAX];
-	u32 port, players, spectators, minutes;
+	u32 port, players, minutes;
 	int score;
 
 	if (msg == WMcMessage_InitDialog) {
@@ -925,11 +994,11 @@ static u8 ONI_FC host_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	if (msg != WMcMessage_Command) return 0;
 	if (code != WMcNotify_Click) return 1;
 	if (id == ID_HOST_GO) {
-		if (!host_read(dialog, name, &port, &players, &spectators, &minutes, &score)) return 1;
-		net_menu_host(port, name, players, spectators, minutes, score);
+		if (!host_read(dialog, name, &port, &players, &minutes, &score)) return 1;
+		net_menu_host(port, name, players, minutes, score);
 		WMrDialog_ModalEnd(dialog, 1);
 	} else if (id == ID_HOST_DEDICATE) {
-		if (!host_read(dialog, name, &port, &players, &spectators, &minutes, &score)) return 1;
+		if (!host_read(dialog, name, &port, &players, &minutes, &score)) return 1;
 		host_status("Dedicated servers aren't built yet.");
 		log_msg("host: Dedicate clicked; dedicated servers aren't built yet");
 	} else if (id == ID_HOST_CANCEL) {
@@ -968,6 +1037,9 @@ enum { ID_JOIN_PLAY = 1, ID_JOIN_BACK = 2, ID_JOIN_ADD = 3, ID_JOIN_REMOVE = 4, 
 #define NO_ANSWER_MS    3000
 #define RESOLVE_WAIT_MS 500    /* after the last key typed in Address */
 #define LAN_TOKEN       0x7fffffffu   /* broadcast questions: the servers on this PC and the network */
+#define LIST_MS         10000  /* the helper's server list (helper.c), asked again this often */
+#define INTRO_MS        3000   /* a server that doesn't answer: the helper introduces this PC to it this often */
+#define HELPED_WAIT_MS  8000   /* ...and once the helper told it, this long before the list says it can't be reached */
 #define MAX_IGNORED     16
 #define TEXT_MAX        256
 
@@ -979,7 +1051,10 @@ typedef struct {
 	u16 port;
 	u32 changed_at, first_ask, last_ask, last_reply;
 	int have_info, have_map;
-	int found;                 /* answered a broadcast; not saved unless its address is edited */
+	int found;                 /* answered a broadcast or came from the server list; not saved unless its address is edited */
+	int listed;                /* came from the server list: info is the list's until the server answers itself */
+	int helper_knows;          /* the helper knows this server (1), doesn't (-1), hasn't said (0) */
+	u32 last_intro, helped_at;
 	NetServerInfo info;
 	char cells[JOIN_COLUMNS][128];   /* what the columns show */
 } Bookmark;
@@ -1002,13 +1077,13 @@ static void list_select(int row)
 	if (g_jlist) WMrMessage_Send(g_jlist, LBcMessage_SetSelection, 0, (u32)row);
 	g_jsel = row;
 }
-static WMtWindow *g_jdialog, *g_address, *g_infoName, *g_infoConnected, *g_infoSpectating, *g_jstatus;
+static WMtWindow *g_jdialog, *g_address, *g_infoName, *g_infoMap, *g_infoConnected, *g_jstatus;
 static char g_shown[4][TEXT_MAX];
 static void *g_joinHookOld;
 static char *g_joinFolder;
 static u32 g_joinFolderSize, *g_joinLevel;
 static u32 g_resolving;            /* the token whose address net.c's thread is looking up, 0: none */
-static u32 g_lastBroadcast;
+static u32 g_lastBroadcast, g_lastList;
 static u32 g_ignored[MAX_IGNORED]; /* found servers removed in this dialog (server ids) */
 static char g_failedFolder[64], g_failedWhy[96];   /* the last map download that stopped, and why */
 static int g_nignored;
@@ -1020,6 +1095,8 @@ static void bookmark_reset(Bookmark *b)
 	b->changed_at = GetTickCount();
 	b->first_ask = b->last_ask = b->last_reply = 0;
 	b->have_info = b->have_map = 0;
+	b->listed = b->helper_knows = 0;
+	b->last_intro = b->helped_at = 0;
 }
 
 static void bookmarks_load(void)
@@ -1064,11 +1141,11 @@ static void bookmark_cells(const Bookmark *b, u32 now, char (*cells)[128])
 	else if (b->have_info && now - b->last_reply < NO_ANSWER_MS + ASK_MS) fmt(cells[0], "%d", b->info.ping_ms);
 	else str_cpy(cells[0], 128, (waiting || !b->resolved) ? "..." : "-");
 
-	if (b->have_info && b->info.same_version && b->info.name[0]) str_cpy(cells[1], 128, b->info.name);
+	if ((b->have_info || b->listed) && b->info.same_version && b->info.name[0]) str_cpy(cells[1], 128, b->info.name);
 	else if (b->address[0]) str_cpy(cells[1], 128, b->address);
 	else str_cpy(cells[1], 128, "(new server)");
 
-	if (b->have_info && b->info.same_version) fmt(cells[2], "%d/%d", b->info.players, b->info.max_players);
+	if ((b->have_info || b->listed) && b->info.same_version) fmt(cells[2], "%d/%d", b->info.players, b->info.max_players);
 	else cells[2][0] = 0;
 }
 
@@ -1093,7 +1170,7 @@ static void show_once(int slot, WMtWindow *w, const char *text)
 static int join_status(const Bookmark *b, u32 now, char *text)
 {
 	if (!b) {
-		str_cpy(text, TEXT_MAX, "Select a server, or Add one.");
+		str_cpy(text, TEXT_MAX, "Select a server, or add one with +.");
 		return 0;
 	}
 	if (!b->address[0]) {
@@ -1104,9 +1181,24 @@ static int join_status(const Bookmark *b, u32 now, char *text)
 		str_cpy(text, TEXT_MAX, "Can't find that address.");
 		return 0;
 	}
+	if (!b->have_info && b->helper_knows > 0) {   /* the helper told the host: it knocks back (helper.c) */
+		str_cpy(text, TEXT_MAX, now - b->helped_at < HELPED_WAIT_MS ? "Reaching the host through the server list..."
+		                                                            : "Can't get through to that host from this network.");
+		return 0;
+	}
 	if (!b->have_info) {
-		str_cpy(text, TEXT_MAX, b->first_ask && now - b->first_ask >= NO_ANSWER_MS ? "No answer: no game hosted there, or a firewall."
-		                                                                          : "Asking the server...");
+		char me[32];
+		if (b->first_ask && now - b->first_ask >= NO_ANSWER_MS && net_my_address(me)) {   /* net.c "Hole punching" */
+			/* the longest wording that fits the line: the address must never be cut */
+			static const char *const forms[] = { "No answer. Host types: /punch %s", "No answer. Host: /punch %s", "/punch %s" };
+			int width = g_jstatus ? WIN_W(g_jstatus) : 375;
+			for (unsigned i = 0; i < sizeof forms / sizeof forms[0]; i++) {
+				fmt(text, forms[i], me);
+				if (ui_text_width(text) <= width) break;
+			}
+		} else
+			str_cpy(text, TEXT_MAX, b->first_ask && now - b->first_ask >= NO_ANSWER_MS ? "No answer: no game hosted there, or a firewall."
+			                                                                          : "Asking the server...");
 		return 0;
 	}
 	if (!b->info.same_version) {
@@ -1129,8 +1221,7 @@ static int join_status(const Bookmark *b, u32 now, char *text)
 		str_cpy(text, TEXT_MAX, "The server is full.");
 		return 0;
 	}
-	str_cpy(text, TEXT_MAX, b->info.in_match ? "Match on, you'll wait for the next: " : "Map: ");
-	str_cpy(text + str_len(text), TEXT_MAX - str_len(text), b->info.map);
+	str_cpy(text, TEXT_MAX, b->info.in_match ? "Match on: you'll wait for the next one." : "Ready: Play joins it.");
 	return 1;
 }
 
@@ -1239,6 +1330,75 @@ static void join_frame(void)
 		g_lastBroadcast = now ? now : 1;
 	}
 
+	/* The helper's server list (helper.c): games outside this network, shown as found ones */
+	if (!g_lastList || now - g_lastList >= LIST_MS) {
+		net_helper_list();
+		g_lastList = now ? now : 1;
+	}
+	while (helper_list_next(&info)) {
+		Bookmark *b = 0;
+		int i;
+		if (ignored(info.server_id)) continue;
+		for (i = 0; i < g_nmarks && !b; i++)
+			if (((g_marks[i].have_info && g_marks[i].info.same_version) || g_marks[i].listed) && g_marks[i].info.server_id == info.server_id)
+				b = &g_marks[i];
+		for (i = 0; i < g_nmarks && !b; i++)
+			if (g_marks[i].resolved == 1 && g_marks[i].addr == info.from_addr && g_marks[i].port == info.from_port) b = &g_marks[i];
+		if (b) {   /* listed already, or answering itself: only what the list knows better */
+			if (!b->have_info) b->info = info, b->listed = 1;
+			continue;
+		}
+		if (g_nmarks >= MAX_BOOKMARKS) continue;
+		{
+			const u8 *ip = (const u8 *)&info.from_addr;
+			b = &g_marks[g_nmarks];
+			memset(b, 0, sizeof *b);
+			bookmark_reset(b);
+			fmt(b->address, "%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ((info.from_port & 0xff) << 8) | (info.from_port >> 8));
+			b->found = b->listed = 1;
+			b->resolved = 1;
+			b->addr = info.from_addr;
+			b->port = info.from_port;
+			b->info = info;
+			b->have_map = info.folder[0] ? custom_game_has_folder(info.folder) : info.level < 127 && TMgLevelValid[info.level];
+			join_add_row(g_nmarks++);
+			if (!sel) {
+				list_select(g_nmarks - 1);
+				join_show_selected();
+				sel = b;
+			}
+		}
+	}
+	/* A server that doesn't answer (or one the list brought): the helper tells it this PC's address
+	 * and it knocks back, opening its NAT; the answer says where it really is */
+	for (int i = 0; i < g_nmarks; i++) {
+		Bookmark *b = &g_marks[i];
+		int quiet = !b->have_info || now - b->last_reply >= NO_ANSWER_MS;
+		if (b->resolved != 1 || !quiet || (!b->listed && (!b->first_ask || now - b->first_ask < 500))) continue;
+		if (b->last_intro && now - b->last_intro < INTRO_MS) continue;
+		net_helper_intro(b->addr, b->port);
+		b->last_intro = now ? now : 1;
+	}
+	{
+		u32 asked, addr;
+		u16 asked_port, port;
+		int known;
+		while (net_helper_intro_ack(&asked, &asked_port, &known, &addr, &port)) {
+			for (int i = 0; i < g_nmarks; i++) {
+				Bookmark *b = &g_marks[i];
+				if (b->resolved != 1 || b->addr != asked || b->port != asked_port) continue;
+				if (known && b->helper_knows <= 0) b->helped_at = now;
+				b->helper_knows = known ? 1 : -1;
+				if (known && !b->have_info && (addr != b->addr || port != b->port)) {   /* a CGNAT host's real port */
+					b->addr = addr;
+					b->port = port;
+					b->last_intro = 0;
+					b->first_ask = 0;
+				}
+			}
+		}
+	}
+
 	while (net_query_poll(&info)) {
 		Bookmark *b = 0;
 		int i;
@@ -1246,7 +1406,17 @@ static void join_frame(void)
 			if (g_marks[i].token == info.token) b = &g_marks[i];
 		/* a broadcast's answer: a server already listed (by its id or its address), or a new one */
 		for (i = 0; i < g_nmarks && !b && info.same_version && info.server_id; i++)
-			if (g_marks[i].have_info && g_marks[i].info.server_id == info.server_id) b = &g_marks[i];
+			if ((g_marks[i].have_info || g_marks[i].listed) && g_marks[i].info.server_id == info.server_id) b = &g_marks[i];
+		if (b && b->listed && b->found && info.token == LAN_TOKEN && (b->addr != info.from_addr || b->port != info.from_port)) {
+			/* a listed game on this network: its own address here (the internet one may not loop back) */
+			const u8 *ip = (const u8 *)&info.from_addr;
+			u32 port = ((info.from_port & 0xff) << 8) | (info.from_port >> 8);
+			if (port == NET_DEFAULT_PORT) fmt(b->address, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+			else fmt(b->address, "%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], port);
+			b->addr = info.from_addr;
+			b->port = info.from_port;
+			b->listed = 0;
+		}
 		for (i = 0; i < g_nmarks && !b; i++)
 			if (g_marks[i].resolved == 1 && g_marks[i].addr == info.from_addr && g_marks[i].port == info.from_port) b = &g_marks[i];
 		if (!b && info.token == LAN_TOKEN && info.same_version && !ignored(info.server_id) && g_nmarks < MAX_BOOKMARKS) {
@@ -1296,10 +1466,11 @@ static void join_frame(void)
 		int known = sel && sel->have_info && sel->info.same_version;
 		if (known) str_cpy(text, sizeof text, sel->info.name);
 		show_once(0, g_infoName, known ? text : "-");
-		if (known) fmt(text, "%d/%d", sel->info.players, sel->info.max_players);
-		show_once(1, g_infoConnected, known ? text : "-");
-		if (known) fmt(text, "%d/%d", sel->info.spectators, sel->info.max_spectators);
-		show_once(2, g_infoSpectating, known ? text : "-");
+		if (known) str_cpy(text, sizeof text, sel->info.map[0] ? sel->info.map : sel->info.folder);
+		show_once(1, g_infoMap, known && text[0] ? text : "-");
+		if (known && sel->info.spectators) fmt(text, "%d/%d (%d spectating)", sel->info.players, sel->info.max_players, sel->info.spectators);
+		else if (known) fmt(text, "%d/%d", sel->info.players, sel->info.max_players);
+		show_once(2, g_infoConnected, known ? text : "-");
 		join_status(sel, now, text);
 		show_once(3, g_jstatus, text);
 	}
@@ -1308,7 +1479,7 @@ static void join_frame(void)
 static void join_init(WMtWindow *dialog)
 {
 	static const char *const headers[JOIN_COLUMNS] = { "Ping", "Name", "Players" };
-	static const char *const rows[4] = { "Address:", "Name:", "Connected:", "Spectating:" };
+	static const char *const rows[4] = { "Name:", "Map:", "Connected:", "Address:" };
 	WMtWindow *lb = WMrDialog_GetItemByID(dialog, 100);
 	WMtWindow *play = WMrDialog_GetItemByID(dialog, ID_JOIN_PLAY);
 	WMtWindow *back = WMrDialog_GetItemByID(dialog, ID_JOIN_BACK);
@@ -1318,8 +1489,9 @@ static void join_init(WMtWindow *dialog)
 	g_jdialog = 0;
 	g_jlist = 0;
 	g_jsel = -1;
+	small_buttons_end();
 	memset(g_shown, 0, sizeof g_shown);
-	g_resolving = g_lastBroadcast = 0;
+	g_resolving = g_lastBroadcast = g_lastList = 0;
 	g_nignored = 0;
 	if (!lb || !play || !back || !outline) {
 		log_msg("join: the Load Game dialog's list, frame or buttons are missing");
@@ -1330,8 +1502,8 @@ static void join_init(WMtWindow *dialog)
 
 	/* The bookmarks: the stock frame (120,10 420x400), now the top 60% */
 	ui_set_frame(outline, 120, 10, 420, 276);
-	/* one list, its rows drawn in three columns: one selection bar across them */
-	ui_list_set_frame(lb, 140, 42, 375, 232);
+	/* one list, its rows drawn in three columns: one selection bar across them; + and - under it */
+	ui_list_set_frame(lb, 140, 42, 375, 208);
 	WIN_STYLE(lb) |= LBcStyle_OwnerDraw;
 	g_jlist = lb;
 	for (int c = 0; c < JOIN_COLUMNS; c++)
@@ -1343,21 +1515,21 @@ static void join_init(WMtWindow *dialog)
 	for (int i = 0; i < 4; i++) {
 		int y = 302 + i * 21;
 		ui_label(dialog, lb, play, rows[i], 140, y, 105, 20, UI_LEFT);
-		if (i == 0) g_address = add_field(dialog, lb, play, ID_JOIN_ADDRESS, 250, y, 265, ADDRESS_MAX - 1, "", FIELD_TEXT, 0, 0);
+		if (i == 3) g_address = add_field(dialog, lb, play, ID_JOIN_ADDRESS, 250, y, 265, ADDRESS_MAX - 1, "", FIELD_TEXT, 0, 0);
 		else values[i] = ui_label(dialog, lb, play, "-", 250, y, 265, 20, UI_LEFT);
 	}
-	g_infoName = values[1];
+	g_infoName = values[0];
+	g_infoMap = values[1];
 	g_infoConnected = values[2];
-	g_infoSpectating = values[3];
 	g_jstatus = ui_label(dialog, lb, play, "", 140, 386, 375, 20, UI_LEFT);
 
-	/* Play, Add, Remove, Back: full size, across the screen */
+	/* + and - (add, remove) at the list's lower left; Play and Back full size, centered */
+	small_button_add(dialog, play, back, "+", ID_JOIN_ADD, 140, 256);
+	small_button_add(dialog, play, back, "-", ID_JOIN_REMOVE, 162, 256);
 	ui_set_text(play, "Play");
-	ui_set_frame(play, 45, 425, BUTTON_W, BUTTON_H);
-	ui_add(dialog, play, back, 0, ~0u, "Add", ID_JOIN_ADD, 185, 425, BUTTON_W, BUTTON_H);
-	ui_add(dialog, play, back, 0, ~0u, "Remove", ID_JOIN_REMOVE, 325, 425, BUTTON_W, BUTTON_H);
+	ui_set_frame(play, 185, 425, BUTTON_W, BUTTON_H);
 	ui_set_text(back, "Back");
-	ui_set_frame(back, 465, 425, BUTTON_W, BUTTON_H);
+	ui_set_frame(back, 325, 425, BUTTON_W, BUTTON_H);
 
 	bookmarks_load();
 	for (int i = 0; i < g_nmarks; i++) join_add_row(i);
@@ -1398,7 +1570,13 @@ static u8 ONI_FC join_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 		}
 		str_cpy(g_joinFolder, g_joinFolderSize, b->info.folder);
 		*g_joinLevel = b->info.level;
-		net_menu_join(b->address);
+		if (b->resolved == 1) {   /* where it answered from (the helper may have found a CGNAT host's real port) */
+			const u8 *ip = (const u8 *)&b->addr;
+			char where[32];
+			fmt(where, "%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ((b->port & 0xff) << 8) | (b->port >> 8));
+			net_menu_join(where);
+		} else
+			net_menu_join(b->address);
 		bookmarks_save();
 		WMrDialog_ModalEnd(dialog, 1);
 	} else if (id == ID_JOIN_ADD) {
@@ -1450,5 +1628,6 @@ int mp_menu_join(char *folder, u32 folder_size, u32 *level)
 	g_jdialog = 0;
 	g_jlist = 0;
 	fields_end();
+	small_buttons_end();
 	return go == 1;
 }

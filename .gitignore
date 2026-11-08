@@ -4,3 +4,4 @@ dist/
 __pycache__/
 ideas.txt
 tools/oni-bench.local.sh
+obituaries.md

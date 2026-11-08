@@ -18,6 +18,22 @@
  * game's. Version 6 adds a seed to the records and sounds: flickers with the same timing but
  * different seeds follow different patterns.
  *
+ * Version 7 adds the id of a Sound object to the sounds. A point or spot light's ambient is a
+ * Sound object (SNDG sphere) Build adds to the level, which stock Oni plays nonstop; a sound record
+ * naming it makes it play only while its flicker fails. update_sphere wraps the play list's call
+ * of the sphere update (0x515120, once a tick): outside a failure the sphere counts as out of
+ * range, its ambient cut at once (its out sound still plays); when a failure starts, the sphere
+ * starts it as usual, at full volume at once instead of fading in over 0.25 s, so it lands on the
+ * flash.
+ *
+ * Version 8 adds the light's id, and with it the ambient's pitch range: before each start the
+ * Sound object's ambient (OSD + 0x50, which Oni only looks up by name while it's null) points at a
+ * private copy of the ambient and its five groups, whose group pitch is the game's times one picked
+ * from SoundPitch..SoundPitchMax. A channel takes its pitch (permutation x group) when a sound
+ * starts on it, so the whole play, in sound to out sound, keeps that pitch. The pick comes from
+ * the flicker's run (or step) and the light's id, not an RNG: every PC, and Catwalk's preview,
+ * picks the same.
+ *
  * In memory (offsets of env_shade and the door lighting, 0x507080):
  *   game state + 0x150 = ONLV, ONLV + 0x40 = AKEV, AKEV + 0x0c = AGQG
  *   AGQG + 0x14 = quad count, + 0x18 = quads, 0x38 bytes each:
@@ -46,8 +62,9 @@ void *memcpy(void *, const void *, unsigned);
 #define QUAD_TRIANGLE       0x40
 
 #define VL_MAGIC   0x4c565743u   /* "CWVL" */
-#define VL_VERSION 6   /* 1: one record per corner; 2: several; 3: min, max, stability, fault;
-                          4: light sounds after the records; 5: their pitch range; 6: seeds */
+#define VL_VERSION 8   /* 1: one record per corner; 2: several; 3: min, max, stability, fault;
+                          4: light sounds after the records; 5: their pitch range; 6: seeds;
+                          7: Sound objects the sounds gate; 8: light ids (ambient pitch) */
 #define VL_V2_SIZE 24  /* bytes per record up to version 2 */
 #define VL_V5_SIZE ((u32)sizeof(Record) - 4)   /* versions 3 to 5 */
 
@@ -89,10 +106,33 @@ typedef struct {     /* as in the file */
 	char  sound[32];
 	float pitch_max;   /* version 5: each play picks from pitch to this */
 	u32   seed;        /* version 6 */
+	u32   object;      /* version 7: id of the Sound object (SNDG) playing the light's ambient,
+	                      which plays only while the flicker fails; 0 = play the impulse sound */
+	u32   light;       /* version 8: the light's object id, which picks an ambient's pitches */
 } SoundRecord;
 
-#define SOUND_V4_SIZE ((u32)sizeof(SoundRecord) - 8)
-#define SOUND_V5_SIZE ((u32)sizeof(SoundRecord) - 4)
+#define SOUND_V4_SIZE ((u32)sizeof(SoundRecord) - 16)
+#define SOUND_V5_SIZE ((u32)sizeof(SoundRecord) - 12)
+#define SOUND_V6_SIZE ((u32)sizeof(SoundRecord) - 8)
+#define SOUND_V7_SIZE ((u32)sizeof(SoundRecord) - 4)
+
+/* Oni's Sound objects (Oni_Sound2.c OSiPlayList_Update_Spheres, OT_Sound.c) */
+#define OSiPlayList_Update_Spheres ((void (ONI_FC *)(u8 *, const float *, const float *))0x515120)
+#define OScPlayList_SphereCall     0x51505f   /* in OSrUpdate's play list loop (0x514f20) */
+#define OBJrSound_GetAmbient       ((u8 *(ONI_FC *)(u8 *))0x4ca3a0)
+#define SSrAmbient_Stop            ((void (ONI_FC *)(u32))0x4823c0)
+#define SSrAmbient_SetVolume       ((void (ONI_FC *)(u32, float, float))0x482000)
+#define SOUND_AMBIENT 0x50   /* Sound object: its SStAmbient (OSD + 0x24), looked up by name while 0 */
+#define AMBIENT_SIZE  0xfc   /* SStAmbient (allocated at 0x481e25) */
+#define AMBIENT_GROUPS 0x44  /* detail, base track 1, base track 2, in sound, out sound */
+#define AMBIENT_GROUP_COUNT 5
+#define PO_OBJECT     0x00   /* OStPlayingObject (0x3c bytes): the Sound object */
+#define PO_PLAY_ID    0x04   /* its ambient's play, -1 for none */
+#define PO_VOLUME     0x08   /* the volume the sphere update worked out */
+#define OBJ_ID        0x04   /* OBJtObject object_id: the id in the level's object list */
+#define AMBIENT_FLAGS 0x24   /* SStAmbient flags (byte); 1 = InterruptTracksOnStop */
+#define AMBIENT_INTERRUPT 0x01
+#define NO_PLAY       0xffffffffu
 
 typedef struct {
 	SoundRecord r;
@@ -101,6 +141,9 @@ typedef struct {
 	int   state;     /* 0: impulse not looked up, 1: ready, -1: the game has none */
 	float group_pitch;   /* the game group's own */
 	u8    group[GROUP_SIZE], impulse[IMPULSE_SIZE];
+	/* an ambient with a pitch: the copy its Sound object plays, its groups, their own pitches */
+	u8    ambient[AMBIENT_SIZE], amb_group[AMBIENT_GROUP_COUNT][GROUP_SIZE];
+	float amb_pitch[AMBIENT_GROUP_COUNT];
 } Sound;
 
 static Sound   g_sounds[MAX_SOUNDS];
@@ -161,15 +204,23 @@ static void load(u32 level, u8 *agqg)
 		if (ReadFile(f, &n, sizeof n, &got, 0) && got == sizeof n)
 			for (u32 i = 0; i < n && i < MAX_SOUNDS; i++) {
 				Sound *s = &g_sounds[g_sound_count];
-				u32 want = head[1] >= 6 ? sizeof s->r : head[1] == 5 ? SOUND_V5_SIZE : SOUND_V4_SIZE;
+				u32 want = head[1] >= 8 ? sizeof s->r : head[1] == 7 ? SOUND_V7_SIZE :
+				           head[1] == 6 ? SOUND_V6_SIZE : head[1] == 5 ? SOUND_V5_SIZE : SOUND_V4_SIZE;
 				if (!ReadFile(f, &s->r, want, &got, 0) || got != want) break;
 				if (head[1] < 5) s->r.pitch_max = s->r.pitch;
 				if (head[1] < 6) s->r.seed = 0;
+				if (head[1] < 7) s->r.object = 0;
+				if (head[1] < 8) s->r.light = 0;
 				s->r.sound[sizeof s->r.sound - 1] = 0;
 				s->started = s->state = 0;
 				g_sound_count++;
 			}
-		if (n) log_msg("vertex light: %d light sound(s) of %d", g_sound_count, n);
+		if (n) {
+			u32 gated = 0;
+			for (u32 i = 0; i < g_sound_count; i++) gated += g_sounds[i].r.object != 0;
+			log_msg("vertex light: %d light sound(s) of %d, %d of them flickering ambients",
+			        g_sound_count, n, gated);
+		}
 	}
 	CloseHandle(f);
 	if (!g_recs) return;
@@ -311,6 +362,7 @@ static void sounds_frame(u32 tick, float seconds)
 		const SoundRecord *r = &s->r;
 		int k = floor_i((seconds + r->offset) / r->period), step = k, due = 1;
 
+		if (r->object) continue;   /* an ambient's Sound object: update_sphere */
 		if (r->mode == MODE_FLICKER) {
 			u32 seed = flicker_seed(r->period, r->offset, r->seed);
 			step = flicker_run(k, r->period, r->fault);
@@ -330,6 +382,100 @@ static void sounds_frame(u32 tick, float seconds)
 	}
 }
 
+/* Whether a light's ambient plays now: while its flicker fails (Stability 0 fails all the time,
+ * and a pulse never does). Catwalk's geometry.flickerFailing is the same. */
+static int sound_gate_open(const SoundRecord *r, float seconds)
+{
+	if (r->mode != MODE_FLICKER || !(r->stability > 0.0f)) return 1;
+	return !run_works(flicker_seed(r->period, r->offset, r->seed),
+	                  flicker_run(floor_i((seconds + r->offset) / r->period), r->period, r->fault),
+	                  r->stability);
+}
+
+static u8 *current_level(void);
+
+/* The pitch a light's ambient starts at now: from SoundPitch to SoundPitchMax, by the flicker's
+ * run (or the step) and the light. Catwalk's geometry.ambientPitch is the same. */
+static float ambient_pitch(const SoundRecord *r, float seconds)
+{
+	int k = floor_i((seconds + r->offset) / r->period);
+	int step = r->mode == MODE_FLICKER ? flicker_run(k, r->period, r->fault) : k;
+	float t = noise(flicker_seed(r->period, r->offset, r->seed) ^ (0x6c8e9cf5u * (r->light + 1)), step);
+	return r->pitch + (r->pitch_max - r->pitch) * t;
+}
+
+/* Points the Sound object at the light's own copy of its ambient, pitched for the start that
+ * comes now. The copy is made from whatever the object plays the first time (the game's). */
+static void pitch_ambient(Sound *s, u8 *obj, float seconds)
+{
+	u8 *amb = OBJrSound_GetAmbient(obj);
+	float p;
+
+	if (!amb) return;
+	if (amb != s->ambient) {
+		memcpy(s->ambient, amb, AMBIENT_SIZE);
+		for (int g = 0; g < AMBIENT_GROUP_COUNT; g++) {
+			u8 **slot = (u8 **)(s->ambient + AMBIENT_GROUPS + 4 * g);
+			if (!*slot) continue;
+			memcpy(s->amb_group[g], *slot, GROUP_SIZE);
+			s->amb_pitch[g] = *(float *)(s->amb_group[g] + GROUP_PITCH);
+			*slot = s->amb_group[g];
+		}
+		*(u8 **)(obj + SOUND_AMBIENT) = s->ambient;
+	}
+	p = ambient_pitch(&s->r, seconds);
+	for (int g = 0; g < AMBIENT_GROUP_COUNT; g++)
+		if (*(u8 **)(s->ambient + AMBIENT_GROUPS + 4 * g))
+			*(float *)(s->amb_group[g] + GROUP_PITCH) = s->amb_pitch[g] * p;
+}
+
+/* The play list's sphere update (ECX the playing object, EDX the listener, then its facing),
+ * for every Sphere sound object once a tick */
+static void ONI_FC update_sphere(u8 *po, const float *listener, const float *facing)
+{
+	u8 *obj = *(u8 **)(po + PO_OBJECT), *gs = ONgGameState;
+	Sound *s = 0;
+	const SoundRecord *r;
+	u32 id, before;
+	float seconds;
+
+	if (obj && gs && current_level())
+		for (u32 i = 0; i < g_sound_count; i++)
+			if (g_sounds[i].r.object && g_sounds[i].r.object == *(u32 *)(obj + OBJ_ID)) {
+				s = &g_sounds[i];
+				break;
+			}
+	if (!s) {
+		OSiPlayList_Update_Spheres(po, listener, facing);
+		return;
+	}
+	r = &s->r;
+	seconds = (float)*(u32 *)(gs + GS_TICK) * (1.0f / 60.0f);
+	if (!sound_gate_open(r, seconds)) {
+		/* as if out of range, but cut now: the light has stopped failing */
+		id = *(u32 *)(po + PO_PLAY_ID);
+		if (id != NO_PLAY) {
+			u8 *amb = OBJrSound_GetAmbient(obj), flags = amb ? amb[AMBIENT_FLAGS] : 0;
+			if (amb) amb[AMBIENT_FLAGS] = flags | AMBIENT_INTERRUPT;   /* only Stop reads it */
+			SSrAmbient_Stop(id);
+			if (amb) amb[AMBIENT_FLAGS] = flags;
+			*(u32 *)(po + PO_PLAY_ID) = NO_PLAY;
+		}
+		return;
+	}
+	before = *(u32 *)(po + PO_PLAY_ID);
+	if (before == NO_PLAY && (r->pitch != 1.0f || r->pitch_max != 1.0f)) pitch_ambient(s, obj, seconds);
+	OSiPlayList_Update_Spheres(po, listener, facing);
+	id = *(u32 *)(po + PO_PLAY_ID);
+	if (before == NO_PLAY && id != NO_PLAY) SSrAmbient_SetVolume(id, *(float *)(po + PO_VOLUME), 0.0f);
+}
+
+void vertex_light_install(void)
+{
+	if (patch_call(OScPlayList_SphereCall, (u32)OSiPlayList_Update_Spheres, (u32)update_sphere))
+		log_msg("vertex light: flickering light ambients patched");
+}
+
 /* Every frame, after the update (live_menu.c's main loop hook) */
 /* The level is going away, even to load again: a level's own sounds (the map's recordings) go with
  * it, and the same level often comes back at the same address, which load() wouldn't notice. A
@@ -341,20 +487,29 @@ void vertex_light_level_end(void)
 	g_agqg = 0;
 }
 
-void vertex_light_frame(void)
+/* The level's quad table, with its vertexlight.bin loaded; 0 outside a level. The sound update
+ * can come before this frame's vertex_light_frame, so both load through here. */
+static u8 *current_level(void)
 {
 	u32 level = ONrLevel_GetCurrent();
 	u8 *agqg = level ? level_agqg() : 0;
-	float seconds;
 
 	if (!agqg) {
-		if (g_recs) drop();
+		if (g_recs || g_sound_count) drop();
 		g_level = 0;
 		g_agqg = 0;
-		return;
+		return 0;
 	}
 	if (level != g_level || agqg != g_agqg) load(level, agqg);
-	if (!g_count && !g_sound_count) return;
+	return agqg;
+}
+
+void vertex_light_frame(void)
+{
+	u8 *agqg = current_level();
+	float seconds;
+
+	if (!agqg || (!g_count && !g_sound_count)) return;
 	seconds = (float)*(u32 *)(ONgGameState + GS_TICK) * (1.0f / 60.0f);
 	sounds_frame(*(u32 *)(ONgGameState + GS_TICK), seconds);
 	for (u32 i = 0; i < g_count; ) {

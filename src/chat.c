@@ -664,6 +664,8 @@ static void help(void)
 		"/idle, /i\ta special idle (most characters have one)",
 		"/spectate\twatch the game without playing (your score goes to 0)",
 		"/join\tplay again after /spectate (your score goes to 0)",
+		"/ip\tyour internet address, for a host outside your network",
+		"/punch address\thost: let in a player outside whose host can't be reached (they tell you their /ip)",
 	};
 	bold_text(info("Commands (taunts, sneeze and idles while standing; any key stops them):", 0, INFO), "Commands");
 	for (unsigned i = 0; i < sizeof rows / sizeof rows[0]; i++) {
@@ -690,7 +692,7 @@ static int command(const char *t)
 
 	if (ieq(cmd, "help") || ieq(cmd, "?")) {
 		help();
-		return 10;
+		return 12;
 	}
 	if (ieq(cmd, "clear")) {
 		g_nmsg = 0;
@@ -736,6 +738,17 @@ static int command(const char *t)
 	if (ieq(cmd, "movelist") || ieq(cmd, "moves")) return move_list(ieq(cmd, "movelist"));
 	if (ieq(cmd, "sneeze")) {
 		emote(PLAYERS_EMOTE_SNEEZE, "sneeze");
+		return 0;
+	}
+	if (ieq(cmd, "ip")) {   /* net.c "Hole punching" */
+		char a[32];
+		if (net_my_address(a)) fmt(line, "Your internet address: %s", a);
+		else str_cpy(line, sizeof line, "Your internet address isn't known (no answer from the STUN server, or not in a network game).");
+		info(line, 0, INFO);
+		return 0;
+	}
+	if (ieq(cmd, "punch")) {
+		info(*args ? net_punch(args) : "Usage: /punch 1.2.3.4:5678 (the address and port the player sees with /ip)", 0, INFO);
 		return 0;
 	}
 	if (ieq(cmd, "spectate") || ieq(cmd, "join")) {

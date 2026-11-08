@@ -77,13 +77,17 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | `[net]` | `host` | 0 | 1: host a network game, as `ARKLITE_HOST=1` does. Set it back to 0 for single player |
 | | `join` | (empty) | `<ip>[:port]`: join that host, as `ARKLITE_JOIN` does. Empty it for single player |
 | | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one. The Host dialog saves its Port here |
+| | `stun`, `stun2` | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | The public STUN servers your game asks for its internet address (`/ip`, `/punch`), every 25 s while it's in a network game; the second one if the first doesn't answer. Empty both to never ask |
+| | `helper` | `51.20.130.46:27780` | The Arklite helper: the server list in Join, and introductions that open a host's router for its players (see below). Empty: none |
+| | `upnp` | 1 | 1: while this PC hosts, ask the router (UPnP) to forward the UDP port to it, and take the forwarding back when hosting stops. 0: don't; forward the port by hand if players on the internet should join |
 | | `record` | 1 | 0: don't record network games to `Arklite-net-host.akr` / `-join.akr`. Only matches of two players with input delay are recorded |
+| `[host]` | `listed` | 1 | 0: your game stays off the server list (players who know your address still get introduced) |
 | | `delay` | 0 | 0: no input delay; the other players' input is predicted and the game corrects itself when the real one arrives (rollback). 1 or more: the input delay in ticks (1/60 s each), and the game waits for the other players' input instead. The host's value is used on every PC |
 | `[host]` | `name` | New Oni multiplayer game | The server's name in other players' Join list (the Host dialog saves it) |
-| | `max_players`, `max_spectators` | 4, 0 | The Host dialog's last values: players 2 to 4, spectators 0 to 64. Matches of 3 or 4 players are untested, and spectators aren't built yet |
+| | `max_players` | 4 | The Host dialog's last value: players 2 to 4 (spectators have no limit). Matches of 3 or 4 players are untested |
 | | `time_limit` | 10 | Minutes a match lasts; 0: no time limit (the Host dialog saves it) |
 | | `score_limit` | 20 | Points that win a match; 0: no score limit. Below 0, e.g. -5: the first player whose score goes down to it wins, by suicides (the Host dialog saves it) |
-| `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by Add and Remove |
+| `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by + and - |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
 | | `characters` | 18 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
@@ -112,16 +116,16 @@ The button asks whether to start a **New** custom game or **Join** one through t
 **New** lists every level in `GameDataFolder/CustomLevels/` plus any installed level whose
 number isn't from the original game, with how many players it has room for (its Player-flagged
 characters, the spawn points); the ones that can be played in multiplayer are blue. **Play** plays it alone. **Host** opens the host settings (map,
-server name, port, max players and spectators; the last ones used are kept) and starts the level
+server name, port, max players; the last ones used are kept; anyone can spectate) and starts the level
 as a network game others can join. A map needs two or more spawn points to be hosted; the list
 says so under it when the selected one hasn't. **Dedicate** (a server without a game window) isn't
 built yet. In the text fields, **Enter** or **Esc** confirms what you typed and leaves the field (Esc doesn't close the screen while you're in a field), and **Tab** goes to the next field. Text is selected as in Windows: **Shift** with the arrows, **Home** and **End** (and **Ctrl** for whole words), a double click selects a word, a triple click everything, **Ctrl+A** too.
 
 **Join** lists your saved servers with their ping, name and players, and adds the games hosted on
 this PC or your local network by itself (those aren't saved unless you edit their address). Select one to see what it
-says about itself (name, players connected, spectators, map) and **Play** to join it; if you don't
-have its map, Play downloads it. **Add** makes a new entry: type its address (`192.168.1.10`, a
-name, and `:port` if it isn't 27777) in **Address**. **Remove** deletes the selected one.
+says about itself (name, map, players connected and how many are spectating) and **Play** to join it; if you don't
+have its map, Play downloads it. **+** (under the list) makes a new entry: type its address (`192.168.1.10`, a
+name, and `:port` if it isn't 27777) in **Address**. **-** deletes the selected one.
 
 **Chat**: in a network game (the lobby, the warm-up and the match), press **Enter** to chat; a
 gray "Press ENTER to chat" says so whenever the match isn't running. A text field
@@ -150,6 +154,8 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `/sneeze` | Konoko sneezes (her rare idle; other characters have none) |
 | `/idle` or `/i` | Plays your character's special idle, one made for its body: Konoko's (also Red, Shinatama), Comguy's (also Griffin, Muro, Thug, Ninjabot), Striker's (also Barabas, Elite, TCTF SWAT), Tanker's. Ninja has none |
 | `/clear` | Empties the chat |
+| `/ip` | Your internet address and port, as the internet sees your game (for a host behind a shared address, see `/punch`) |
+| `/punch 1.2.3.4:5678` | Host: lets in a player from outside your network when they can't reach you. They tell you their address (shown under "Connecting to the host..." or by their `/ip`); your game knocks toward it for 2 minutes |
 | `\/text` | Sends "/text" as a message, not a command |
 
 A taunt first puts your character in its fighting stance (taunts belong to it, as with the taunt key). Taunts, the sneeze and idles play only while you stand, every player sees them, and any key stops
@@ -229,7 +235,12 @@ A game with player 2 is a **multiplayer game**, and in one:
 - **Auto-aim is off**, as it will have to be over the network, where each player sees
   different characters.
 - **Nothing pauses**: the game keeps running behind the pause menu and behind the help and
-  objectives screen (F1), and F1 doesn't turn the sound down.
+  objectives screen (F1), and F1 doesn't turn the sound down. A console's text page opens only
+  for the player who used the console, and the game goes on behind it too.
+- **Esc always works** in a network game, even while the game stands "Waiting for" another
+  player: it opens the pause menu, whose Custom Game button hosts or joins another game (Join
+  can take the same host again). A player who stops answering is dropped after 10 seconds, and
+  a joiner whose host stops answering goes back to its own warm-up.
 - **Players respawn**: 1.5 seconds after dying (`respawn_delay`), a dead player presses an
   attack button (punch, kick or any fire) to come back at a spawn point, with the starting
   health and weapon of their placement. The body stays as a corpse. On custom levels a particle
@@ -243,14 +254,17 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
 
 - **F2 picks your character**: a menu over the running game shows a picture of every character
   you can play. Pick one with the arrow keys or the mouse and choose it with Enter or a click
-  (F2 or Esc closes the menu). You change at once, wherever you are, keeping your health,
-  weapons and items; if you're dead, you come back as that character when you respawn. Every player has 100 health,
+  (F2 or Esc closes the menu). In the warm-up (and alone) you change at once, wherever you are,
+  keeping your health, weapons and items ("Playing as:" under the name). In a match you come
+  back as that character at your next respawn ("Next respawn:"); only the character you chose
+  in the warm-up, or before joining a match in progress, takes over at once as the match starts.
+  If you're dead, you come back as that character when you respawn. Every player has 125 health,
   whatever the character, so a Thug is as tough as a Muro. Your player stands still while the menu is open. The list can be changed
   with `characters` in `[multiplayer]`.
 - **Variations**: most characters have other versions of themselves (Konoko's outfits, the
   Strikers' colors, the thug gangs). Press Q/E (or Page Up/Down), or click the `<  2 / 7  >` line
   under a character, to see them, then choose as usual.
-- **Your name**: the F2 menu shows it under its title. Press Tab or click it, type a new one
+- **Your name**: the F2 menu shows it in a text field under its title. Press Tab or click it, type a new one
   (up to 23 letters), and press Enter to keep it (Esc puts the old one back). It's saved, so
   you keep it next time. The score shows everyone's name, and when you look straight at
   another player, their name appears over their head.
@@ -273,7 +287,7 @@ player 2); the rest aren't spawned, they only mark more spawn points. A map take
 players as it has spawn points (at most 4), so a 4-player map needs at least four. Matches of 3 or 4 players are untested. Each player starts at a random spawn point and respawns at one that no other living
 player is near (the farthest one if every point has someone close). The pick is the same on
 every PC and in every replay. A spawn point gives the position and the facing; the class, team
-and weapon come from the player's own placement, and every player starts with 100 health.
+and weapon come from the player's own placement, and every player starts with 125 health.
 
 The `[players]` settings are in [Settings](#settings).
 
@@ -311,11 +325,16 @@ The host checks this when someone joins: if a joiner's Arklite, Daodan, `daodan.
 gameplay settings, `level0_Final` files or map folder (`GameDataFolder/CustomLevels/<map>`) aren't
 identical to the host's, the joiner stays out of the lobby and both screens say in red what
 differs. Copy that file or folder from one PC to the other and join again.
-When only `level0_Final` differs, a joiner can switch to the host's without restarting Oni. Put a
-copy of the host's `level0_Final.dat` and `level0_Final.raw` in
-`AE/cache/<dat hash>-<raw hash>/`; the joiner's log names the folder it looked in. The level then
-reloads with the host's level 0 until Oni closes. Menus and fonts keep the old file's look until
-then, and after three switches Oni needs a restart.
+When only `level0_Final` differs (two AE installs whose patches didn't come out the same), the
+joiner gets the host's version and switches to it without restarting Oni, the way Unreal
+Tournament fetches a server's packages: the level reloads, its loading box shows the download
+(about 172 MB, Esc cancels), and the files are kept in `AE/cache/<dat hash>-<raw hash>/`, so the
+next game with that version starts at once. Your own `GameDataFolder` files are never written.
+The host's version is only used while you play on that host: when you host or play alone again,
+Oni switches back to your own (through a link to your files in the cache, at the next level
+load). Oni can switch up to three times per run (each keeps about 172 MB of memory); after that
+it stays on the last version until you restart Oni (the log says so). Menus and fonts keep your
+own version's look meanwhile.
 When only the map folder differs, the joiner downloads the host's version instead: the level
 reloads, and its loading box shows `Downloading (files left/files in the map)` and the current
 file's progress and speed. Esc cancels. The joiner's old files go to
@@ -374,7 +393,40 @@ first tab is the **Scoreboard**: the time left (before the match, the time limit
 on top, then every player's name, score and ping to the host. The host is marked, and players who
 left are in blue. Tick **Mute** next to a player to hide their chat messages (until you untick it
 or close Oni). The **Objective** tab says in one sentence how to win the match.
-The host needs UDP port 27777 open (forwarded through the router for a game over the internet).
+The host needs UDP port 27777 open. Over the internet the router must forward it to the host:
+when you host, Arklite asks the router to do that itself (UPnP, most home routers allow it), and
+a line in your chat says how it went and which address players on the internet join with. If it
+says your provider shares the router's address (carrier-grade NAT: the router's internet address
+is 100.64.x.x to 100.127.x.x, or another private one), forwarding can't help, but hole punching
+usually does, and the **Arklite helper** does it for you:
+
+- While you host, your game tells the helper (a small public server, `[net] helper`) what it is,
+  every 15 seconds, and your chat says "Your game is on the server list". Players find it in
+  **Join**, next to the games on their own network.
+- When a player's game can't reach yours, it asks the helper, which tells your game the player's
+  address, and your game knocks toward it: the same as `/punch`, without anyone typing it. A player
+  who typed only your IP is also told your real port (behind a shared address it changes every
+  time Oni starts).
+
+The helper never carries the game itself: once both games reach each other they talk directly.
+If the helper is down, or you set `listed=0` and the player doesn't know your address, punch by
+hand:
+
+1. Your chat shows your internet address when you host (`/ip` shows it again). It changes every
+   time Oni starts. Give it to the player outside your network.
+2. They join it. While your game can't be reached, their Join list says "No answer. Host types:
+   /punch ..." with their address, and in the game "Connecting to the host..." has their address under it.
+3. You type `/punch` with their address in your chat. Both games knock toward each other, each
+   router takes the other's packets for answers, and they're in.
+
+Players on your own network join you as always, by your LAN address. If punching doesn't work (some
+routers and mobile networks don't allow it), ask your provider for a public IPv4 address, use a UDP
+tunnel such as playit.gg, or let a player without that problem host. If the router doesn't answer
+UPnP, forward UDP 27777 to your PC by hand (`upnp=0` under `[net]` stops Arklite asking).
+
+Your PC only takes packets from players in your game: the host gives every address a key that
+only a PC really at that address can read, and ignores packets without it (the log counts them as
+"ignored ... from outside the game"). Received inputs are cleaned of impossible values first.
 A joiner's camera, sound, HUD, laser sight and crosshair follow that joiner's own player.
 
 The logs (`AE/logs/Arklite_<date>_<time>.log`; `Arklite-join_...` for a joiner started with
@@ -382,7 +434,10 @@ The logs (`AE/logs/Arklite_<date>_<time>.log`; `Arklite-join_...` for a joiner s
 compare the game state. `DESYNC` means the games came apart; the log lists this PC's characters at
 that tick, and each PC writes `AE/logs/Arklite-desync-host_<date>_<time>.bin` or `...-join_...`
 (`-join3` for player 3, and so on). `tools/desync_diff.py` compares two of them and prints every
-value that differs. In a two-player match with input delay, each PC also records the whole game to
+value that differs. Each PC also writes `Arklite-desyncticks-host_...` / `...-join_...` (about
+16 MB): the last 256 ticks one by one (every character, both random-number seeds and the inputs
+each tick ran with), and `tools/desync_ticks.py` compares the two PCs' files and names the first
+tick and the values where the games split. In a two-player match with input delay, each PC also records the whole game to
 `AE/Arklite-net-host.akr` or `AE/Arklite-net-join.akr` (a few MB a minute; `record=0` under `[net]`
 turns it off), and `tools/akr_diff.py` compares the two recordings tick by tick and names the first
 tick, value and random-number calls that differ.
@@ -396,7 +451,10 @@ leaves its corpse), the rest play on, and the chat says who left. Their place go
 player who joins. If the host goes, a joiner plays on alone with everyone else standing
 still.
 
-Joining shows your IP address to the host, and hosting shows yours to whoever joins.
+Joining shows your IP address to the host, and hosting shows yours to whoever joins. While you
+host, the server list shows your address, your game's name and map to anyone looking at Join
+(`listed=0` under `[host]` hides it). The helper keeps addresses only in memory, drops a game 45
+seconds after it stops hosting, and logs only counts.
 
 ## Troubleshooting
 

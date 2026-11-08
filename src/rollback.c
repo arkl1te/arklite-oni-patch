@@ -666,11 +666,16 @@ static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid)
 	return -1;   /* EXCEPTION_CONTINUE_EXECUTION: the access runs again, now allowed */
 }
 
+#define POOL_SLOTS        96            /* 6 MB (see "Oni's big blocks during a match") */
+static u8 *g_pool;
+static u32 g_pool_used_max;          /* the most pool slots in use at once this match */
+
 static void rb_start(void)
 {
 	Engine *e = g_e;
 
 	rb_find_oni();
+	if (g_pool) rb_add_oni(g_pool);   /* the pool for Oni's big blocks is game memory too (see "Oni's big blocks") */
 	enumerate();
 	e->nregs = 0;
 	memset(e->flag, 0, PAGES);
@@ -695,16 +700,41 @@ static void rb_start(void)
 			log_msg("rollback: Arklite's .tstate section is missing: its game state won't be rewound");
 		}
 	}
-	/* other threads: two hashes back to back */
+	/* other threads: two hashes back to back. A page that changed between them is another
+	 * thread's too (the sound thread mixing: the match's start sound plays right now), but ticks
+	 * may write game state into it as well (Oni's heap mixes them). Once marked foreign, never
+	 * copied or put back: the Linux host of 2026-11-06 started a match with 26 such pages and
+	 * came apart at tick 7140 (the host's own player 0.386 units off on the joiner); its other
+	 * sessions started with 0 or 1 and stayed in sync. So they're known and shared from the
+	 * start, as a page another thread touches later is: put back only in the dwords ticks
+	 * alone change (tmask, omask). Known pages are never protected, so no new faults. */
 	hash_all(g_h0);
 	hash_all(g_h1);
-	for (u32 i = 0; i < g_nregions; i++)
-		for (u32 p = g_regions[i].base >> PAGE_SHIFT; p < (g_regions[i].base + g_regions[i].size) >> PAGE_SHIFT; p++)
-			if (g_h0[p] != g_h1[p] && (e->flag[p] & PF_CAND)) {
-				e->flag[p] |= PF_FOREIGN;
-				e->nforeign_pages++;
-			}
 	e->npages = e->overflow = 0;
+	{
+		u32 n = 0, logged = 0;
+		for (u32 i = 0; i < g_nregions; i++)
+			for (u32 p = g_regions[i].base >> PAGE_SHIFT; p < (g_regions[i].base + g_regions[i].size) >> PAGE_SHIFT; p++) {
+				if (g_h0[p] == g_h1[p] || !(e->flag[p] & PF_CAND)) continue;
+				if (e->npages >= RB_MAX_PAGES) {
+					e->flag[p] |= PF_FOREIGN;
+					e->nforeign_pages++;
+					continue;
+				}
+				rb_learn(p);
+				e->flag[p] |= PF_SHARED;
+				e->nshared++;
+				n++;
+				if (logged++ < 8) {
+					char near[160];
+					rb_globals_near(p, near);
+					log_msg("rollback: page %08x changed under another thread at the start: shared from the start; Oni.exe "
+					        "globals near:%s", p << PAGE_SHIFT, near[0] ? near : " none");
+				}
+			}
+		if (n) log_msg("rollback: %d page(s) changed by other threads at the start are known and shared (put back where ticks "
+		               "alone write)", n);
+	}
 	for (u32 s = 0; s < RB_SLOTS; s++) e->slot_valid[s] = 0;
 	e->endc_ok = 0;
 	e->nnotes = e->notes_logged = 0;
@@ -731,6 +761,8 @@ static void rb_reset(const char *why)
 	        "dropped, %d broken particle lists cut, ACM memory in known pages %d times, %d freed addresses taken again, %d KB of "
 	        "other heaps dropped", why, g_e->npages, g_e->grown * 4, g_e->freed * 4, g_e->plist_cuts, g_e->acm_hits, g_e->reused,
 	        g_e->heap_pages * 4);
+	if (g_pool) log_msg("rollback: the pool for Oni's big blocks: at most %d of %d slots in use at once this match", g_pool_used_max, POOL_SLOTS);
+	g_pool_used_max = 0;
 	g_e->active = 0;
 	if (g_e->vout && g_e->vout != INVALID_HANDLE_VALUE) CloseHandle(g_e->vout);
 	g_e->vout = 0;
@@ -992,14 +1024,79 @@ static int rb_kept(u32 p)
 #define IAT_VirtualAlloc  0x529060
 #define IAT_HeapFree      0x529164
 #define IAT_VirtualFree   0x52906c
+#define IAT_HeapSize      0x529058
 
 static void *(WINAPI *g_heap_alloc)(HANDLE, u32, u32);
 static void *(WINAPI *g_heap_realloc)(HANDLE, u32, void *, u32);
 static void *(WINAPI *g_virtual_alloc)(void *, u32, u32, u32);
 static int (WINAPI *g_heap_free)(HANDLE, u32, void *);
 static int (WINAPI *g_virtual_free)(void *, u32, u32);
+static u32 (WINAPI *g_heap_size)(HANDLE, u32, const void *);
 static u32 rb_alloc_of(const void *p);
 static void rb_freed(u32 base);
+
+/* ---- Oni's big blocks during a match ------------------------------------------------------- *
+ * A rollback can't undo the heap taking a new segment. The Linux host of 2026-11-08 crashed in
+ * HeapFree (ntdll, writing 032f64f4) while the level unloaded after a match: at tick 11153 Oni's C
+ * runtime heap took a new 64 KB segment (032e0000) for a 50000-byte particle block (0x455d00); a
+ * rollback put the heap's own bookkeeping back to before that tick, so the heap no longer knew the
+ * segment, and the re-run took another one (032f0000, logged at the same tick). From then on the
+ * heap's lists didn't match its memory, and freeing everything at the unload went through them.
+ * (Growing the heap before the match doesn't work under Wine: a block shrunk in place keeps its
+ * room, and an emptied segment is given back.)
+ * So while the engine runs, the main thread's HeapAlloc of POOL_MIN..POOL_SLOT bytes on Oni's
+ * heap takes a slot of Arklite's pool instead: POOL_SLOTS slots of POOL_SLOT bytes, allocated once
+ * and never freed, game memory like Oni's (rb_start). Which slots are taken, and how big each
+ * block is, is tick state (.tstate): a rollback puts it back with the blocks' contents, and the
+ * heap itself never changes for them. HeapFree, HeapReAlloc and HeapSize know a slot's address
+ * (any thread, any time, after the match too: the level's unload frees them). A full pool falls
+ * back to the heap, logged. */
+#define POOL_SLOT         0x10000
+#define POOL_MIN          0x4000
+#define HEAP_ZERO_MEMORY  0x08
+#define HEAP_REALLOC_IN_PLACE_ONLY 0x10
+
+static u32 g_pool_size[POOL_SLOTS] TICK_STATE;   /* the block's bytes, 0: free */
+static u32 g_pool_full_logs, g_pool_logs;
+
+/* Its slot if p is a pool block, -1 if not the pool's at all */
+static int pool_slot(const void *p)
+{
+	u32 o = (u32)p - (u32)g_pool;
+	if (!g_pool || (u32)p < (u32)g_pool || o >= POOL_SLOTS * POOL_SLOT || (o & (POOL_SLOT - 1))) return -1;
+	return (int)(o / POOL_SLOT);
+}
+
+/* any: a block of any size up to a slot (one that made the heap grow, rb_heap_alloc) */
+static void *pool_alloc(HANDLE h, u32 flags, u32 n, int any)
+{
+	Engine *e = g_e;
+	u32 used = 0;
+	int free_slot = -1;
+	/* only inside a tick: its slot table is rewound to a tick's start, so a block taken between
+	 * ticks would be forgotten by a rollback while still in use (one freed between ticks is only
+	 * kept: a leak, not a clash) */
+	if (!g_pool || h != ONgCrtHeap || (n < POOL_MIN && !any) || !n || n > POOL_SLOT || !e || !e->active || !e->in_body ||
+	    GetCurrentThreadId() != e->main_tid)
+		return 0;
+	for (int i = 0; i < POOL_SLOTS; i++) {
+		if (g_pool_size[i]) used++;
+		else if (free_slot < 0) free_slot = i;
+	}
+	if (free_slot < 0) {
+		if (g_pool_full_logs++ < 4)
+			log_msg("rollback: tick %d: the pool for Oni's big blocks is full (%d): a %d-byte block comes from the heap, which may "
+			        "grow during the match", e->last_tick, POOL_SLOTS, n);
+		return 0;
+	}
+	if (used + 1 > g_pool_used_max) g_pool_used_max = used + 1;
+	if (g_pool_logs < 4 && ++g_pool_logs)
+		log_msg("rollback: tick %d: Oni's %d-byte block from the pool (slot %d, %d in use)", e->last_tick, n, free_slot, used + 1);
+	g_pool_size[free_slot] = n;
+	u8 *p = g_pool + free_slot * POOL_SLOT;
+	if (flags & HEAP_ZERO_MEMORY) memset(p, 0, n);
+	return p;
+}
 
 static void rb_new_memory(const void *p, u32 n)
 {
@@ -1010,18 +1107,69 @@ static void rb_new_memory(const void *p, u32 n)
 	e->grow = 1;
 }
 
+/* In a tick, the heap gave memory it didn't have before (a new segment, or more of one committed) */
+static int rb_heap_grew(const void *p, u32 n)
+{
+	Engine *e = g_e;
+	if (!p || !n || !e || !e->active || !e->in_body || GetCurrentThreadId() != e->main_tid) return 0;
+	return !(e->flag[(u32)p >> PAGE_SHIFT] & PF_CAND) || !(e->flag[((u32)p + n - 1) >> PAGE_SHIFT] & PF_CAND);
+}
+
+static u32 g_grow_logs;
+
 static void *WINAPI rb_heap_alloc(HANDLE h, u32 flags, u32 n)
 {
-	void *p = g_heap_alloc(h, flags, n);
+	void *p = pool_alloc(h, flags, n, 0), *q;
+	if (p) return p;
+	p = g_heap_alloc(h, flags, n);
+	/* the heap grew for it: given back at once (the heap as it was), and a pool slot instead. Any
+	 * size: the bot test of 2026-11-08 grew the heap at tick 4428 with no 16-64 KB block at all */
+	if (h == ONgCrtHeap && rb_heap_grew(p, n) && (q = pool_alloc(h, flags, n, 1))) {
+		u32 at = (u32)p;
+		g_heap_free(h, 0, p);
+		if (g_grow_logs++ < 8)
+			log_msg("rollback: tick %d: a %d-byte block of Oni's would have made its heap grow (at %08x): given back, from the "
+			        "pool instead", g_e->last_tick, n, at);
+		return q;
+	}
+	if (h == ONgCrtHeap && rb_heap_grew(p, n) && g_grow_logs++ < 8)
+		log_msg("rollback: tick %d: a %d-byte block of Oni's made its heap grow (at %08x) and the pool can't take it: a rollback "
+		        "past this tick may break the heap", g_e->last_tick, n, (u32)p);
 	rb_new_memory(p, n);
 	return p;
 }
 
 static void *WINAPI rb_heap_realloc(HANDLE h, u32 flags, void *old, u32 n)
 {
+	int slot = pool_slot(old);
+	if (slot >= 0) {   /* a pool block: in its slot while it fits, else to the heap */
+		u32 had = g_pool_size[slot];
+		void *p;
+		if (n <= POOL_SLOT) {
+			if ((flags & HEAP_ZERO_MEMORY) && n > had) memset((u8 *)old + had, 0, n - had);
+			g_pool_size[slot] = n ? n : 1;
+			return old;
+		}
+		if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return 0;
+		if (!(p = g_heap_alloc(h, flags & ~HEAP_ZERO_MEMORY, n))) return 0;
+		memcpy(p, old, had);
+		if (flags & HEAP_ZERO_MEMORY) memset((u8 *)p + had, 0, n - had);
+		g_pool_size[slot] = 0;
+		rb_new_memory(p, n);
+		return p;
+	}
 	u32 base = rb_alloc_of(old);
-	void *p = g_heap_realloc(h, flags, old, n);
+	void *p = g_heap_realloc(h, flags, old, n), *q;
 	rb_freed(base);
+	if (h == ONgCrtHeap && rb_heap_grew(p, n) && (q = pool_alloc(h, flags, n, 1))) {   /* as in rb_heap_alloc */
+		u32 at = (u32)p;
+		memcpy(q, p, n);
+		g_heap_free(h, 0, p);
+		if (g_grow_logs++ < 8)
+			log_msg("rollback: tick %d: resizing a block of Oni's to %d bytes would have made its heap grow (at %08x): given "
+			        "back, from the pool instead", g_e->last_tick, n, at);
+		return q;
+	}
 	rb_new_memory(p, n);
 	return p;
 }
@@ -1084,8 +1232,19 @@ static void rb_freed(u32 base)
 	if (base && !rb_alloc_alive(base)) rb_forget(base);
 }
 
+static u32 WINAPI rb_heap_size(HANDLE h, u32 flags, const void *p)
+{
+	int slot = pool_slot(p);
+	return slot >= 0 ? g_pool_size[slot] : g_heap_size(h, flags, p);
+}
+
 static int WINAPI rb_heap_free(HANDLE h, u32 flags, void *p)
 {
+	int slot = pool_slot(p);
+	if (slot >= 0) {
+		g_pool_size[slot] = 0;
+		return 1;
+	}
 	u32 base = rb_alloc_of(p);
 	int r = g_heap_free(h, flags, p);
 	rb_freed(base);
@@ -1138,6 +1297,13 @@ static void rb_hook_alloc(void)
 	rb_hook_iat(IAT_HeapReAlloc, (const u8 *)0x51fd88, (void *)rb_heap_realloc, (void **)&g_heap_realloc);
 	rb_hook_iat(IAT_VirtualAlloc, (const u8 *)0x524515, (void *)rb_virtual_alloc, (void **)&g_virtual_alloc);
 	rb_hook_iat(IAT_HeapFree, (const u8 *)0x51fc1c, (void *)rb_heap_free, (void **)&g_heap_free);
+	rb_hook_iat(IAT_HeapSize, (const u8 *)0x52521e, (void *)rb_heap_size, (void **)&g_heap_size);
+	/* the pool only works when every heap call Oni makes knows it */
+	if (g_heap_alloc && g_heap_realloc && g_heap_free && g_heap_size)
+		g_pool = VirtualAlloc(0, POOL_SLOTS * POOL_SLOT, 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
+	log_msg(g_pool ? "rollback: Oni's big blocks (%d-%d KB) come from Arklite's pool during a match (%d slots): its heap never "
+	                 "grows then" : "rollback: no pool for Oni's big blocks: its heap may grow during a match",
+	        POOL_MIN / 1024, POOL_SLOT / 1024, POOL_SLOTS);
 	if (code_matches(0x5240aa, (const u8[]){ 0x8b, 0x3d }, 2) && *(const u32 *)0x5240ac == IAT_VirtualFree) {
 		g_virtual_free = *(void **)IAT_VirtualFree;
 		void *hook = (void *)rb_virtual_free;

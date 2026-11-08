@@ -13,3 +13,7 @@ EXPORTS
   ntohs@4
   gethostbyname@4
   setsockopt@20
+  connect@12
+  send@16
+  recv@16
+  getsockname@12

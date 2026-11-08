@@ -1,0 +1,6 @@
+# Maps that tools/release-maps.sh zips and uploads to the "maps" release, one folder name per line
+# (folders of GameDataFolder/CustomLevels).
+Condemned
+StalwartXL
+Versus
+PowerPlant

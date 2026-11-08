@@ -109,6 +109,7 @@ static void process_level_classes(void)
 static u32 ONI_FC level_begin_hook(u32 ecx, u32 edx)
 {
 	respawn_fx_load(ecx);
+	players_level_begin();
 	process_level_classes();
 	u32 result = ONrLevelBegin(ecx, edx);
 	SSrAmbient_UpdateGroupPointers();

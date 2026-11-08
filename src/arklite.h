@@ -165,6 +165,7 @@ void rollback_keep(const void *p, u32 n); /* memory a rewind never puts back (HU
 #define ROLLBACK_KEPT_TICKS 12            /* RB_SLOTS: how far back the game can go */
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
+int  lockstep_replay_spawn_seed(u32 *seed);   /* replaying: the recording's spawn seed (1), else 0 */
 int lockstep_impulses_mute(int muted);    /* rollback re-runs ticks: only new one-shot sounds play (1), else off (0) */
 /* net.c's recording of a networked game (same format, player 2's record per tick) */
 int  lockstep_net_record_begin(u32 level, const char *path);
@@ -184,7 +185,7 @@ int  net_synced(void);   /* in a session every PC runs the same (warm-up or matc
 #define NET_SERVER_NAME_MAX 48
 void net_menu_local(void);     /* Play (a mode set at startup stays) */
 /* time_limit in minutes, score_limit in points (below 0: reached going down); 0: none */
-void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectators, u32 time_limit, int score_limit);
+void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit);
 #define NET_PLAYERS_MAX     4      /* the Host dialog's Max players: 2 to this */
 #define NET_TIME_LIMIT_MAX  999
 #define NET_SCORE_LIMIT_MAX 999
@@ -239,6 +240,8 @@ typedef struct {
 	int over_left_ms;          /* until everyone goes back to the lobby anyway */
 	int joining;               /* joiner: 1 catching up with the session in progress, 2 in sync, not in the game yet */
 	int joining_pct;           /* joining 1: how far (0..100) */
+	int fight_ms;              /* match (not warm-up) just began on this PC: "FIGHT!" this much longer */
+	char punch_me[32];         /* joiner, the host silent: this PC's internet address, for the host's /punch ("" none) */
 } NetHud;
 /* What differs between the two PCs, so the host doesn't let the joiner in */
 enum {
@@ -250,6 +253,41 @@ void net_hud(NetHud *h);
 int  net_watching(void);         /* this PC's player watches: the player it shows, -2 free flight; -1 not watching */
 u8  *net_swapped_konoko(void);   /* Konoko while the joiner's display runs with player 2 in gs+0xac, else 0 */
 const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
+
+/* ---- upnp.c ------------------------------------------------------------------------------ */
+
+void upnp_start(u16 port);              /* host: ask the router to forward UDP port here (its own thread; [net] upnp=0: off) */
+void upnp_stop(void);                   /* the forwarding taken back (waits up to 2 s for the router) */
+const char *upnp_take_message(void);    /* the outcome, once, for the host's chat; 0: nothing new */
+
+/* ---- stun.c ------------------------------------------------------------------------------ */
+
+void stun_reset(void);                  /* a new socket: ask again at once */
+void stun_frame(u32 sock, u32 now);     /* each frame the socket is open: asks every 25 s ([net] stun, stun2) */
+int  stun_packet(const u8 *p, u32 n, const void *from);   /* 1: a STUN server's answer, taken */
+int  stun_text(char *out);              /* this socket's internet address "a.b.c.d:port" (0, "": not known) */
+int  stun_take_change(void);            /* 1 once after it became known or changed */
+
+/* Hole punching (net.c): /ip and /punch */
+int  net_my_address(char *out);         /* this PC's game (or Join list) socket's internet address; 0 if not known */
+/* helper.c: the server list and introductions ([net] helper) */
+void helper_set_proto(u16 proto);
+int  helper_on(void);                  /* [net] helper names one */
+void helper_frame(u32 sock, u32 now);   /* each frame the socket is open: its key */
+int  helper_packet(u32 sock, const u8 *p, u32 n, const void *from);   /* 1: the helper's, taken */
+int  helper_beat_due(u32 sock, u32 now);   /* host: then helper_beat */
+void helper_beat(u32 sock, const NetServerInfo *game);
+int  helper_take_news(void);           /* host: 1 listed, 0 refused, 2 silent, 3 hidden; -1 nothing new */
+int  helper_take_intro(u32 *addr, u16 *port);   /* host: a player to knock toward */
+void helper_list(u32 sock);            /* the Join list: ask for the list from the first page */
+int  helper_list_next(NetServerInfo *out);   /* a game on it (from_addr/from_port its address) */
+void helper_intro(u32 sock, u32 addr, u16 port);   /* introduce this socket to that host */
+int  helper_intro_ack(u32 sock, u32 *asked_addr, u16 *asked_port, int *known, u32 *addr, u16 *port);
+void helper_closed(u32 sock);
+void net_helper_list(void);            /* the Join list's socket: helper_list */
+void net_helper_intro(u32 addr, u16 port);   /* ...helper_intro */
+int  net_helper_intro_ack(u32 *asked_addr, u16 *asked_port, int *known, u32 *addr, u16 *port);   /* ...its answers */
+const char *net_punch(const char *address);   /* host: knock toward that player for a minute; what to tell the user */
 
 /* ---- mp_menu.c --------------------------------------------------------------------------- */
 
@@ -396,6 +434,7 @@ void respawn_fx_level0_changed(void);  /* its base classes come from the new lev
 void level0_swap_install(void);
 char *level0_swap_ref(char *ref);      /* the file to open for a level file table entry */
 int  level0_swap(const char *dir);     /* with no level loaded: level 0 from dir (level0_swap.c) */
+int  level0_swaps(void);              /* swaps done in this Oni session */
 int  char_menu_open(void);     /* the F2 menu is up: this PC's player gets no input */
 void hud_textures_prepare(void);   /* net.c, before rollback starts: the HUD's textures made */
 u8  *hud_solid(u16 argb1555, const char *name);   /* an 8x8 texture of one color (kept until Oni exits) */
@@ -416,6 +455,9 @@ void players_net_frame(const u32 (*records)[6][12], u32 n);   /* networked: slot
 void players_set_count(u32 n);                /* players spawned at the next level load (2 by default) */
 u32  players_count(void);
 int  players_spawn_points(void);              /* the level's Player-flagged placements */
+void players_set_spawn_seed(u32 seed);        /* the next level load's spawn picks (net.c: the host's, on every PC) */
+u32  players_spawn_seed(void);                /* this level's (lockstep.c keeps it in a recording) */
+void players_level_begin(void);               /* particle_table.c: a level loads, its spawns get a new seed */
 u8  *players_char(int who);                   /* slot who's character, or 0 */
 void players_note_hit(u8 *victim, u8 *attacker, u32 owner);   /* from TakeDamage, in a tick */
 int  players_can_change(int who);            /* alive: an F2 choice applies at once */
@@ -447,7 +489,7 @@ u8  *obit_weapon_class(u8 *c);                 /* the ONWC of the weapon c holds
 void obit_add(int killer, int victim, int kind, u8 *weapon);   /* in a tick; killer -1: nobody */
 void obit_reset(void);
 void obit_textures_prepare(void);              /* hud_textures_prepare: before rollback starts */
-void obit_draw(int x, int y, int local);       /* from the HUD: lines from y down, right edge x */
+void obit_draw(int x, int y, int local);       /* from the HUD: lines from y down, left edge x */
 
 /* ---- mp_rules.c -------------------------------------------------------------------------- */
 
@@ -481,12 +523,14 @@ void live_menu_request(void);  /* open it after this frame's update */
 void live_menu_close(void);    /* end every live dialog (as Esc does), before a level reload */
 /* WMrDialog_ModalBegin for every dialog (lockstep.c wraps the calls): in a multiplayer game a
  * dialog outside a tick runs with the game going on behind it, one inside a tick isn't shown */
+int  lockstep_in_tick(void);   /* lockstep.c: inside a tick, on its thread */
 u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick);
 
 /* ---- vertex_light.c ---------------------------------------------------------------------- */
 
 void bench_frame(void);           /* every frame: ARKLITE_BENCH timing (bench.c) */
 void vertex_light_level_end(void);   /* from any level unload */
+void vertex_light_install(void);     /* flickering lights' ambients play only while they fail */
 void vertex_light_frame(void);   /* every frame: animated corners of a custom level (vertexlight.bin) */
 void spin_particle_frame(void);  /* every frame: particles in a custom level's spinning groups (spin_particle.c) */
 

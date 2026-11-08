@@ -154,7 +154,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    NET_DEFAULT_PORT
-#define PROTO           18
+#define PROTO           19
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -171,6 +171,8 @@ typedef unsigned long long u64;
 #define CHAT_QUEUE      16
 #define COUNTDOWN_MS    7000
 #define WARM_WAIT_MS    1500         /* a new player: this long for anyone coming along, then the reload */
+#define RELOAD_EVERY_MS 60000        /* ...but one PC gets the warm-up reloaded for it once in this long (a PC that keeps
+                                       failing to catch up, or a hostile one, would otherwise restart everyone's game) */
 #define HIST_BYTES      (64u << 20)  /* the session's inputs kept for players joining it: 64 MB, about 97 minutes */
 #define HIST_TICK       (NPL * 12)   /* u32 per tick: every player's input */
 #define HIST_REQ_TICKS  600          /* a joiner asks for this many ticks at once... */
@@ -181,6 +183,8 @@ typedef unsigned long long u64;
 #define CATCHUP_US      25000        /* a catching-up frame runs ticks this long, then draws */
 #define LIVE_GAP        60           /* caught up: within this many ticks of the host's inputs */
 #define JOIN_GAP        20           /* comes in: its inputs and its acknowledgements this near the host's ticks */
+#define JOIN_STEADY     30           /* ...for this many of the host's ticks in a row, after this many live ticks of its own */
+#define JOIN_QUIET_MS   150          /* ...and nothing from it for longer than this (a PC that hitched isn't near) */
 #define PROBLEM_MS      2000         /* a refusal stays on screen this long after the last one */
 #define FIXING_MS       30000        /* host: a joiner refused for level0 or the map alone fixes it itself (cache swap,
                                        download, a reload each); the refusal shows only when it lasts longer */
@@ -229,6 +233,9 @@ __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
 __declspec(dllimport) int  WINAPI VirtualFree(void *, u32, u32);
 __declspec(dllimport) int  WINAPI CreateDirectoryA(const char *, void *);
 __declspec(dllimport) int  WINAPI MoveFileExA(const char *, const char *, u32);
+__declspec(dllimport) int  WINAPI CreateHardLinkA(const char *, const char *, void *);
+__declspec(dllimport) int  WINAPI CopyFileA(const char *, const char *, int);
+__declspec(dllimport) u32  WINAPI GetLastError(void);
 __declspec(dllimport) int  WINAPI RemoveDirectoryA(const char *);
 __declspec(dllimport) int  WINAPI DeleteFileA(const char *);
 __declspec(dllimport) u32  WINAPI SetFilePointer(HANDLE, int, int *, u32);
@@ -239,6 +246,9 @@ __declspec(dllimport) int  WINAPI DispatchMessageA(const void *);
 __declspec(dllimport) void WINAPI PostQuitMessage(int);
 __declspec(dllimport) int  WINAPI setsockopt(u32, int, int, const void *, int);
 __declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(void *), void *, u32, u32 *);
+__declspec(dllimport) HANDLE WINAPI LoadLibraryA(const char *);
+__declspec(dllimport) void * WINAPI GetProcAddress(HANDLE, const char *);
+__declspec(dllimport) u32  WINAPI GetCurrentThreadId(void);
 #ifndef ARKLITE_SRC_HASH
 #define ARKLITE_SRC_HASH 0   /* build.sh: a hash of the source, the same for every build of it */
 #endif
@@ -250,11 +260,17 @@ __declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(voi
 
 enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY, PKT_NAME,
        PKT_MAP_LIST_REQ, PKT_MAP_LIST, PKT_MAP_REQ, PKT_MAP_DATA, PKT_INFO_REQ, PKT_INFO,
-       PKT_CHAT, PKT_CHAT_ACK, PKT_END, PKT_NAMES, PKT_HIST_REQ, PKT_HIST };
+       PKT_CHAT, PKT_CHAT_ACK, PKT_END, PKT_NAMES, PKT_HIST_REQ, PKT_HIST, PKT_COOKIE };
 
 #define NPL             NET_PLAYERS_MAX
 
-typedef struct { u32 magic; u16 proto; u8 type, pad; } PktHead;
+/* key (protocol 19): the receiver's address proves the packet is from the PC playing there. The
+ * host gives each address its cookie (cookie_of: a keyed hash of IP and port, with a secret made
+ * at random when it opens its port); a PC can only learn the cookie of an address where it reads
+ * packets. Every packet from a joiner or a map download carries it, and every packet the host sends
+ * one carries it back, so a stranger who writes someone else's address on its packets (UDP lets
+ * anyone do that) can't take a place, speak for a player or answer for the host. See "Strangers". */
+typedef struct { u32 magic; u16 proto; u8 type, pad; u32 key; } PktHead;
 #define NFILES 4
 /* What every PC must have the same of (see g_file_names) */
 typedef struct {
@@ -358,7 +374,7 @@ typedef struct {
 typedef struct {
 	PktHead h;
 	u32 token, sent;
-	u32 level, players, max_players, spectators, max_spectators;
+	u32 level, players, max_players, spectators, max_spectators;   /* max_spectators: always 0, no limit (kept: the helper's layout) */
 	u32 in_match;          /* the match is on: a joiner waits in its lobby until the next one */
 	u32 server_id;         /* random per hosting: the same server reached at two addresses */
 	char name[NET_SERVER_NAME_MAX];   /* the server's, Host dialog */
@@ -412,7 +428,11 @@ typedef struct {
 	int rejoin;            /* host: a gone player, back in its lobby: plays from the next reload */
 	int joining;           /* host: joins the session in progress: 1 catching up, 2 in sync (gets inputs), not in yet */
 	int no_catchup;        /* host: its replay came out differently: it waits for the next reload */
+	int reload_held;       /* host: it wants in again within RELOAD_EVERY_MS: said once that it waits */
 	u32 spect_gen;         /* host, joining 2: it sent its own inputs up to here (none count before it's in) */
+	u32 live_from;         /* host, joining 2: its first live tick */
+	u32 near_since;        /* host, joining 2: our tick from which it has kept near (joining_frame; 0: it isn't) */
+	int held_logged;       /* host, joining 2: "hitched, comes in once it keeps up" said */
 	u32 knows;             /* host: the players whose inputs it acknowledged from their first tick (g_base) */
 	char name[MP_NAME_MAX];   /* host: the joiner's player's */
 	int entered;           /* host: "Name entered the game" was said (its first PKT_NAME) */
@@ -539,6 +559,8 @@ static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_se
 /* The lobby */
 static int g_match_pending;            /* the level was reloaded for the match: start synced */
 static int g_warm;                     /* this synced session (or the one being reloaded) is a warm-up */
+static u32 g_fight_at;                 /* GetTickCount when this PC's match began (begin_run), 0: none */
+#define FIGHT_MS 2000                  /* how long "FIGHT!" is on screen (mp_hud.c) */
 static int g_lobby_match;              /* joiner: a match is on at the host, without this PC */
 static int g_quiet_end;                /* every PC is reloading: no goodbye */
 static u32 g_go_session, g_go_taken;   /* host: the last reload's number; joiner: the last one it followed */
@@ -569,7 +591,7 @@ static int g_reload_seeds;             /* load it with g_match_seed / g_match_lo
 
 /* The server, as the Host dialog (or Arklite.ini [host]) has it */
 static char g_server_name[NET_SERVER_NAME_MAX] = "New Oni multiplayer game";
-static u32 g_max_players = NET_PLAYERS_MAX, g_max_spectators;
+static u32 g_max_players = NET_PLAYERS_MAX;
 static u32 g_server_id;
 static int g_startup_mode;             /* set by the environment or Arklite.ini [net], not the menu */
 static int g_hashed, g_join_installed;
@@ -985,6 +1007,79 @@ static void dump_images(u32 slot, u32 tick)
 	log_msg("net: wrote %s (%d characters at tick %d): send it with the other PC's", path, g_nimages[slot], tick);
 }
 
+/* The last TRING ticks one by one, for the desync dump's second file (Arklite-desyncticks-host.bin
+ * / -join.bin; tools/desync_ticks.py compares two and names the first tick and field that
+ * differ): after each tick, the inputs it ran with, both RNG seeds, Konoko's input state
+ * (gs+0xb8) and each character in use (up to TRING_CHARS, as image_of). A rollback runs a tick
+ * again and its entry is overwritten, so a verified tick's entry is its run with the real inputs.
+ * The hash every HASH_EVERY ticks only says that the PCs came apart in those ticks; this says
+ * where. */
+#define TRING        256
+#define TRING_CHARS  4
+typedef struct {
+	u32 tick, seeds[2], nplayers, guessed, nchars;
+	u32 input[NPL][12];
+	u32 gs_input[12];
+	CharImage chars[TRING_CHARS];
+} TickRec;
+static TickRec *g_tring;
+
+static void tring_capture(u32 ticks)
+{
+	TickRec *r;
+	u8 *chr = GS_CHARACTERS(ONgGameState);
+	u32 slots = ONgCharacterSlots, t = ticks - 1, s = t % RING;
+
+	if (!g_tring || !ticks) return;
+	r = &g_tring[ticks % TRING];
+	r->tick = ticks;
+	lockstep_get_seeds(&r->seeds[0], &r->seeds[1]);
+	r->nplayers = g_nplayers;
+	r->guessed = 0;
+	for (int p = 0; p < NPL; p++) {
+		if (p >= (int)g_nplayers) memset(r->input[p], 0, 0x30);
+		else if (!remote(p) || t < g_have[p]) memcpy(r->input[p], g_in[p][s], 0x30);
+		else {
+			memcpy(r->input[p], g_pred[p][s], 0x30);
+			r->guessed |= 1u << p;
+		}
+	}
+	memcpy(r->gs_input, ONgGameState + 0xb8, 0x30);
+	r->nchars = 0;
+	if (slots > MAX_CHARS) slots = MAX_CHARS;
+	for (u32 i = 0; i < slots && r->nchars < TRING_CHARS; i++, chr += CHR_SIZE) {
+		if (!(*(u32 *)(chr + 4) & CHR_INUSE)) continue;
+		r->chars[r->nchars].index = i;
+		image_of(i, r->chars[r->nchars].img);
+		r->nchars++;
+	}
+}
+
+static void tring_dump(u32 tick)
+{
+	char name[48], path[MAX_PATH];
+	u32 head[8] = { 0x54444b41 /* "AKDT" */, 1, tick, 0, NPL, TRING_CHARS, IMG_SIZE, sizeof(TickRec) }, w, n = 0;
+	HANDLE f;
+
+	if (!g_tring) return;
+	for (u32 k = 0; k < TRING; k++)
+		if (g_tring[k].tick && g_tring[k].tick <= tick && g_tring[k].tick + TRING > tick) n++;
+	head[3] = n;
+	if (g_mode == NET_HOST) str_cpy(name, sizeof name, "Arklite-desyncticks-host.bin");
+	else if (g_slot <= 1) str_cpy(name, sizeof name, "Arklite-desyncticks-join.bin");
+	else fmt(name, "Arklite-desyncticks-join%d.bin", g_slot + 1);
+	f = log_file_create(name, path);
+	if (f == INVALID_HANDLE_VALUE) {
+		log_msg("net: can't write %s", path);
+		return;
+	}
+	WriteFile(f, head, sizeof head, &w, 0);
+	for (u32 t = tick + 1 - (tick < TRING ? tick : TRING); t <= tick; t++)   /* oldest first */
+		if (t && g_tring[t % TRING].tick == t) WriteFile(f, &g_tring[t % TRING], sizeof(TickRec), &w, 0);
+	CloseHandle(f);
+	log_msg("net: wrote %s (%d ticks up to %d, one by one): send it with the other PC's", path, n, tick);
+}
+
 static void log_summary(u32 slot)
 {
 	for (u32 i = 0; i < g_mine[slot].n; i++) {
@@ -1015,6 +1110,7 @@ static void compare_hash(int l, u32 slot)
 			        g_mine[slot].seeds[0], g_mine[slot].seeds[1]);
 			log_summary(slot);
 			dump_images(slot, tick);
+			tring_dump(tick);
 		}
 	}
 }
@@ -1176,7 +1272,7 @@ static void hist_serve(int l, const PktHistReq *q)
 	PktHist *p = (PktHist *)buf;
 	u32 from = q->from, end;
 
-	if (!g_hist_ok || q->session != g_go_session || !g_link[l].joining) return;
+	if (!g_hist_ok || q->session != g_go_session || !g_link[l].joining || from > g_hist_n) return;
 	end = from + (q->count < HIST_REQ_TICKS ? q->count : HIST_REQ_TICKS);
 	if (end > g_hist_n) end = g_hist_n;
 	for (u32 k = 0; k < HIST_REQ_PKTS; k++) {
@@ -1256,6 +1352,7 @@ static void catchup_check(u32 slot)
 	log_msg("net:   RNG seeds here %08x/%08x", g_mine[slot].seeds[0], g_mine[slot].seeds[1]);
 	log_summary(slot);
 	dump_images(slot, tick);
+	tring_dump(tick);
 	g_cu_abort = 1;
 }
 
@@ -1264,6 +1361,7 @@ void net_tick_done(void)
 {
 	if (g_state != S_RUN && g_state != S_LOST && g_state != S_CATCHUP) return;
 	g_ticks++;
+	tring_capture(g_ticks);
 	if (g_ticks % HASH_EVERY) return;
 	u32 slot = (g_ticks / HASH_EVERY) % HASH_SLOTS;
 	g_mine[slot].hash = summarize(g_mine[slot].chars, &g_mine[slot].n);
@@ -1298,6 +1396,222 @@ static void publish_verified(void)
 	}
 }
 
+/* ---- Strangers ---------------------------------------------------------------------------- *
+ * With the host's port forwarded, anyone on the internet can send packets to it, and UDP lets a
+ * sender write any address as its own. So (protocol 19):
+ *   - The host gives each address a cookie (cookie_of: SipHash-2-4 of the IP and port, keyed by
+ *     128 random bits made when the port opens). A HELLO or map download request without the
+ *     address's cookie in its head (key) gets only PKT_COOKIE back, a head with it, no bigger than
+ *     the request (so a forged address can't turn the host into a flood of someone else). The PC
+ *     really there puts it in the head of everything it sends after that. Only packets with the
+ *     sender's cookie count at all: a place in the lobby, inputs, chat, goodbye, map files.
+ *   - Everything the host sends a joiner carries that cookie too, and the joiner takes only packets
+ *     from the host's address with it (a new cookie only while none came right for KEY_KEEP_MS:
+ *     the host restarted), so nobody but the host can speak for the host.
+ *   - The Join list's question (PKT_INFO_REQ) is padded to the size of the answer, for the same
+ *     reason; an older Arklite's short question gets a short answer, which says "another version".
+ *   - Each player's input is cleaned before it runs (strip): no NaN, infinity or absurd aim.
+ * Everything else is ignored and counted; the log says how much every STRANGER_LOG_MS. */
+#define KEY_KEEP_MS     2000
+#define STRANGER_LOG_MS 30000
+
+static u32 g_secret[4];                /* host: the cookies' key, made when the port opens */
+static u32 g_key;                      /* joiner: the host's cookie for this PC's address, 0: none yet */
+static u32 g_key_ok_at;                /* joiner: when a packet carrying it last came */
+static int g_dl_rekeyed;               /* joiner, downloading: a cookie came, ask again at once */
+static u32 g_strangers, g_strangers_at;
+
+/* ---- Hole punching ------------------------------------------------------------------------ *
+ * A host behind a NAT it can't open (the provider's shared address, CGNAT) can't be reached until
+ * it sends to the joiner first, and the joiner's NAT the same the other way. So both knock: the
+ * joiner's HELLO (or the Join list's PKT_INFO_REQ) goes to the host's internet address and port,
+ * which the host learned from STUN (stun.c) and gave the joiner; the host types the joiner's
+ * address, shown on the joiner's Join list or in its chat, after /punch, and sends it PKT_COOKIE
+ * every PUNCH_EVERY_MS for PUNCH_MS (it becomes a link, or time's up). Each NAT then takes the
+ * other's packets for answers. The joiner's key handshake runs as for anyone ("Strangers").
+ * The Join list's socket (g_qsock) asked the server from its own NAT mapping: Play hands that very
+ * socket to the game (g_adopt, net_open) so the hole punched for it stays the game's. */
+#define PUNCH_MAX       8
+#define PUNCH_MS        120000
+#define PUNCH_EVERY_MS  200
+#define HINT_AFTER_MS   4000         /* joiner: the host silent this long, the chat says how /punch helps */
+#define HINT_HELPED_MS  12000        /* ...this long when the helper said it told the host (helper.c) */
+#define INTRO_PUNCH_MS  15000        /* host: knocking toward a player the helper introduced */
+#define INTRO_AFTER_MS  300          /* joiner: the host silent this long, the helper is asked to introduce it... */
+#define INTRO_EVERY_MS  2000         /* ...and again this often while it stays silent */
+static u32 g_qsock = INVALID_SOCKET;   /* the Join list's (see "Server info for the Join list") */
+static u32 g_adopt = INVALID_SOCKET;   /* the Join list's socket, kept for the game's (Play) */
+static struct { SOCKADDR_IN a; u32 until, last; int quiet; } g_punch[PUNCH_MAX];
+static u32 g_intro_at;                 /* joiner: the last introduction asked for */
+static int g_helper_knows;             /* joiner: the helper said it knows the host (1) or not (-1); 0 no answer */
+static u32 g_opened_at;                /* when g_sock opened */
+static char g_hint_addr[32];           /* joiner: the address the chat last gave */
+
+static u64 rotl64(u64 x, int b) { return x << b | x >> (64 - b); }
+
+/* SipHash-2-4 of one 8-byte message (only adds, xors and rotations: no 64-bit library calls) */
+static u64 siphash8(const u32 *key, u64 m)
+{
+	u64 k0 = (u64)key[1] << 32 | key[0], k1 = (u64)key[3] << 32 | key[2];
+	u64 v0 = k0 ^ 0x736f6d6570736575ull, v1 = k1 ^ 0x646f72616e646f6dull;
+	u64 v2 = k0 ^ 0x6c7967656e657261ull, v3 = k1 ^ 0x7465646279746573ull;
+	u64 b = (u64)8 << 56;
+#define SIPROUND do { v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32); v2 += v3; v3 = rotl64(v3, 16); \
+	v3 ^= v2; v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0; v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32); } while (0)
+	v3 ^= m; SIPROUND; SIPROUND; v0 ^= m;
+	v3 ^= b; SIPROUND; SIPROUND; v0 ^= b;
+	v2 ^= 0xff; SIPROUND; SIPROUND; SIPROUND; SIPROUND;
+#undef SIPROUND
+	return v0 ^ v1 ^ v2 ^ v3;
+}
+
+static u32 cookie_of(const SOCKADDR_IN *a)
+{
+	u32 c = (u32)siphash8(g_secret, (u64)a->addr << 16 | a->port);
+	return c ? c : 1;
+}
+
+/* host: a new secret (Windows' RtlGenRandom; the clock, ids and stack as a fallback) */
+static void make_secret(void)
+{
+	typedef unsigned char (WINAPI *GenRandom)(void *, u32);
+	HANDLE adv = LoadLibraryA("advapi32.dll");
+	GenRandom gen = adv ? (GenRandom)GetProcAddress(adv, "SystemFunction036") : 0;
+	u32 local = 0;
+	if (!gen || !gen(g_secret, sizeof g_secret)) {
+		log_msg("net: no random numbers from Windows: the cookies' key comes from the clock");
+		g_secret[0] ^= GetTickCount();
+		g_secret[1] ^= GetCurrentProcessId() << 16 ^ GetCurrentThreadId();
+		g_secret[2] ^= (u32)(unsigned long)&local;
+	}
+	g_secret[3] ^= counter();
+}
+
+/* Every packet this PC sends carries the key for the receiver: the host's cookie of that address,
+ * a joiner's the one the host gave it */
+static void put_key(const void *p, const SOCKADDR_IN *to)
+{
+	((PktHead *)p)->key = g_mode == NET_HOST ? cookie_of(to) : g_key;
+}
+
+static void stranger(const SOCKADDR_IN *from, const char *why)
+{
+	u32 now = GetTickCount();
+	g_strangers++;
+	if (g_strangers_at && now - g_strangers_at < STRANGER_LOG_MS) return;
+	const u8 *ip = (const u8 *)&from->addr;
+	log_msg("net: ignored %d packet%s from outside the game (the last from %d.%d.%d.%d:%d: %s)", g_strangers,
+	        g_strangers == 1 ? "" : "s", ip[0], ip[1], ip[2], ip[3], ntohs(from->port), why);
+	g_strangers = 0;
+	g_strangers_at = now ? now : 1;
+}
+
+/* host: the cookie for that address, to a request that came without it */
+static void send_cookie(const SOCKADDR_IN *to)
+{
+	PktHead h;
+	memset(&h, 0, sizeof h);
+	h.magic = MAGIC;
+	h.proto = PROTO;
+	h.type = PKT_COOKIE;
+	put_key(&h, to);
+	sendto(g_sock, &h, sizeof h, 0, to, sizeof *to);
+}
+
+/* joiner: the host's PKT_COOKIE. 1: it's this PC's key now */
+static int joiner_cookie(u32 key)
+{
+	u32 now = GetTickCount();
+	if (!key || key == g_key) return 0;
+	if (g_key && now - g_key_ok_at < KEY_KEEP_MS) return 0;   /* the host speaks with the key it has: not the host's */
+	log_msg(g_key ? "net: the host gave this PC a new key (it restarted?)" : "net: the host answered and gave this PC its key");
+	g_key = key;
+	g_key_ok_at = now;
+	g_last_hello = 0;   /* say HELLO again at once, with it */
+	return 1;
+}
+
+/* joiner: a packet from the host's address carries this PC's key (1), or isn't the host's (0) */
+static int host_keyed(const PktHead *h)
+{
+	if (!g_key || h->key != g_key) return 0;
+	g_key_ok_at = GetTickCount();
+	return 1;
+}
+
+/* host: knock toward the addresses /punch named, until each is a player here or time's up */
+static void punch_frame(u32 now)
+{
+	if (g_mode != NET_HOST || g_sock == INVALID_SOCKET) return;
+	for (int i = 0; i < PUNCH_MAX; i++) {
+		const u8 *ip = (const u8 *)&g_punch[i].a.addr;
+		if (!g_punch[i].until) continue;
+		if (link_of(&g_punch[i].a) >= 0) {
+			log_msg("net: punched through to %d.%d.%d.%d:%d: it's in", ip[0], ip[1], ip[2], ip[3], ntohs(g_punch[i].a.port));
+			g_punch[i].until = 0;
+		} else if ((int)(now - g_punch[i].until) >= 0) {
+			if (!g_punch[i].quiet)
+				log_msg("net: /punch %d.%d.%d.%d:%d: no player came from there", ip[0], ip[1], ip[2], ip[3], ntohs(g_punch[i].a.port));
+			g_punch[i].until = 0;
+		} else if (now - g_punch[i].last >= PUNCH_EVERY_MS) {
+			send_cookie(&g_punch[i].a);   /* (no bigger than any packet it lets in) */
+			g_punch[i].last = now;
+		}
+	}
+}
+
+/* knock toward a for ms (an address already knocked at keeps the longer time); quiet: no log when
+ * nobody comes (the helper's introductions: most are players only looking at the Join list) */
+static void punch_add(const SOCKADDR_IN *a, u32 ms, int quiet)
+{
+	u32 slot = 0, now = GetTickCount(), until = now + ms;
+	if (!until) until = 1;
+	for (u32 i = 0; i < PUNCH_MAX; i++) {   /* that address again, or a free place, or the oldest */
+		if (g_punch[i].until && g_punch[i].a.addr == a->addr && g_punch[i].a.port == a->port) {
+			if ((int)(g_punch[i].until - until) > 0) return;
+			slot = i;
+			break;
+		}
+		if (!g_punch[i].until || g_punch[i].until < g_punch[slot].until) slot = i;
+	}
+	g_punch[slot].a = *a;
+	g_punch[slot].until = until;
+	g_punch[slot].last = 0;
+	g_punch[slot].quiet = quiet;
+}
+
+const char *net_punch(const char *address)
+{
+	static char msg[CHAT_MAX];
+	char host[32];
+	u32 n = 0, port = 0;
+	SOCKADDR_IN a;
+
+	if (g_mode != NET_HOST || g_sock == INVALID_SOCKET) return "Only the host punches. Give the host your address (/ip).";
+	while (address[n] && address[n] != ':' && address[n] != ' ' && n + 1 < sizeof host) host[n] = address[n], n++;
+	host[n] = 0;
+	if (address[n] == ':')
+		for (const char *c = address + n + 1; *c >= '0' && *c <= '9'; c++) port = port * 10 + (*c - '0');
+	memset(&a, 0, sizeof a);
+	a.family = 2;
+	a.addr = n ? inet_addr(host) : 0xffffffffu;
+	if (a.addr == 0xffffffffu || !a.addr || !port || port > 65535) return "Usage: /punch 1.2.3.4:5678 (the address and port the player sees with /ip)";
+	a.port = htons((u16)port);
+	punch_add(&a, PUNCH_MS, 0);
+	log_msg("net: /punch %s:%d: knocking for %d s", host, port, PUNCH_MS / 1000);
+	fmt(msg, "Knocking toward %s:%d for %d s: the player can join now.", host, port, PUNCH_MS / 1000);
+	return msg;
+}
+
+int net_my_address(char *out) { return stun_text(out); }
+
+/* Text another PC sent (a name, a chat line): no control characters */
+static void clean_text(char *s, u32 size)
+{
+	for (u32 i = 0; i < size && s[i]; i++)
+		if ((u8)s[i] < 0x20 || s[i] == 0x7f) s[i] = ' ';
+}
+
 /* ---- Sending and receiving ---------------------------------------------------------------- */
 
 static void head(PktHead *h, u8 type)
@@ -1306,10 +1620,12 @@ static void head(PktHead *h, u8 type)
 	h->proto = PROTO;
 	h->type = type;
 	h->pad = 0;
+	h->key = 0;   /* (put in by the send) */
 }
 
 static void send_addr(const void *p, u32 n, const SOCKADDR_IN *to)
 {
+	put_key(p, to);
 	if (sendto(g_sock, p, n, 0, to, sizeof *to) < 0) {
 		if (WSAGetLastError() == 10093) return;   /* WSANOTINITIALISED: the process is exiting */
 		if (g_send_errors++ < 5) log_msg("net: send failed (error %d)", WSAGetLastError());
@@ -1649,6 +1965,7 @@ static void chat_received(int l, const PktChat *p)
 		int who = g_mode == NET_HOST ? l : (int)p->from;
 		memcpy(text, p->text, sizeof text);
 		text[sizeof text - 1] = 0;
+		clean_text(text, sizeof text);
 		k->chat_in_seq = p->seq;
 		if (g_mode == NET_JOIN && p->from == CHAT_SERVER) {
 			chat_server(text);
@@ -1792,6 +2109,11 @@ static void start_match(void);
 static void strip(u32 *rec)
 {
 	rec[0] &= ~7u;   /* escape, console, pausescreen: per PC */
+	/* words 2-10 are floats (analogs 0-8; word 11 is Arklite's, see char_menu.c): a NaN, an infinity
+	 * or an aim of 16384 units (256 radians) and more in one tick isn't anyone's mouse, and the game
+	 * would carry it in every character it touches: nothing pressed there instead */
+	for (int w = 2; w <= 10; w++)
+		if ((rec[w] >> 23 & 0xff) >= 127 + 14) rec[w] = 0;
 }
 
 /* host: player p's PC stopped answering or left. From the first tick the host has no input of
@@ -1832,7 +2154,7 @@ static void fill_gone(void)
 static void add_players(u32 n, const u32 *base)
 {
 	for (u32 q = g_nplayers; q < n; q++) {
-		u32 b = base ? base[q] : g_ticks;
+		u32 b = base && base[q] <= g_ticks + RING ? base[q] : g_ticks;
 		memset(g_in[q], 0, sizeof g_in[q]);
 		memset(g_in_at[q], 0, sizeof g_in_at[q]);
 		memset(g_pred[q], 0, sizeof g_pred[q]);
@@ -1857,7 +2179,7 @@ static void on_input(int l, const PktInput *p, u32 size)
 		if (p->ack[q] > k->ack[q] && p->ack[q] <= have_of(q)) k->ack[q] = p->ack[q];
 		if (g_mode == NET_HOST && p->ack[q] >= g_base[q]) k->knows |= 1u << q;
 	}
-	k->adv = p->adv;
+	k->adv = p->adv > RING ? RING : p->adv < -RING ? -RING : p->adv;
 	k->adv_known = 1;
 	if ((int)(p->stamp - k->stamp) > 0 || !k->stamp) {
 		k->stamp = p->stamp;
@@ -1947,6 +2269,7 @@ static void on_input(int l, const PktInput *p, u32 size)
  * A joiner without the map's folder at all downloads it the same way from the menu, before the
  * level starts (net_map_fetch, from Join's Play), into CustomLevels\<folder>\. */
 #define MAP_PATH        112
+#define L0_SET          0x10000u     /* MAP_LIST_REQ / MAP_REQ "level" for the host's level0 pair (see "level0 download") */
 #define MAP_LIST_PAGE   12
 #define MAP_MAX_FILES   512
 #define MAP_CHUNK       1400
@@ -2007,6 +2330,7 @@ static int list_tree(const char *dir, const char *rel, int depth, MapFile *out, 
 
 static void send_to(const void *p, u32 n, const SOCKADDR_IN *to)
 {
+	put_key(p, to);
 	if (sendto(g_sock, p, n, 0, to, sizeof *to) >= 0) g_npackets_sent++;   /* a full buffer: asked again */
 }
 
@@ -2039,11 +2363,111 @@ static int map_can_serve(void)
 	return g_serve_ok;
 }
 
+/* The pieces q asks for of a file of size bytes open in f, each in a MAP_DATA (level as asked) */
+static void send_chunks(HANDLE f, u32 size, const PktMapReq *q, const SOCKADDR_IN *to)
+{
+	static u8 data[MAP_REQ_MAX * MAP_CHUNK], out[sizeof(PktMapData) + MAP_CHUNK];
+	PktMapData *p = (PktMapData *)out;
+	u32 off, len, got = 0;
+
+	if (q->chunk >= (size + MAP_CHUNK - 1) / MAP_CHUNK) return;
+	off = q->chunk * MAP_CHUNK;
+	len = q->count * MAP_CHUNK;
+	if (len > size - off) len = size - off;
+	SetFilePointer(f, (int)off, 0, 0 /* FILE_BEGIN */);
+	if (!ReadFile(f, data, len, &got, 0)) return;
+	for (u32 k = 0; k * MAP_CHUNK < got; k++) {
+		u32 n = got - k * MAP_CHUNK;
+		if (n > MAP_CHUNK) n = MAP_CHUNK;
+		head(&p->h, PKT_MAP_DATA);
+		p->level = q->level;
+		p->file = q->file;
+		p->chunk = q->chunk + k;
+		p->size = n;
+		memcpy(out + sizeof *p, data + k * MAP_CHUNK, n);
+		send_to(out, sizeof *p + n, to);
+	}
+}
+
+/* ---- level0 download ------------------------------------------------------------------------ *
+ * level0 is one big file pair every PC must have the same of (an AE install whose XML patches
+ * didn't run has another, see docs "Fresh Linux install refused by the host"). A joiner refused
+ * for level0 alone uses the host's pair from AE\cache\<dat hash>-<raw hash>\ (level0_swap.c); when
+ * it isn't there, it gets it from the host the way a map comes (map_download_to, the "level"
+ * L0_SET in the requests): the host lists its two files (the pair it runs: GameDataFolder's, or
+ * the cache copy it switched to itself) with the hashes it compares, and sends them in pieces;
+ * the joiner reloads the level, downloads them in the loading popup into the cache folder (about
+ * 172 MB once, then kept), and the same load swaps level 0 to them. */
+static char g_l0_active[64];           /* the cache folder of the level0 this PC switched to ("": GameDataFolder's) */
+static HANDLE g_l0_file = INVALID_HANDLE_VALUE;
+static u32 g_l0_file_index = 0xffffffffu;
+
+static void l0_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
+{
+	static const char *const names[2] = { "level0_Final.dat", "level0_Final.raw" };
+	static MapFile files[2];
+	static char dir[64];
+	const PktHead *h = (const PktHead *)buf;
+	char path[160];
+
+	if (!files[0].size || !str_ieq_n(dir, g_l0_active[0] ? g_l0_active : "GameDataFolder", sizeof dir)) {
+		str_cpy(dir, sizeof dir, g_l0_active[0] ? g_l0_active : "GameDataFolder");
+		if (g_l0_file != INVALID_HANDLE_VALUE) CloseHandle(g_l0_file);
+		g_l0_file = INVALID_HANDLE_VALUE;
+		g_l0_file_index = 0xffffffffu;
+		for (int i = 0; i < 2; i++) {
+			WIN32_FIND_DATAA fd;
+			HANDLE f;
+			fmt(path, "%s\\%s", dir, names[i]);
+			str_cpy(files[i].path, MAP_PATH, names[i]);
+			files[i].hash = g_files[2 + i];   /* what the handshake compares */
+			files[i].size = 0;
+			if ((f = FindFirstFileA(path, &fd)) != INVALID_HANDLE_VALUE) {
+				files[i].size = fd.nFileSizeLow;
+				FindClose(f);
+			}
+		}
+	}
+	if (!files[0].size || !files[1].size) return;
+	if (h->type == PKT_MAP_LIST_REQ && n >= sizeof(PktMapListReq)) {
+		const PktMapListReq *q = (const PktMapListReq *)buf;
+		static u32 last_log;
+		PktMapList p;
+		if (!q->first && GetTickCount() - last_log > LOST_MS) {
+			const u8 *ip = (const u8 *)&to->addr;
+			log_msg("net: %d.%d.%d.%d:%d is downloading this PC's level0 (%s)", ip[0], ip[1], ip[2], ip[3], ntohs(to->port), dir);
+			last_log = GetTickCount();
+		}
+		memset(&p, 0, sizeof p);
+		head(&p.h, PKT_MAP_LIST);
+		p.level = L0_SET;
+		p.total = 2;
+		p.first = q->first;
+		for (u32 i = q->first; i < 2 && p.count < MAP_LIST_PAGE; i++) p.f[p.count++] = files[i];
+		send_to(&p, sizeof p, to);
+	} else if (h->type == PKT_MAP_REQ && n >= sizeof(PktMapReq)) {
+		const PktMapReq *q = (const PktMapReq *)buf;
+		if (q->file >= 2 || !q->count || q->count > MAP_REQ_MAX) return;
+		if (g_l0_file == INVALID_HANDLE_VALUE || g_l0_file_index != q->file) {
+			if (g_l0_file != INVALID_HANDLE_VALUE) CloseHandle(g_l0_file);
+			fmt(path, "%s\\%s", dir, names[q->file]);
+			g_l0_file = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 3, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+			g_l0_file_index = q->file;
+			if (g_l0_file == INVALID_HANDLE_VALUE) log_msg("net: level0 download: can't open %s", path);
+		}
+		if (g_l0_file != INVALID_HANDLE_VALUE) send_chunks(g_l0_file, files[q->file].size, q, to);
+	}
+}
+
 static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 {
 	const PktHead *h = (const PktHead *)buf;
 	char path[1024];
 
+	if (n >= sizeof *h + 4 && *(const u32 *)(buf + sizeof *h) == L0_SET) {   /* (both requests start with the level) */
+		l0_serve(buf, n, to);
+		return;
+	}
 	if (!map_can_serve()) return;
 	if (h->type == PKT_MAP_LIST_REQ && n >= sizeof(PktMapListReq)) {
 		const PktMapListReq *q = (const PktMapListReq *)buf;
@@ -2064,10 +2488,7 @@ static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 		for (u32 i = q->first; i < g_nserve && p.count < MAP_LIST_PAGE; i++) p.f[p.count++] = g_serve[i];
 		send_to(&p, sizeof p, to);
 	} else if (h->type == PKT_MAP_REQ && n >= sizeof(PktMapReq)) {
-		static u8 data[MAP_REQ_MAX * MAP_CHUNK], out[sizeof(PktMapData) + MAP_CHUNK];
 		const PktMapReq *q = (const PktMapReq *)buf;
-		PktMapData *p = (PktMapData *)out;
-		u32 off, len, got = 0;
 		if (q->level != g_level || q->file >= g_nserve || !q->count || q->count > MAP_REQ_MAX) return;
 		const MapFile *m = &g_serve[q->file];
 		if (q->chunk >= (m->size + MAP_CHUNK - 1) / MAP_CHUNK) return;
@@ -2079,22 +2500,7 @@ static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 			if (g_serve_file == INVALID_HANDLE_VALUE) log_msg("net: map download: can't open %s", path);
 		}
 		if (g_serve_file == INVALID_HANDLE_VALUE) return;
-		off = q->chunk * MAP_CHUNK;
-		len = q->count * MAP_CHUNK;
-		if (len > m->size - off) len = m->size - off;
-		SetFilePointer(g_serve_file, (int)off, 0, 0 /* FILE_BEGIN */);
-		if (!ReadFile(g_serve_file, data, len, &got, 0)) return;
-		for (u32 k = 0; k * MAP_CHUNK < got; k++) {
-			u32 size = got - k * MAP_CHUNK;
-			if (size > MAP_CHUNK) size = MAP_CHUNK;
-			head(&p->h, PKT_MAP_DATA);
-			p->level = g_level;
-			p->file = q->file;
-			p->chunk = q->chunk + k;
-			p->size = size;
-			memcpy(out + sizeof *p, data + k * MAP_CHUNK, size);
-			send_to(out, sizeof *p + size, to);
-		}
+		send_chunks(g_serve_file, m->size, q, to);
 	}
 }
 
@@ -2125,7 +2531,10 @@ static void reload_level(u32 level, int seeds)
 		return;
 	}
 	g_reload = 0;
-	if (seeds) lockstep_set_seeds(g_match_seed, g_match_local_seed);
+	if (seeds) {
+		lockstep_set_seeds(g_match_seed, g_match_local_seed);
+		players_set_spawn_seed(g_match_seed);   /* every PC starts the players at the same points */
+	}
 	ONrGame_StartLevel(level);
 }
 
@@ -2144,8 +2553,44 @@ static int map_download_start(void)
 
 /* From the host's LOBBY refusal for level0 alone: when AE\cache has the host's pair, reload the
  * level, and its load swaps level 0 first (level0_swap.c). Tried once per host pair. */
-static u32 g_l0_want[2], g_l0_tried[2], g_l0_pending;
+static u32 g_l0_want[2], g_l0_tried[2], g_l0_pending, g_l0_fetch;
+static u32 g_l0_installed[2];          /* GameDataFolder's pair, while this PC runs a host's (g_l0_active) */
+static int g_l0_restart_said;
+/* Swaps per Oni session: each keeps the old level 0 loaded (~172 MB of address space). A second
+ * one used to draw everything white: the run-long dynamic file's pixel memory ran out under the
+ * new level 0's fonts (level0_swap.c now enlarges it). After the last, Oni stays on that pair
+ * until it restarts. */
+#define L0_SWAPS_MAX    3   /* level0_swap.c's GHOSTS_MAX */
 static char g_l0_dir[64];
+
+/* This PC's own level0, back after a host's: not GameDataFolder's files again (the first level 0
+ * stays loaded as a ghost with them open, and a second load of the same path drew every texture
+ * white), but the same pair under cache\\<its hashes>\\, hard links to the installed files (a copy
+ * where links don't work), which nothing ever writes to. 1: g_l0_dir names it */
+static int l0_own_dir(void)
+{
+	static const char *const names[2] = { "level0_Final.dat", "level0_Final.raw" };
+	char from[128], to[128];
+
+	fmt(g_l0_dir, "cache\\%08x-%08x", g_l0_installed[0], g_l0_installed[1]);
+	CreateDirectoryA("cache", 0);
+	CreateDirectoryA(g_l0_dir, 0);
+	for (int i = 0; i < 2; i++) {
+		fmt(from, "GameDataFolder\\%s", names[i]);
+		fmt(to, "%s\\%s", g_l0_dir, names[i]);
+		if (hash_file(to) == g_l0_installed[i]) continue;
+		DeleteFileA(to);
+		if (!CreateHardLinkA(to, from, 0) && !CopyFileA(from, to, 0)) {
+			log_msg("net: can't put this PC's own level0 in %s (error %d)", g_l0_dir, GetLastError());
+			return 0;
+		}
+		if (hash_file(to) != g_l0_installed[i]) {
+			log_msg("net: %s isn't this PC's own level0", to);
+			return 0;
+		}
+	}
+	return 1;
+}
 
 static int level0_swap_start(const u32 *want)
 {
@@ -2156,21 +2601,36 @@ static int level0_swap_start(const u32 *want)
 	g_l0_tried[0] = want[0];
 	g_l0_tried[1] = want[1];
 	fmt(g_l0_dir, "cache\\%08x-%08x", want[0], want[1]);
-	fmt(path, "%s\\level0_Final.dat", g_l0_dir);
-	if (hash_file(path) != want[0]) {
-		log_msg("net: no good copy of the host's level0 in %s", g_l0_dir);
+	if (level0_swaps() >= L0_SWAPS_MAX) {
+		log_msg("net: this host's level0 (%08x %08x) isn't the one this Oni switched to: restart Oni to join it", want[0], want[1]);
 		return 0;
 	}
-	fmt(path, "%s\\level0_Final.raw", g_l0_dir);
-	if (hash_file(path) != want[1]) {
-		log_msg("net: %s has the wrong level0_Final.raw", g_l0_dir);
-		return 0;
-	}
-	log_msg("net: the host's level0 is in %s: reloading level %d with it", g_l0_dir, level);
 	g_l0_want[0] = want[0];
 	g_l0_want[1] = want[1];
-	g_l0_pending = 1;
-	session_end("switching to the host's level0");
+	if (g_l0_active[0] && want[0] == g_l0_installed[0] && want[1] == g_l0_installed[1]) {
+		/* this PC runs another host's level0, and this host has the installed one: back to it */
+		if (!l0_own_dir()) return 0;
+		log_msg("net: the host has this PC's own level0: reloading level %d with it", level);
+		g_l0_pending = 1;
+		session_end("switching back to this PC's level0");
+		reload_level(level, 0);
+		return 1;
+	}
+	fmt(path, "%s\\level0_Final.dat", g_l0_dir);
+	if (hash_file(path) == want[0]) {
+		fmt(path, "%s\\level0_Final.raw", g_l0_dir);
+		if (hash_file(path) == want[1]) {
+			log_msg("net: the host's level0 is in %s: reloading level %d with it", g_l0_dir, level);
+			g_l0_pending = 1;
+			session_end("switching to the host's level0");
+			reload_level(level, 0);
+			return 1;
+		}
+	}
+	/* not here (or not whole): from the host, in the reload's loading popup (see "level0 download") */
+	log_msg("net: the host's level0 (%08x %08x) isn't in %s: reloading level %d to download it", want[0], want[1], g_l0_dir, level);
+	g_l0_fetch = 1;
+	session_end("downloading the host's level0");
 	reload_level(level, 0);
 	return 1;
 }
@@ -2225,10 +2685,22 @@ static u32 dl_receive(u8 *buf, u32 size)
 			if (WSAGetLastError() == 10054) continue;
 			return 0;
 		}
+		if (stun_packet(buf, (u32)n, &from) || helper_packet(g_sock, buf, (u32)n, &from)) continue;
 		const PktHead *h = (const PktHead *)buf;
-		if ((u32)n < sizeof *h || h->magic != MAGIC || h->proto != PROTO) continue;
-		if (from.addr != g_link[0].addr.addr || from.port != g_link[0].addr.port) continue;
+		if ((u32)n < sizeof *h || h->magic != MAGIC || h->proto != PROTO ||
+		    from.addr != g_link[0].addr.addr || from.port != g_link[0].addr.port) {
+			stranger(&from, "not the host");
+			continue;
+		}
 		g_npackets_recv++;
+		if (h->type == PKT_COOKIE) {   /* the first request had no key: ask again with it */
+			if (joiner_cookie(h->key)) g_dl_rekeyed = 1;
+			continue;
+		}
+		if (!host_keyed(h)) {
+			stranger(&from, "the host's address without this PC's key");
+			continue;
+		}
 		return (u32)n;
 	}
 }
@@ -2324,7 +2796,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	u32 ntheirs = 0, nmine = 0, total = 0xffffffffu, their_map = 0, nneed = 0, nextra = 0, need_bytes = 0, biggest = 0;
 	u32 now, last_heard, last_req = 0, last_draw = 0, bytes_all = 0, began;
 	HANDLE out = INVALID_HANDLE_VALUE;
-	const char *why = 0;
+	const char *why = 0, *what = level == L0_SET ? "level0" : "map";
 	int ok = 0, cur = -1;
 
 	if (!g_link[0].used) return 0;
@@ -2333,12 +2805,13 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	mine = theirs + MAP_MAX_FILES;
 	need = (u8 *)(mine + MAP_MAX_FILES);
 	moved = need + MAP_MAX_FILES;
-	fmt(path, "GameDataFolder\\CustomLevels.download\\%s\\", folder);
+	/* (level0 never comes near GameDataFolder: it's downloaded and kept in AE\\cache) */
+	fmt(path, level == L0_SET ? "cache\\.download\\%s\\" : "GameDataFolder\\CustomLevels.download\\%s\\", folder);
 	if (!GetFullPathNameA(path, sizeof stage, stage, 0)) str_cpy(stage, sizeof stage, path);
-	fmt(path, "GameDataFolder\\CustomLevels.backup\\%s\\", folder);
+	fmt(path, level == L0_SET ? "cache\\.old\\%s\\" : "GameDataFolder\\CustomLevels.backup\\%s\\", folder);
 	if (!GetFullPathNameA(path, sizeof backup, backup, 0)) str_cpy(backup, sizeof backup, path);
 	dl_lines_create();
-	log_msg("net: map download: asking the host for its list of %s's files", folder);
+	log_msg("net: %s download: asking the host for its list of %s's files", what, folder);
 
 	/* 1. the host's list */
 	last_heard = GetTickCount();
@@ -2370,6 +2843,11 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 			last_heard = now;
 			last_req = 0;   /* the next page at once */
 		}
+		if (g_dl_rekeyed) {   /* the request that came back with the key: again, with it */
+			g_dl_rekeyed = 0;
+			last_req = 0;
+			continue;
+		}
 		if (now - last_draw >= DL_DRAW_MS) {
 			dl_draw("Connecting to the host...", "", 10);
 			last_draw = now;
@@ -2377,7 +2855,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	}
 
 	/* 2. what differs: files to fetch, and files the host doesn't have */
-	if (!list_tree(dir, "", 0, mine, &nmine)) log_msg("net: map download: couldn't list every file in %s", dir);
+	if (!list_tree(dir, "", 0, mine, &nmine)) log_msg("net: %s download: couldn't list every file in %s", what, dir);
 	for (u32 i = 0; i < ntheirs; i++) {
 		int k = find_file(mine, nmine, theirs[i].path);
 		need[i] = k < 0 || mine[k].size != theirs[i].size || mine[k].hash != theirs[i].hash;
@@ -2387,7 +2865,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 		if (theirs[i].size > biggest) biggest = theirs[i].size;
 	}
 	for (u32 i = 0; i < nmine; i++) nextra += find_file(theirs, ntheirs, mine[i].path) < 0;
-	log_msg("net: map download: the host's map has %d files; %d to download (%u bytes), %d here that it doesn't have",
+	log_msg("net: %s download: the host has %d files; %d to download (%u bytes), %d here that it doesn't have", what,
 	        ntheirs, nneed, need_bytes, nextra);
 	got = VirtualAlloc(0, biggest / MAP_CHUNK / 8 + 1, 0x3000, 4);
 	if (!got) { why = "out of memory"; goto done; }
@@ -2427,6 +2905,10 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 				heard = 1;
 			}
 			if (heard) last_heard = now;
+			if (g_dl_rekeyed) {   /* (only if the host restarted meanwhile) every piece asked for again */
+				g_dl_rekeyed = 0;
+				memset(g_req_chunk, 0, sizeof g_req_chunk);
+			}
 			while (lo < chunks && (got[lo >> 3] & (1 << (lo & 7)))) lo++;
 			if (lo - grown_at >= win) {
 				win = win + 32 > DL_WINDOW_MAX ? DL_WINDOW_MAX : win + 32;
@@ -2477,7 +2959,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 		CloseHandle(out);
 		out = INVALID_HANDLE_VALUE;
 		if (hash_file(path) != m->hash) { why = "a file arrived damaged"; goto done; }
-		log_msg("net: map download: got %s (%u bytes)", m->path, m->size);
+		log_msg("net: %s download: got %s (%u bytes)", what, m->path, m->size);
 		left--;
 	}
 	cur = -1;
@@ -2506,20 +2988,25 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 		fmt(path, "%s%s", stage, theirs[i].path);
 		fmt(to, "%s%s", dir, theirs[i].path);
 		if (!move_file(path, to)) {
-			log_msg("net: map download: the map's folder is half updated; its old files are in %s", backup);
+			log_msg("net: %s download: the map's folder is half updated; its old files are in %s", what, backup);
 			why = "can't move the downloaded files into the map's folder";
 			goto done;
 		}
 	}
-	log_msg("net: map download: done, %u bytes in %u ms%s%s; the host's map is %08x", bytes_all, GetTickCount() - began,
-	        nmine ? "; old files in " : "", nmine ? backup : "", their_map);
+	{
+		char tail[32] = "";
+		if (level != L0_SET) fmt(tail, "; the host's map is %08x", their_map);
+		RemoveDirectoryA(stage);   /* (only when it's empty: a map's subfolders stay) */
+		log_msg("net: %s download: done, %u bytes in %u ms%s%s%s", what, bytes_all, GetTickCount() - began,
+		        nmine ? "; old files in " : "", nmine ? backup : "", tail);
+	}
 	ok = 1;
 
 done:
 	if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
 	g_dl_why = why ? why : "?";
 	if (!ok) {
-		log_msg("net: map download of level %d stopped: %s; this PC keeps its own version", level, g_dl_why);
+		log_msg("net: %s download stopped: %s; this PC keeps its own version", what, g_dl_why);
 		for (u32 i = 0; i < ntheirs && cur >= 0; i++) {   /* the downloaded files, left in the download folder */
 			if (!need[i]) continue;
 			fmt(path, "%s%s", stage, theirs[i].path);
@@ -2555,12 +3042,56 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 {
 	u32 l = g_dl_level;
 
+	if (g_l0_fetch) {
+		char rel[80], dir[MAX_PATH], folder[40], path[128];
+		g_l0_fetch = 0;
+		fmt(rel, "%s\\", g_l0_dir);
+		fmt(folder, "level0-%08x-%08x", g_l0_want[0], g_l0_want[1]);
+		if (GetFullPathNameA(rel, sizeof dir, dir, 0) && map_download_to(L0_SET, dir, folder)) {
+			fmt(path, "%s\\level0_Final.dat", g_l0_dir);
+			u32 d = hash_file(path);
+			fmt(path, "%s\\level0_Final.raw", g_l0_dir);
+			if (d == g_l0_want[0] && hash_file(path) == g_l0_want[1]) g_l0_pending = 1;
+			else log_msg("net: the downloaded level0 in %s isn't the host's: not switching to it", g_l0_dir);
+		} else {
+			log_msg("net: no level0 from the host (%s): this PC can't join it", g_dl_why ? g_dl_why : "?");
+		}
+	}
+	if (!g_l0_pending && g_l0_active[0] && g_mode != NET_JOIN && !g_l0_restart_said) {
+		/* a host's level0 is only for playing on that host: hosting, or playing alone, is on this
+		 * PC's own again (the installed files were never touched) */
+		g_l0_want[0] = g_l0_installed[0];
+		g_l0_want[1] = g_l0_installed[1];
+		if (level0_swaps() >= L0_SWAPS_MAX) {
+			g_l0_restart_said = 1;
+			log_msg("net: not joining any more, but this Oni already switched level0 once: it stays on the host's until Oni restarts");
+		} else if (l0_own_dir()) {
+			g_l0_pending = 1;
+			log_msg("net: not joining any more: back to this PC's own level0 (%s)", g_l0_dir);
+		} else {
+			g_l0_installed[0] = g_l0_installed[1] = 0;   /* (not tried again) */
+			g_l0_active[0] = 0;
+			log_msg("net: staying on the host's level0 until Oni restarts");
+		}
+	}
 	if (g_l0_pending) {
+		int back = g_l0_active[0] && g_l0_want[0] == g_l0_installed[0] && g_l0_want[1] == g_l0_installed[1];
 		g_l0_pending = 0;
+		if (!g_l0_active[0]) {
+			g_l0_installed[0] = g_files[2];
+			g_l0_installed[1] = g_files[3];
+		}
 		if (level0_swap(g_l0_dir)) {
 			g_files[2] = g_l0_want[0];
 			g_files[3] = g_l0_want[1];
-			log_msg("net: now on the host's level0 %08x %08x until Oni closes", g_files[2], g_files[3]);
+			if (back) {
+				g_l0_active[0] = 0;
+				g_l0_tried[0] = g_l0_tried[1] = 0;   /* a host with another level0 may be switched to again */
+				log_msg("net: on this PC's own level0 %08x %08x again", g_files[2], g_files[3]);
+			} else {
+				str_cpy(g_l0_active, sizeof g_l0_active, g_l0_dir);   /* as a host, this is the pair it sends */
+				log_msg("net: now on the host's level0 %08x %08x (from %s) while playing there", g_files[2], g_files[3], g_l0_dir);
+			}
 		}
 	}
 	if (l && (level & 0xff) == l) {
@@ -2630,11 +3161,21 @@ const char *net_map_fetch_error(void)
 	return g_dl_why ? g_dl_why : "?";
 }
 
-static void answer_info(const PktInfoReq *q, const SOCKADDR_IN *to)
+static void answer_info(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 {
+	const PktInfoReq *q = (const PktInfoReq *)buf;
 	PktInfo p;
 	const char *folder = custom_game_level_folder(g_level), *map = custom_game_level_name(g_level);
 
+	if (q->h.proto != PROTO) {   /* an older Arklite's (8-byte head): its token and time back, as short */
+		u32 r[5];
+		memset(r, 0, sizeof r);
+		r[0] = MAGIC;
+		r[1] = PROTO | PKT_INFO << 16;
+		memcpy(&r[2], buf + 8, 8);
+		sendto(g_sock, r, sizeof r, 0, to, sizeof *to);
+		return;
+	}
 	memset(&p, 0, sizeof p);
 	head(&p.h, PKT_INFO);
 	p.token = q->token;
@@ -2643,7 +3184,6 @@ static void answer_info(const PktInfoReq *q, const SOCKADDR_IN *to)
 	p.players = g_state == S_IDLE ? 1 : bits(present_mask());
 	p.max_players = capacity();
 	p.spectators = bits(players_spectators() & present_mask());   /* players watching (/spectate) */
-	p.max_spectators = g_max_spectators;
 	p.in_match = g_state != S_LOBBY && !g_warm;
 	p.server_id = g_server_id;
 	str_cpy(p.name, sizeof p.name, g_server_name);
@@ -2651,6 +3191,80 @@ static void answer_info(const PktInfoReq *q, const SOCKADDR_IN *to)
 	if (map) str_cpy(p.map, sizeof p.map, map);
 	else fmt(p.map, "Level %d", g_level);
 	send_addr(&p, sizeof p, to);
+}
+
+/* host: what the server list shows of this game (helper.c's BEAT), as PKT_INFO says it */
+static void helper_frame_host(u32 now)
+{
+	NetServerInfo g;
+	const char *folder = custom_game_level_folder(g_level), *map = custom_game_level_name(g_level);
+	u32 addr;
+	u16 port;
+	int news;
+
+	while (helper_take_intro(&addr, &port)) {   /* a player wants in: knock toward it (see "Hole punching") */
+		SOCKADDR_IN a;
+		memset(&a, 0, sizeof a);
+		a.family = 2;
+		a.addr = addr;
+		a.port = port;
+		if (link_of(&a) >= 0) continue;
+		{   /* the log says it once per address (players browsing ask again every few seconds) */
+			static u32 said[8], nsaid;
+			u32 k, key = a.addr ^ (u32)a.port << 16 ^ a.port;
+			for (k = 0; k < nsaid && k < 8 && said[k] != key; k++) {}
+			if (k == nsaid || k == 8) {
+				const u8 *ip = (const u8 *)&a.addr;
+				said[nsaid++ % 8] = key;
+				log_msg("helper: a player at %d.%d.%d.%d:%d is looking at this game: knocking toward it", ip[0], ip[1], ip[2], ip[3], ntohs(a.port));
+			}
+		}
+		punch_add(&a, INTRO_PUNCH_MS, 1);
+	}
+	if ((news = helper_take_news()) >= 0)
+		chat_server(news == 1 ? "Your game is on the server list: players outside your network find it in Join." :
+		            news == 3 ? "Your game isn't on the server list ([host] listed=0), but players can still reach it by address." :
+		            news == 0 ? "The server list is full: players outside your network need /punch (see /help)." :
+		                        "The server list doesn't answer: players outside your network need /punch (see /help).");
+	if (!helper_beat_due(g_sock, now)) return;
+	memset(&g, 0, sizeof g);
+	g.level = g_level;
+	g.players = g_state == S_IDLE ? 1 : bits(present_mask());
+	g.max_players = capacity();
+	g.spectators = bits(players_spectators() & present_mask());
+	g.in_match = g_state != S_LOBBY && !g_warm;
+	g.server_id = g_server_id;
+	str_cpy(g.name, sizeof g.name, g_server_name);
+	if (folder) str_cpy(g.folder, sizeof g.folder, folder);
+	if (map) str_cpy(g.map, sizeof g.map, map);
+	else fmt(g.map, "Level %d", g_level);
+	helper_beat(g_sock, &g);
+}
+
+/* joiner: the host hasn't answered: the helper tells it this PC's address (it knocks back), and
+ * says where the host really is (a CGNAT host's port isn't the one it hosts on) */
+static void helper_frame_join(u32 now)
+{
+	u32 asked, addr;
+	u16 asked_port, port;
+	int known;
+
+	while (helper_intro_ack(g_sock, &asked, &asked_port, &known, &addr, &port)) {
+		if (asked != g_link[0].addr.addr || asked_port != g_link[0].addr.port) continue;
+		if (g_helper_knows != (known ? 1 : -1))
+			log_msg(known ? "net: the helper knows the host and told it this PC's address" : "net: the helper doesn't know that host");
+		g_helper_knows = known ? 1 : -1;
+		if (known && !g_key && (addr != g_link[0].addr.addr || port != g_link[0].addr.port)) {
+			const u8 *ip = (const u8 *)&addr;
+			log_msg("net: the host is at %d.%d.%d.%d:%d on the internet (the helper says)", ip[0], ip[1], ip[2], ip[3], ntohs(port));
+			g_link[0].addr.addr = addr;
+			g_link[0].addr.port = port;
+			g_intro_at = 0;   /* introduce to that address too */
+		}
+	}
+	if (g_key || now - g_opened_at < INTRO_AFTER_MS || (g_intro_at && now - g_intro_at < INTRO_EVERY_MS)) return;
+	g_intro_at = now ? now : 1;
+	helper_intro(g_sock, g_link[0].addr.addr, g_link[0].addr.port);
 }
 
 /* ---- The match's end ------------------------------------------------------------------------ *
@@ -2999,7 +3613,9 @@ static void joining_live(int l, u32 from)
 	k->adv = k->adv_known = 0;
 	k->stamp = k->stamp_at = 0;
 	k->sent_sig = 0;
-	k->spect_gen = from;
+	k->spect_gen = k->live_from = from;
+	k->near_since = 0;
+	k->held_logged = 0;
 	log_msg("net: %s (player %d) caught up to tick %d (the session is at %d): in sync, coming in", mp_name(l), l + 1, from,
 	        g_ticks);
 }
@@ -3007,14 +3623,29 @@ static void joining_live(int l, u32 from)
 /* host: the joining players that are in sync come in. Each needs: inputs from its PC near this
  * PC's ticks, ours reaching it, and every other PC knowing its player (they ran its absent ticks
  * as nothing pressed). It comes in at the first tick whose input isn't made yet: its own inputs
- * count from there, and the host's record says it has a character from there. */
+ * count from there, and the host's record says it has a character from there.
+ * Near means steadily: JOIN_STEADY live ticks of its own first, then JOIN_STEADY of ours in a row
+ * with its inputs within JOIN_GAP and packets coming. Its first live frame does slow one-time
+ * work (rollback's start; the Windows joiner of 2026-11-06 went quiet ~1.4 s there): taken in
+ * at its first input, everyone's game stood still waiting for it (the host 64 frames). Now a
+ * PC that hitches only comes in later. */
 static void joining_frame(void)
 {
+	u32 now = GetTickCount();
 	for (int l = 1; l < NPL && l < (int)g_nplayers; l++) {
 		Link *k = &g_link[l];
 		int known = 1;
 		if (!k->used || k->joining != 2 || !k->adv_known) continue;
-		if (k->spect_gen + JOIN_GAP < g_ticks || k->ack[0] + JOIN_GAP < g_gen) continue;
+		if (k->spect_gen < k->live_from + JOIN_STEADY || k->spect_gen + JOIN_GAP < g_ticks || k->ack[0] + JOIN_GAP < g_gen ||
+		    (int)(now - k->last_recv) > JOIN_QUIET_MS) {
+			if (k->near_since && !k->held_logged++)
+				log_msg("net: %s (player %d) fell behind at tick %d (its inputs up to %d, %d ms since its last packet): it "
+				        "comes in once it keeps up", mp_name(l), l + 1, g_ticks, k->spect_gen, (int)(now - k->last_recv));
+			k->near_since = 0;
+			continue;
+		}
+		if (!k->near_since) k->near_since = g_ticks ? g_ticks : 1;
+		if (g_ticks < k->near_since + JOIN_STEADY) continue;
 		for (int o = 1; o < NPL; o++)
 			if (o != l && live(o) && !g_link[o].joining && o < (int)g_nplayers && !(g_link[o].knows >> l & 1)) known = 0;
 		if (!known) continue;
@@ -3266,22 +3897,58 @@ static void receive(void)
 			if (WSAGetLastError() == 10054) continue;   /* WSAECONNRESET: an earlier send bounced */
 			return;
 		}
+		if (stun_packet(buf, (u32)n, &from)) continue;   /* this PC's internet address (stun.c) */
+		if (helper_packet(g_sock, buf, (u32)n, &from)) continue;   /* the server list and introductions (helper.c) */
 		const PktHead *h = (const PktHead *)buf;
-		if ((u32)n < sizeof *h || h->magic != MAGIC) continue;
+		if ((u32)n < 8 || h->magic != MAGIC) {
+			stranger(&from, "not Arklite's");
+			continue;
+		}
 		g_npackets_recv++;
-		if (h->type == PKT_INFO_REQ && g_mode == NET_HOST && (u32)n >= sizeof(PktInfoReq)) {
-			answer_info((const PktInfoReq *)buf, &from);
+		if (h->type == PKT_INFO_REQ && g_mode == NET_HOST) {   /* the Join list: anyone may ask */
+			if (h->proto == PROTO ? (u32)n >= sizeof(PktInfo) : (u32)n >= 16) answer_info(buf, (u32)n, &from);
 			continue;
 		}
 		l = link_of(&from);
-		if (g_mode == NET_JOIN && l != 0) continue;   /* only the host talks to a joiner */
+		if (g_mode == NET_JOIN && l != 0) {   /* only the host talks to a joiner */
+			stranger(&from, "not the host");
+			continue;
+		}
 		if (g_state == S_IDLE) continue;   /* not in a level yet: the others will resend */
 		if (h->proto != PROTO) {   /* another Arklite: its packets can't be read */
+			if (g_mode == NET_HOST && l < 0 && h->type != PKT_HELLO) {
+				stranger(&from, "another protocol");
+				continue;
+			}
 			if (!(g_problem & NETBAD_PROTO) || GetTickCount() - g_problem_at > LOST_MS)
 				log_msg("net: packet of protocol %d from the %s, this is %d: use the same Arklite.dll on every PC", h->proto,
 				        g_mode == NET_HOST ? "joiner" : "host", PROTO);
 			refuse(g_mode == NET_HOST ? "joiner" : "host", NETBAD_PROTO, 0);
 			continue;
+		}
+		if ((u32)n < sizeof *h) {
+			stranger(&from, "too short");
+			continue;
+		}
+		if (g_mode == NET_HOST && h->key != cookie_of(&from)) {   /* see "Strangers" */
+			/* a would-be joiner's request, or a player's packet whose key went wrong (its PC took a
+			 * forged PKT_COOKIE): the right one back, no bigger than what came */
+			if (((h->type == PKT_HELLO || h->type == PKT_MAP_LIST_REQ || h->type == PKT_MAP_REQ) && (u32)n >= sizeof *h + 8) ||
+			    l >= 0)
+				send_cookie(&from);
+			else
+				stranger(&from, h->key ? "wrong key" : "no key");
+			continue;
+		}
+		if (g_mode == NET_JOIN) {
+			if (h->type == PKT_COOKIE) {
+				joiner_cookie(h->key);
+				continue;
+			}
+			if (!host_keyed(h)) {
+				stranger(&from, "the host's address without this PC's key");
+				continue;
+			}
 		}
 		if (g_mode == NET_HOST && (h->type == PKT_MAP_LIST_REQ || h->type == PKT_MAP_REQ)) {
 			map_serve(buf, n, &from);
@@ -3291,7 +3958,10 @@ static void receive(void)
 			host_hello(l, (const PktHello *)buf, &from);
 			continue;
 		}
-		if (l < 0) continue;   /* everything else only from a PC in this lobby or match */
+		if (l < 0) {   /* everything else only from a PC in this lobby or match */
+			stranger(&from, "not in the game");
+			continue;
+		}
 		if (g_mode == NET_HOST && g_state != S_LOBBY && gone(l)) continue;
 		if (h->type == PKT_HIST_REQ && g_mode == NET_HOST && (u32)n >= sizeof(PktHistReq)) {
 			hist_serve(l, (const PktHistReq *)buf);
@@ -3312,6 +3982,7 @@ static void receive(void)
 			char name[MP_NAME_MAX];
 			memcpy(name, p->name, sizeof name);
 			name[sizeof name - 1] = 0;
+			clean_text(name, sizeof name);
 			if (!str_ieq_n(name, g_link[l].name, MP_NAME_MAX) || str_len(name) != str_len(g_link[l].name)) {
 				if (g_link[l].entered && *g_link[l].name && *name) {   /* a new name (F2 or /name) */
 					char what[CHAT_MAX];
@@ -3333,6 +4004,7 @@ static void receive(void)
 				if (q == g_slot) continue;
 				memcpy(name, p->name[q], sizeof name);
 				name[sizeof name - 1] = 0;
+				clean_text(name, sizeof name);
 				mp_name_set(q, name);
 			}
 		} else if ((h->type == PKT_CHAT && (u32)n >= sizeof(PktChat)) || (h->type == PKT_CHAT_ACK && (u32)n >= sizeof(PktChatAck))) {
@@ -3387,6 +4059,8 @@ static void session_begin(u32 level)
 	memset(g_have, 0, sizeof g_have);
 	memset(g_last_local, 0, sizeof g_last_local);
 	memset(g_mine, 0, sizeof g_mine);
+	if (g_tring)
+		for (u32 k = 0; k < TRING; k++) g_tring[k].tick = 0;
 	memset(g_peer_ping, 0xff, sizeof g_peer_ping);
 	g_last_hash_tick = g_last_hash = 0;
 	g_checks = g_bad_checks = g_first_bad = 0;
@@ -3468,6 +4142,7 @@ static void begin_run(void)
 	} else {
 		players_set_limits(1, g_time_limit * 3600, g_score_limit);
 		mp_sound("objective_new");
+		g_fight_at = GetTickCount() | 1;
 	}
 	log_msg("net: %s on (%s, player %d of %d), RNG %08x/%08x, input delay %d ticks; limits: %d min, %d points",
 	        g_warm ? "warm-up" : "game", mode_name(), g_slot + 1, g_nplayers, g_seed, g_local_seed, g_delay, g_time_limit, g_score_limit);
@@ -3514,6 +4189,9 @@ static void catchup_begin(void)
 	else players_set_limits(1, g_time_limit * 3600, g_score_limit);
 	g_cu_sound = ONgSoundOn;
 	ONgSoundOn = 0;
+	/* here, not in the first live frame (rolling_frame): that frame's time is time the others may
+	 * wait for this PC (on Windows the roster and its textures are part of a ~1.4 s first frame) */
+	hud_textures_prepare();
 	log_msg("net: catching up with the host's %s (player %d), RNG %08x/%08x", g_warm ? "warm-up" : "match", g_slot + 1, g_seed,
 	        g_local_seed);
 }
@@ -3752,6 +4430,7 @@ static void start_match(void)
 		g_nplayers = lobby_players();
 		g_slot = 0;
 		lockstep_get_seeds(&g_match_seed, &g_match_local_seed);
+		g_match_seed ^= GetTickCount() * 0x9e3779b1u;   /* the spawn points too: new each match */
 		g_go_session = g_go_session ? g_go_session + 1 : (GetTickCount() | 1);
 		for (int i = 0; i < 3; i++) send_lobby_all(1);   /* and again for each HELLO that still says lobby */
 	}
@@ -3787,10 +4466,38 @@ static void host_go(int warm)
 }
 
 /* A joiner the running session doesn't have wants in */
+/* host: when a warm-up last reloaded to let a PC at each IP address in (by address, not by link:
+ * one that leaves and comes back is a new link). See RELOAD_EVERY_MS. */
+#define RELOAD_IPS 8
+static struct { u32 addr, at; } g_reload_ip[RELOAD_IPS];
+
+static u32 *reload_ip_at(u32 addr, int make)
+{
+	int oldest = 0;
+	for (int i = 0; i < RELOAD_IPS; i++) {
+		if (g_reload_ip[i].at && g_reload_ip[i].addr == addr) return &g_reload_ip[i].at;
+		if (g_reload_ip[i].at < g_reload_ip[oldest].at) oldest = i;
+	}
+	if (!make) return 0;
+	g_reload_ip[oldest].addr = addr;
+	return &g_reload_ip[oldest].at;
+}
+
 static int newcomers(void)
 {
-	for (int l = 1; l < NPL; l++)
-		if (g_link[l].used && (g_link[l].waiting || g_link[l].rejoin)) return 1;
+	u32 now = GetTickCount();
+	for (int l = 1; l < NPL; l++) {
+		Link *k = &g_link[l];
+		u32 *at;
+		if (!k->used || !(k->waiting || k->rejoin)) continue;
+		if ((at = reload_ip_at(k->addr.addr, 0)) && now - *at < RELOAD_EVERY_MS) {
+			if (!k->reload_held++)
+				log_msg("net: %s (player %d) wants in again %d s after the last reload for its address: it waits for the next one",
+				        mp_name(l), l + 1, (now - *at) / 1000);
+			continue;
+		}
+		return 1;
+	}
 	return 0;
 }
 
@@ -3818,7 +4525,16 @@ static int ready_frame(u32 now)
 		else send_lobby_all(0);
 	}
 	if (g_mode == NET_JOIN) {
+		char a[32], t[CHAT_MAX];
 		if (now - g_last_hello >= HELLO_MS) send_hello();
+		/* the host never answered: maybe it's behind a NAT that only opens with /punch */
+		if (g_state == S_LOBBY && !g_host_heard && !g_key && !g_problem && now - g_opened_at >= (g_helper_knows > 0 ? HINT_HELPED_MS : HINT_AFTER_MS) &&
+		    stun_text(a) &&
+		    !str_ieq_n(a, g_hint_addr, sizeof g_hint_addr)) {
+			str_cpy(g_hint_addr, sizeof g_hint_addr, a);
+			fmt(t, "The host doesn't answer. If it's outside your network, it types: /punch %s", a);
+			chat_server(t);
+		}
 		if (g_state == S_LOBBY && g_host_heard && (int)(now - g_link[0].last_recv) > LOST_MS) {
 			log_msg("net: nothing from the host for %d s", LOST_MS / 1000);
 			server_line(mp_name(0), "left the game");
@@ -3850,6 +4566,12 @@ static int ready_frame(u32 now)
 		log_msg("net: %d player%s: the warm-up %s%s", players, players == 1 ? "" : "s",
 		        g_state == S_LOBBY ? "starts" : "starts again for the new player",
 		        g_state == S_LOBBY && solo_session() ? " (players who come join it as it goes on)" : "");
+		if (g_state != S_LOBBY)
+			for (int l = 1; l < NPL; l++)
+				if (g_link[l].used && (g_link[l].waiting || g_link[l].rejoin)) {
+					*reload_ip_at(g_link[l].addr.addr, 1) = now ? now : 1;
+					g_link[l].reload_held = 0;
+				}
 		host_go(1);
 		return 1;
 	}
@@ -3923,6 +4645,9 @@ void net_hud(NetHud *h)
 	h->countdown_ms = -1;
 	if (g_mode == NET_OFF) return;
 	h->present = present_mask() | (1u << h->local_player);
+	/* the host never answered: this PC's address for its /punch (see "Hole punching") */
+	if (g_mode == NET_JOIN && g_state == S_LOBBY && !g_host_heard && !g_problem && now - g_opened_at >= HINT_AFTER_MS)
+		stun_text(h->punch_me);
 	if (g_mode == NET_HOST) {
 		h->connected = 1;
 		h->players = ready_players();
@@ -3961,6 +4686,8 @@ void net_hud(NetHud *h)
 		}
 	}
 	if (g_state == S_LOST) h->lost = g_lost_left ? 2 : 1;
+	if (g_fight_at && g_state == S_RUN && !g_warm && now - g_fight_at < FIGHT_MS) h->fight_ms = (int)(FIGHT_MS - (now - g_fight_at));
+	else g_fight_at = 0;
 	h->time_limit = g_time_limit;
 	h->score_limit = g_score_limit;
 	if (g_state != S_RUN && g_state != S_OVER)
@@ -4178,16 +4905,23 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 	}
 
 	rb_fill_frames(n);
+	u32 first_t0 = 0, tex_us = 0;
 	if (n && !g_rb_started) {   /* the match's first tick (or a joining PC's first live one) */
+		first_t0 = counter();
 		if (!g_ticks) lockstep_set_seeds(g_seed, g_local_seed);
 		g_sound_on = ONgSoundOn;
 		hud_textures_prepare();   /* a rewind mustn't see them made */
+		tex_us = us(counter() - first_t0);
 		g_rb_started = rollback_net_begin();
 		log_msg("net: rollback %s: no input delay, the %s' inputs guessed and corrected up to %d ticks back%s",
 		        g_rb_started ? "on" : "FAILED", others(), RB_AHEAD, g_record ? " (recording is off with rollback)" : "");
 	}
 	players_net_frame(g_frames, n);
-	return run_update(n, ticks_run);
+	u32 err = run_update(n, ticks_run);
+	if (first_t0)
+		log_msg("net: rollback's first frame took %d ms (%d ticks; the HUD's textures %d ms)", us(counter() - first_t0) / 1000, n,
+		        tex_us / 1000);
+	return err;
 }
 
 /* lockstep.c's update hook, in place of the update, while networking is on */
@@ -4201,6 +4935,11 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 		players_net_frame(0, 0);
 		return ONrGameState_Update(count, actions, ticks_run);
 	}
+	stun_frame(g_sock, now);
+	helper_frame(g_sock, now);
+	if (g_mode == NET_HOST) helper_frame_host(now);
+	else helper_frame_join(now);
+	punch_frame(now);
 	if (g_reload) {   /* the session has ended: the game stands until the dialogs are gone */
 		if (!live_menu_open()) {
 			reload_level(g_reload - 1, g_reload_seeds);
@@ -4217,6 +4956,16 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	if (g_state == S_IDLE) {
 		players_net_frame(0, 0);
 		return ONrGameState_Update(count, actions, ticks_run);
+	}
+	if (g_mode == NET_HOST) {   /* what the router said to upnp.c's request, in the host's chat */
+		const char *m = upnp_take_message();
+		char a[32], t[CHAT_MAX];
+		if (m) chat_server(m);
+		if (stun_take_change() && stun_text(a)) {   /* see "Hole punching" */
+			if (helper_on()) fmt(t, "Your internet address: %s", a);   /* the helper's line says how players get in */
+			else fmt(t, "Your internet address: %s. Players outside your network may need /punch (see /help)", a);
+			chat_server(t);
+		}
 	}
 
 	/* Esc: action bit 0 opens the pause menu inside the tick (0x4faec0), but it's kept out of the
@@ -4986,21 +5735,34 @@ static int net_open(void)
 		log_msg("net: Winsock didn't start, networking off");
 		return 0;
 	}
-	g_sock = socket(2 /* AF_INET */, 2 /* SOCK_DGRAM */, 17 /* IPPROTO_UDP */);
-	if (g_sock == INVALID_SOCKET) {
-		log_msg("net: no UDP socket (error %d), networking off", WSAGetLastError());
-		return 0;
-	}
-	memset(&local, 0, sizeof local);
-	local.family = 2;
-	local.port = g_mode == NET_HOST ? htons(g_port) : 0;   /* the joiner: any free port */
-	if (bind(g_sock, &local, sizeof local)) {
-		log_msg("net: can't use UDP port %d (error %d; another host running?), networking off", g_port, WSAGetLastError());
-		closesocket(g_sock);
-		g_sock = INVALID_SOCKET;
-		return 0;
+	if (g_mode == NET_JOIN && g_adopt != INVALID_SOCKET) {   /* see "Hole punching" */
+		g_sock = g_adopt;
+		g_adopt = INVALID_SOCKET;
+		log_msg("net: the game goes on with the Join list's socket (its way through the NATs, if punched, stays open)");
+	} else {
+		g_sock = socket(2 /* AF_INET */, 2 /* SOCK_DGRAM */, 17 /* IPPROTO_UDP */);
+		if (g_sock == INVALID_SOCKET) {
+			log_msg("net: no UDP socket (error %d), networking off", WSAGetLastError());
+			return 0;
+		}
+		stun_reset();
+		memset(&local, 0, sizeof local);
+		local.family = 2;
+		local.port = g_mode == NET_HOST ? htons(g_port) : 0;   /* the joiner: any free port */
+		if (bind(g_sock, &local, sizeof local)) {
+			log_msg("net: can't use UDP port %d (error %d; another host running?), networking off", g_port, WSAGetLastError());
+			closesocket(g_sock);
+			g_sock = INVALID_SOCKET;
+			return 0;
+		}
 	}
 	ioctlsocket(g_sock, FIONBIO, &on);
+	g_key = 0;   /* joiner: the host gives this address its key (see "Strangers") */
+	g_opened_at = GetTickCount();
+	g_hint_addr[0] = 0;
+	g_intro_at = 0;
+	g_helper_knows = 0;
+	if (g_mode == NET_HOST) make_secret();
 	{   /* room for a map download's bursts (Windows' default is 64 KB) */
 		int rcv = 4 << 20, snd = 1 << 20;
 		setsockopt(g_sock, 0xffff /* SOL_SOCKET */, 0x1002 /* SO_RCVBUF */, &rcv, 4);
@@ -5008,6 +5770,7 @@ static int net_open(void)
 	}
 	if (!g_images)
 		g_images = VirtualAlloc(0, HASH_SLOTS * IMG_CHARS * sizeof(CharImage), 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
+	if (!g_tring) g_tring = VirtualAlloc(0, TRING * sizeof(TickRec), 0x3000, 4);
 	if (g_mode == NET_JOIN) {
 		memset(&g_link[0], 0, sizeof g_link[0]);
 		g_slot = 1;   /* until the host's lobby says which player this PC is */
@@ -5024,6 +5787,7 @@ static int net_open(void)
 	} else {
 		g_slot = 0;
 		log_msg("net: hosting on UDP port %d", g_port);
+		upnp_start(g_port);   /* players on the internet: the router forwards the port here (upnp.c) */
 	}
 	return 1;
 }
@@ -5061,8 +5825,12 @@ static void net_leave(void)
 {
 	lobby_goodbye();
 	session_end("left from the menu");
-	if (g_sock != INVALID_SOCKET) closesocket(g_sock);
+	upnp_stop();
+	if (g_sock != INVALID_SOCKET) helper_closed(g_sock), closesocket(g_sock);
 	g_sock = INVALID_SOCKET;
+	if (g_adopt != INVALID_SOCKET) closesocket(g_adopt);
+	g_adopt = INVALID_SOCKET;
+	memset(g_punch, 0, sizeof g_punch);
 	memset(g_link, 0, sizeof g_link);
 	names_push();
 	g_match_pending = 0;
@@ -5086,7 +5854,7 @@ void net_menu_local(void)
 	log_msg("net: off, playing alone");
 }
 
-void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectators, u32 time_limit, int score_limit)
+void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit)
 {
 	net_leave();
 	g_startup_mode = 0;
@@ -5095,13 +5863,12 @@ void net_menu_host(u32 port, const char *name, u32 max_players, u32 max_spectato
 	g_port = (u16)(port >= 1 && port <= 65535 ? port : DEFAULT_PORT);
 	str_cpy(g_server_name, sizeof g_server_name, name && name[0] ? name : "New Oni multiplayer game");
 	g_max_players = max_players >= 2 && max_players <= NET_PLAYERS_MAX ? max_players : NET_PLAYERS_MAX;
-	g_max_spectators = max_spectators;
 	g_time_limit = time_limit;
 	g_score_limit = score_limit;
 	g_server_id = GetTickCount() * 2654435761u ^ (u32)GetCurrentProcessId();
 	net_prepare();
-	log_msg("net: hosting \"%s\" on UDP port %d, %d players, %d spectators, %d min, %d points", g_server_name, g_port,
-	        g_max_players, g_max_spectators, g_time_limit, g_score_limit);
+	log_msg("net: hosting \"%s\" on UDP port %d, %d players, %d min, %d points", g_server_name, g_port,
+	        g_max_players, g_time_limit, g_score_limit);
 }
 
 void net_menu_join(const char *address)
@@ -5109,6 +5876,10 @@ void net_menu_join(const char *address)
 	net_leave();
 	g_startup_mode = 0;
 	g_mode = NET_JOIN;
+	if (g_qsock != INVALID_SOCKET) {   /* the game goes on with it (see "Hole punching") */
+		g_adopt = g_qsock;
+		g_qsock = INVALID_SOCKET;
+	}
 	str_cpy(g_join, sizeof g_join, address);
 	net_prepare();
 	join_install();
@@ -5116,8 +5887,6 @@ void net_menu_join(const char *address)
 }
 
 /* ---- Server info for the Join list ------------------------------------------------------- */
-
-static u32 g_qsock = INVALID_SOCKET;
 
 static int query_open(void)
 {
@@ -5189,19 +5958,19 @@ int net_resolve_poll(u32 *addr, u16 *port)
 
 void net_query_send(u32 token, u32 addr, u16 port)
 {
-	PktInfoReq q;
+	union { PktInfoReq q; u8 pad[sizeof(PktInfo)]; } u;   /* as big as the answer (see "Strangers") */
 	SOCKADDR_IN to;
 
 	if (!query_open()) return;
-	memset(&q, 0, sizeof q);
-	head(&q.h, PKT_INFO_REQ);
-	q.token = token;
-	q.sent = GetTickCount();
+	memset(&u, 0, sizeof u);
+	head(&u.q.h, PKT_INFO_REQ);
+	u.q.token = token;
+	u.q.sent = GetTickCount();
 	memset(&to, 0, sizeof to);
 	to.family = 2;
 	to.addr = addr;
 	to.port = port;
-	sendto(g_qsock, &q, sizeof q, 0, &to, sizeof to);
+	sendto(g_qsock, &u, sizeof u, 0, &to, sizeof to);
 }
 
 /* Servers on this PC and the local network: the default port and Arklite.ini's */
@@ -5222,6 +5991,8 @@ int net_query_poll(NetServerInfo *out)
 	int len, n;
 
 	if (g_qsock == INVALID_SOCKET) return 0;
+	stun_frame(g_qsock, GetTickCount());   /* the address a host behind CGNAT punches toward (see "Hole punching") */
+	helper_frame(g_qsock, GetTickCount());
 	for (;;) {
 		len = sizeof from;
 		n = recvfrom(g_qsock, buf, sizeof buf, 0, &from, &len);
@@ -5229,13 +6000,21 @@ int net_query_poll(NetServerInfo *out)
 			if (WSAGetLastError() == 10054) continue;   /* WSAECONNRESET: nobody on that port */
 			return 0;
 		}
+		if (stun_packet(buf, (u32)n, &from) || helper_packet(g_qsock, buf, (u32)n, &from)) continue;
 		const PktInfo *p = (const PktInfo *)buf;
 		if ((u32)n < sizeof p->h || p->h.magic != MAGIC || p->h.type != PKT_INFO) continue;
 		memset(out, 0, sizeof *out);
-		/* another protocol's reply may not be laid out like ours: only its token and time count */
-		if ((u32)n < 3 * 4 + sizeof p->h) continue;
-		out->token = p->token;
-		out->ping_ms = GetTickCount() - p->sent;
+		/* another protocol's reply may not be laid out like ours: only its token and time count
+		 * (before protocol 19 the head was 8 bytes, the token and time right after it) */
+		if (p->h.proto < 19) {
+			if ((u32)n < 16) continue;
+			out->token = ((const u32 *)buf)[2];
+			out->ping_ms = GetTickCount() - ((const u32 *)buf)[3];
+		} else {
+			if ((u32)n < 3 * 4 + sizeof p->h) continue;
+			out->token = p->token;
+			out->ping_ms = GetTickCount() - p->sent;
+		}
 		out->from_addr = from.addr;
 		out->from_port = from.port;
 		out->same_version = p->h.proto == PROTO && (u32)n >= sizeof *p;
@@ -5256,9 +6035,25 @@ int net_query_poll(NetServerInfo *out)
 	}
 }
 
+/* The Join list: the helper's server list, and introductions to hosts that don't answer (helper.c) */
+void net_helper_list(void)
+{
+	if (query_open()) helper_list(g_qsock);
+}
+
+void net_helper_intro(u32 addr, u16 port)
+{
+	if (query_open()) helper_intro(g_qsock, addr, port);
+}
+
+int net_helper_intro_ack(u32 *asked_addr, u16 *asked_port, int *known, u32 *addr, u16 *port)
+{
+	return g_qsock != INVALID_SOCKET && helper_intro_ack(g_qsock, asked_addr, asked_port, known, addr, port);
+}
+
 void net_query_close(void)
 {
-	if (g_qsock != INVALID_SOCKET) closesocket(g_qsock);
+	if (g_qsock != INVALID_SOCKET) helper_closed(g_qsock), closesocket(g_qsock);
 	g_qsock = INVALID_SOCKET;
 }
 
@@ -5275,11 +6070,12 @@ void net_install(void)
 	    patch_call(0x4fb170, (u32)ONrCamera_Update, (u32)camera_update))
 		log_msg("net: the camera follows this PC's player");
 
+	helper_set_proto(PROTO);   /* the server list shows only games of this protocol */
+
 	/* The server's description, as the Host dialog saved it */
 	GetPrivateProfileStringA("host", "name", g_server_name, g_server_name, sizeof g_server_name, ini_path());
 	g_max_players = GetPrivateProfileIntA("host", "max_players", NET_PLAYERS_MAX, ini_path());
 	if (g_max_players < 2 || g_max_players > NET_PLAYERS_MAX) g_max_players = NET_PLAYERS_MAX;   /* (an older Arklite allowed 64) */
-	g_max_spectators = GetPrivateProfileIntA("host", "max_spectators", 0, ini_path());
 	g_time_limit = GetPrivateProfileIntA("host", "time_limit", 10, ini_path());
 	g_score_limit = (int)GetPrivateProfileIntA("host", "score_limit", 20, ini_path());
 	if (g_time_limit > NET_TIME_LIMIT_MAX) g_time_limit = 10;   /* (a negative one reads as huge) */
@@ -5347,6 +6143,7 @@ void net_exit(void)
 {
 	lobby_goodbye();
 	session_end("game closed");
+	upnp_stop();
 	net_query_close();
 	if (g_sock != INVALID_SOCKET) closesocket(g_sock);
 	g_sock = INVALID_SOCKET;

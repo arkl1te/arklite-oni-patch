@@ -1,0 +1,29 @@
+[Unit]
+Description=Arklite helper (Oni multiplayer server list and introductions)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -I /opt/arklite-helper/arklite_helper.py --port 27780
+Restart=always
+RestartSec=2
+# its own throwaway user, and nothing on the disk it can change
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

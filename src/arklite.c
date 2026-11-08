@@ -46,7 +46,8 @@
  *   - Two PCs over UDP (net.c): multiplayer step 3, lockstep with input delay; a lobby where F3
  *     readies up, a 7 s countdown, then the match. On-screen text and score (mp_hud.c).
  *   - Flickering and pulsing vertex lights in custom levels (vertex_light.c): Catwalk's
- *     vertexlight.bin, applied to the level's quad colors every frame.
+ *     vertexlight.bin, applied to the level's quad colors every frame; their sounds, and a
+ *     flickering light's ambient Sound object playing only while the flicker fails.
  *   - Particles that turn with Catwalk's spinning groups (spin_particle.c): spinparticles.bin.
  *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
 
@@ -159,6 +160,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	random_class_install();
 	texture_clamp_install();
 	particle_table_install();
+	vertex_light_install();
 	respawn_fx_install();
 	char_limit_install();
 	players_install();

@@ -50,8 +50,10 @@
  * (ONrGameState_DeleteCharacter 0x4dc480) and spawned again from its own placement, moved to the
  * spawn point. A character spawned from a placement takes the placement's position (+0xc) and
  * facing (+0x228). The pick is random among the points no other living player is near (the
- * farthest one if none), from a hash of the level, the tick and the player, so every PC and
- * every replay picks the same. Respawning runs in the tick, right after every player's input.
+ * farthest one if none), from a hash of the level, the tick, the player and the level load's
+ * spawn seed (choose_spawn_seed: in a network game the host's match seed, so every PC picks the
+ * same; offline the clock's; a replay its recording's), so every game starts somewhere new and
+ * every PC and replay agrees. Respawning runs in the tick, right after every player's input.
  *
  * Character choice (F2, char_menu.c): word 11 of each player's action record carries the class
  * that player comes back as (PLAYERS_CHOICE_TAG | ONCC instance number + 1, or the tag alone
@@ -63,8 +65,11 @@
  * variant) while the character is made, then puts both back. The first spawn always uses the
  * placement's class. The choices start over with the level and with a network match.
  *
- * A living player doesn't have to die: a new choice changes their class at once, wherever they
- * are, as the shapeshifter cheat does (0x4d7c30: ECX the character, EDX the ONCC; called from
+ * In a network match (not the warm-up: players_set_limits on) a living player's new choice waits
+ * for their respawn; only the first choice the tick sees for them in the match (the one they made
+ * in the warm-up, or before joining in progress) still changes them at once, so nobody starts the
+ * match as the map's class. Elsewhere (the warm-up, a game alone) a living player doesn't have to
+ * die: a new choice changes their class at once, wherever they are, as the shapeshifter cheat does (0x4d7c30: ECX the character, EDX the ONCC; called from
  * utility input at 0x4f62fb). It swaps the class (char +0xc) and its animations in place, so
  * position, health, weapons and inventory stay. Choosing the map's class goes back to the class
  * the player was spawned as. Every PC does it in the tick from the shared input, like
@@ -72,7 +77,7 @@
  * who comes back as another class gets the health the map gives its own player (the maximum,
  * +0x3c, the player had when spawned with the placement's class; current health +0x38
  * set to it too), so every character is as tough as the map's Konoko. On a multiplayer map that
- * health is MP_HEALTH (100) for every player and class, set at each spawn; the in-place class
+ * health is MP_HEALTH (125) for every player and class, set at each spawn; the in-place class
  * change (0x4d7c30) doesn't touch health, so it stays.
  *
  * Kill camera (a level's cm_detach, as in Level 3's vat: the camera stays and the dead player drops
@@ -144,11 +149,13 @@ typedef unsigned long long u64;
 #define CHR_POS(c)      ((float *)((c) + 0x148))
 #define CHR_HEALTH(c)   (*(int *)((c) + 0x38))
 #define CHR_MAX_HEALTH(c) (*(int *)((c) + 0x3c))
-#define MP_HEALTH       100   /* every player's health on a multiplayer map */
+#define MP_HEALTH       125   /* every player's health on a multiplayer map */
 #define CHR_DEATH_TICK(c) (*(u32 *)((c) + 0x1638))
 
 __declspec(dllimport) HANDLE WINAPI LoadLibraryA(const char *);
 __declspec(dllimport) void * WINAPI GetProcAddress(HANDLE, const char *);
+__declspec(dllimport) int  WINAPI QueryPerformanceCounter(u64 *);
+__declspec(dllimport) u32  WINAPI GetTickCount(void);
 void *memset(void *, int, unsigned);
 void *memcpy(void *, const void *, unsigned);
 
@@ -179,6 +186,10 @@ static u32 g_count = 2;                /* players to spawn (players_set_count) *
 static u8 *g_spawn[MAX_SPAWN];         /* Player-flagged placements: [s] slot s's, then spawn points only */
 static int g_nspawn;
 static u32 g_spawn_level;             /* for the spawn pick only: the level isn't current yet */
+static u32 g_spawn_seed;              /* this level load's spawn picks (players_spawn_seed) */
+static u32 g_next_spawn_seed;         /* players_set_spawn_seed's, for the next load */
+static int g_next_spawn_seed_set;
+static int g_spawn_seed_due = 1;      /* a level is loading (players_level_begin): pick a new seed */
 static u32 g_respawn_ticks = 90;       /* dead this long, an attack button brings a player back */
 /* Score (see "Score" below) */
 #define KILL_CREDIT     600     /* 10 s */
@@ -187,6 +198,9 @@ static int g_class[PL] TICK_STATE = { -1, -1, -1, -1 };   /* ONCC instance numbe
 static int g_base_health[PL] TICK_STATE;          /* each player's maximum health with the map's class */
 static int g_as[PL] TICK_STATE = { -1, -1, -1, -1 };      /* the class each player's character is, -1: the map's */
 static u8 *g_map_class[PL] TICK_STATE;            /* the ONCC each player was last spawned as with the map's class */
+/* Match (not warm-up): a choice waits for the respawn, except the first one the tick sees for the
+ * player (made in the warm-up or before joining), which still changes them at once */
+static u8 g_noted[PL] TICK_STATE, g_settled[PL] TICK_STATE;
 static int g_hit_by[PL] TICK_STATE = { -1, -1, -1, -1 };
 static u32 g_hit_tick[PL] TICK_STATE;
 static u32 g_last_owner[PL] TICK_STATE;           /* last hit's owner handle that credited no one */
@@ -529,6 +543,7 @@ static void note_choice(int who, const u32 *rec)
 	if ((rec[11] & PLAYERS_CHOICE_MASK) != PLAYERS_CHOICE_TAG) return;
 	if (who == 0) spectate_tick(0, rec[11]);   /* the others' in set_input: they may have no character */
 	g_class[who] = (int)(rec[11] & PLAYERS_CLASS_MASK) - 1;
+	g_noted[who] = 1;
 	emote_tick(who, rec[11]);
 }
 
@@ -656,9 +671,39 @@ static int choose_spawn(const float *const *avoid, int navoid, u32 who)
 		if (d > far_d) { far_d = d; far = i; }
 	}
 	if (!nfree) return far;
-	u32 r = hash(g_spawn_level * 0x9e3779b9u ^ hash(GS_TICK(ONgGameState) * 0x85ebca6bu + who));
+	u32 r = hash(g_spawn_level * 0x9e3779b9u ^ g_spawn_seed ^ hash(GS_TICK(ONgGameState) * 0x85ebca6bu + who));
 	return free[r % nfree];
 }
+
+/* The seed of a level load's spawn picks: the one net.c set for a synced load (the host's, the
+ * same on every PC), a replay's own (its header), else the clock's, so every game starts
+ * somewhere new. The tick and the player still make each pick of the load differ. */
+static u32 choose_spawn_seed(void)
+{
+	u64 now = 0;
+	u32 seed;
+
+	g_spawn_seed_due = 0;
+	if (g_next_spawn_seed_set) {
+		g_next_spawn_seed_set = 0;
+		return g_next_spawn_seed;
+	}
+	if (lockstep_replay_spawn_seed(&seed)) return seed;
+	QueryPerformanceCounter(&now);
+	return hash((u32)now ^ hash((u32)(now >> 32) + GetTickCount())) | 1;
+}
+
+void players_set_spawn_seed(u32 seed)
+{
+	g_next_spawn_seed = seed;
+	g_next_spawn_seed_set = 1;
+}
+
+u32 players_spawn_seed(void) { return g_spawn_seed; }
+
+/* Only a level load picks a new seed: the game's walk at 0x4f6200 spawns a player in a tick
+ * when there's none, and a seed from the clock there would differ on every PC */
+void players_level_begin(void) { g_spawn_seed_due = 1; }
 
 static u8 ONI_FC collect_spawn(u8 *obj, u32 unused)
 {
@@ -772,6 +817,7 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 	memset(g_killcam, 0, sizeof g_killcam);
 	g_spect = 0;   /* everyone is spawned; watchers' records park them again in the first tick */
 	g_spawn_level = ONrLevel_GetCurrent();
+	if (g_spawn_seed_due || g_next_spawn_seed_set) g_spawn_seed = choose_spawn_seed();
 	OBJrEnumerate(OBJcType_CHAR, collect_spawn, 0);
 	mp_rules_level();   /* multiplayer_map() is known now, and no character is made yet */
 	g_ntaken = 0;
@@ -797,6 +843,7 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 		g_base_health[s] = 0;
 		g_map_class[s] = 0;
 		g_as[s] = -1;
+		g_noted[s] = g_settled[s] = 0;
 	}
 	if (GS_PLAYER(ONgGameState)) {
 		if (multiplayer_map())
@@ -885,12 +932,21 @@ static int alive(u8 *c)
 	return c && (CHR_FLAGS(c) & CHR_INUSE) && !(CHR_FLAGS(c) & CHR_DEAD);
 }
 
+/* In a match a living player's new choice waits for the respawn (make_player), apart from their
+ * first (see g_settled) */
+static int waits_for_respawn(int who) { return g_limits_on && g_settled[who]; }
+
 /* A new choice while alive: the class changes in place, as the shapeshifter cheat does it */
 static void change_class(int who, u8 *c)
 {
 	u8 *oncc = 0;
 
-	if (!alive(c) || g_class[who] == g_as[who]) return;
+	if (!alive(c) || waits_for_respawn(who)) return;
+	if (g_limits_on) {   /* a match: this is the player's first choice, if the tick has seen one */
+		if (!g_noted[who]) return;
+		g_settled[who] = 1;
+	}
+	if (g_class[who] == g_as[who]) return;
 	if (g_class[who] < 0) oncc = g_map_class[who];
 	else if (TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, (u32)g_class[who], (void **)&oncc)) oncc = 0;
 	g_as[who] = g_class[who];
@@ -919,6 +975,7 @@ static void join_player(int who)
 
 	g_score[who] = 0;
 	g_class[who] = g_as[who] = -1;
+	g_noted[who] = g_settled[who] = 0;
 	g_hit_by[who] = -1;
 	g_hit_tick[who] = g_last_owner[who] = g_death_tick[who] = 0;
 	g_last_cause[who] = OBIT_SKULL;
@@ -1218,7 +1275,10 @@ void players_note_hit(u8 *victim, u8 *attacker, u32 owner)
 	g_hit_weapon[v] = weapon;
 }
 
-int players_can_change(int who) { return who >= 0 && who < PL && multiplayer_map() && alive(player_char(who)); }
+int players_can_change(int who)
+{
+	return who >= 0 && who < PL && multiplayer_map() && alive(player_char(who)) && !waits_for_respawn(who);
+}
 
 int players_score(int who) { return who >= 0 && who < PL ? g_score[who] : 0; }
 
@@ -1286,6 +1346,7 @@ void players_reset_scores(void)
 		g_death_tick[who] = 0;
 		g_class[who] = -1;
 		g_as[who] = -1;
+		g_noted[who] = g_settled[who] = 0;
 		g_killcam[who] = 0;
 		u8 *c = player_char(who);
 		g_was_dead[who] = c && (CHR_FLAGS(c) & CHR_DEAD);

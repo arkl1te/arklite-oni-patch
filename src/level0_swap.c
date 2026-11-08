@@ -35,6 +35,8 @@
 #define LEVEL0_INDEX                  1          /* file_index of level0_Final */
 #define GHOST_LEVEL_FIRST             126        /* above every real level number */
 #define GHOSTS_MAX                    3          /* each costs ~172 MB of Oni's 2 GB */
+#define TMcDynamicPixelsMov           0x420f47   /* mov edx, 0x200000; mov ecx, 0x100 (the run-long dynamic file) */
+#define DYNAMIC_PIXELS                (16u << 20)
 
 static char g_path[0x100];   /* the level file table's slot 0 entry points here after a swap */
 static char g_dir[0x100];
@@ -83,6 +85,8 @@ static int ghost_level0(void)
 	return 0;
 }
 
+int level0_swaps(void) { return g_ghosts; }
+
 int level0_swap(const char *dir)
 {
 	u16 error;
@@ -116,6 +120,24 @@ int level0_swap(const char *dir)
 
 void level0_swap_install(void)
 {
+	/* The dynamic instance file that lasts the whole run (0x4209e0 makes it: 256 instances, 2 MB of
+	 * pixels, at 0x420f47 mov edx, 0x200000, which Daodan makes 4 MB): every level 0 load puts its text system's font
+	 * textures there and nothing frees them, so the second swap ran out ("Unable to allocate the
+	 * pixels", Motoko_Texture.c 197, then "Unable to create texture map", BFW_TextSystem.c 690)
+	 * and every texture and font drew white. 16 MB holds the original load and GHOSTS_MAX swaps.
+	 * Patched before Oni starts (Arklite loads with Daodan, ahead of 0x4209e0). */
+	const u8 *c = (const u8 *)TMcDynamicPixelsMov;
+	static const u8 ecx_256[] = { 0xb9, 0x00, 0x01, 0x00, 0x00 };   /* mov ecx, 0x100 after it */
+	if (c[0] == 0xba && code_matches(TMcDynamicPixelsMov + 5, ecx_256, sizeof ecx_256)) {
+		u32 was = *(const u32 *)(c + 1), size = DYNAMIC_PIXELS;   /* (Daodan makes it 4 MB) */
+		if (was < size) {
+			patch_write(TMcDynamicPixelsMov + 1, &size, 4);
+			log_msg("level0 swap: the run's dynamic textures get %u MB of pixels (was %u KB)", size >> 20, was >> 10);
+		}
+	} else {
+		log_msg("level0 swap: 0x%x isn't the dynamic file's size (%02x %02x %02x %02x %02x): a second level0 swap may draw white",
+		        TMcDynamicPixelsMov, c[0], c[1], c[2], c[3], c[4]);
+	}
 	patch_call(BDcRegisterCallTM, BDrRegisterClass, (u32)register_class);
 	patch_call(BDcRegisterCallIE, BDrRegisterClass, (u32)register_class);
 }

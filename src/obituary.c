@@ -1,5 +1,5 @@
-/* The kill feed: each death in a multiplayer game as a line in the top right corner, under the
- * score, in pictures rather than words: "Killer [icon] Victim", or "[icon] Victim" for a death
+/* The kill feed: each death in a multiplayer game as a line in the top left corner (the score
+ * has the top right), in pictures rather than words: "Killer [icon] Victim", or "[icon] Victim" for a death
  * nobody is credited with (players.c "Score": the same deaths that cost a point).
  *
  * Icons, by how the death was caused (players.c works it out from the hits, see obit_hit_cause):
@@ -212,7 +212,7 @@ static void icon_draw(const u8 *texture, int x, int y, int size, u32 alpha)
 #define YELLOW  0x00ffe040u
 #define GAP     8   /* between a name and the icon */
 
-/* From the HUD (mp_hud.c), with its text font: lines from y down, right-aligned to x */
+/* From the HUD (mp_hud.c), with its text font: lines from y down, left-aligned to x */
 void obit_draw(int x, int y, int local)
 {
 	u32 now;
@@ -225,7 +225,7 @@ void obit_draw(int x, int y, int local)
 		const Obit *o = &g_obit[i];
 		const u8 *icon;
 		u32 age, alpha;
-		int right = x, ty = y + (size - line) / 2;
+		int left = x, ty = y + (size - line) / 2;
 
 		if (!o->tick || now + 1 < o->tick) continue;   /* none, or from before a level restart */
 		age = now + 1 - o->tick;
@@ -233,11 +233,13 @@ void obit_draw(int x, int y, int local)
 		alpha = age + OBIT_FADE <= OBIT_TICKS ? 255 : (OBIT_TICKS - age) * 255 / OBIT_FADE;
 		icon = o->kind == OBIT_WEAPON && o->weapon ? ONWC_ICON(o->weapon) : g_icon[g_kind_icon[o->kind]];
 
-		mp_hud_text(mp_name(o->victim), right, ty, MP_RIGHT, alpha << 24 | (o->victim == local ? YELLOW : WHITE));
-		right -= mp_hud_text_width(mp_name(o->victim), -1) + GAP + size;
-		if (icon) icon_draw(icon, right, y, size, alpha);
-		if (o->killer >= 0)
-			mp_hud_text(mp_name(o->killer), right - GAP, ty, MP_RIGHT, alpha << 24 | (o->killer == local ? YELLOW : WHITE));
+		if (o->killer >= 0) {
+			mp_hud_text(mp_name(o->killer), left, ty, MP_LEFT, alpha << 24 | (o->killer == local ? YELLOW : WHITE));
+			left += mp_hud_text_width(mp_name(o->killer), -1) + GAP;
+		}
+		if (icon) icon_draw(icon, left, y, size, alpha);
+		left += size + GAP;
+		mp_hud_text(mp_name(o->victim), left, ty, MP_LEFT, alpha << 24 | (o->victim == local ? YELLOW : WHITE));
 		y += row;
 	}
 }
