@@ -13,3 +13,4 @@ EXPORTS
   TranslateMessage@4
   DispatchMessageA@4
   PostQuitMessage@4
+  WindowFromDC@4

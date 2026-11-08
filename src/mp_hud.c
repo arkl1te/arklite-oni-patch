@@ -243,7 +243,7 @@ static int draw_lobby(const NetHud *h, int width, int y)
 	text(line, x, y, CENTER, WHITE);
 	if (h->punch_me[0] && !h->connected) {   /* net.c "Hole punching" */
 		y += g_line_height + 2;
-		fmt(line, "Host outside your network? It types: /punch %s", h->punch_me);
+		str_cpy(line, sizeof line, "Host outside your network? It can /punch you: your /ip");
 		text(line, x, y, CENTER, WHITE);
 	}
 	return y + g_line_height + LINE_GAP;

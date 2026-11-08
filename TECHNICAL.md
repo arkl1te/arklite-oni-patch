@@ -68,6 +68,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `pause_background` | 33 | Opacity of the black behind the pause menu, 0–100 |
 | | `pause_music` | `keep` | `keep` (level music goes on), `theme` (original menu theme) or `silence` |
 | | `show_fps` | 0 | 1: FPS counter in the top right corner, refreshed every 6 frames |
+| | `mouse_sensitivity` | 1.000 | Multiplies the mouse's aiming and turning, 0.001–99.99 (the slider covers 0.10–4.00). Daodan's own `[windows] mousesensitivity` in `daodan.ini` multiplies on top when Daodan reads the mouse (raw input) |
 | `[volume]` | `sound`, `music`, `voice` | Overall Volume | 0–100 each; a missing key starts at your old Overall Volume |
 | `[players]` | `p2` | 1 | 0: no player 2 |
 | | `p2_name` | Player 2 | Player 2's name, shown in the score and over their head |
@@ -125,7 +126,7 @@ built yet. In the text fields, **Enter** or **Esc** confirms what you typed and 
 this PC or your local network by itself (those aren't saved unless you edit their address). Select one to see what it
 says about itself (name, map, players connected and how many are spectating) and **Play** to join it; if you don't
 have its map, Play downloads it. **+** (under the list) makes a new entry: type its address (`192.168.1.10`, a
-name, and `:port` if it isn't 27777) in **Address**. **-** deletes the selected one.
+name, and `:port` if it isn't 27777) in **Address**. **-** deletes the selected one. **Refresh** asks every server again at once: games that ended drop off the list.
 
 **Chat**: in a network game (the lobby, the warm-up and the match), press **Enter** to chat; a
 gray "Press ENTER to chat" says so whenever the match isn't running. A text field
@@ -327,8 +328,11 @@ identical to the host's, the joiner stays out of the lobby and both screens say 
 differs. Copy that file or folder from one PC to the other and join again.
 When only `level0_Final` differs (two AE installs whose patches didn't come out the same), the
 joiner gets the host's version and switches to it without restarting Oni, the way Unreal
-Tournament fetches a server's packages: the level reloads, its loading box shows the download
-(about 172 MB, Esc cancels), and the files are kept in `AE/cache/<dat hash>-<raw hash>/`, so the
+Tournament fetches a server's packages: the level reloads, and its loading box shows the
+download (Esc cancels). Only what differs comes over the network: your game looks for the
+host's version's pieces in your own `level0` and every version already in the cache, and asks
+the host for the rest (a mod's `level0` of 197 MB took 35 MB against the stock one; the whole
+pair comes only if that fails). The files are kept in `AE/cache/<dat hash>-<raw hash>/`, so the
 next game with that version starts at once. Your own `GameDataFolder` files are never written.
 The host's version is only used while you play on that host: when you host or play alone again,
 Oni switches back to your own (through a link to your files in the cache, at the next level
@@ -395,7 +399,7 @@ left are in blue. Tick **Mute** next to a player to hide their chat messages (un
 or close Oni). The **Objective** tab says in one sentence how to win the match.
 The host needs UDP port 27777 open. Over the internet the router must forward it to the host:
 when you host, Arklite asks the router to do that itself (UPnP, most home routers allow it), and
-a line in your chat says how it went and which address players on the internet join with. If it
+a line in your chat says how it went. If it
 says your provider shares the router's address (carrier-grade NAT: the router's internet address
 is 100.64.x.x to 100.127.x.x, or another private one), forwarding can't help, but hole punching
 usually does, and the **Arklite helper** does it for you:
@@ -412,12 +416,16 @@ The helper never carries the game itself: once both games reach each other they 
 If the helper is down, or you set `listed=0` and the player doesn't know your address, punch by
 hand:
 
-1. Your chat shows your internet address when you host (`/ip` shows it again). It changes every
-   time Oni starts. Give it to the player outside your network.
-2. They join it. While your game can't be reached, their Join list says "No answer. Host types:
-   /punch ..." with their address, and in the game "Connecting to the host..." has their address under it.
+1. Type `/ip` in your chat to see your internet address. It changes every time Oni starts. Give
+   it to the player outside your network.
+2. They join it. While your game can't be reached, their Join list and their lobby screen say the
+   host may need to `/punch` them; they type `/ip` in their chat and give you their address.
 3. You type `/punch` with their address in your chat. Both games knock toward each other, each
    router takes the other's packets for answers, and they're in.
+
+Addresses are never shown on screen unless you ask (`/ip`), so you can stream your games: the
+chat, the lobby screen and the Join list say what to do without them, and a game from the
+server list doesn't show its host's address. The logs still have them.
 
 Players on your own network join you as always, by your LAN address. If punching doesn't work (some
 routers and mobile networks don't allow it), ask your provider for a public IPv4 address, use a UDP

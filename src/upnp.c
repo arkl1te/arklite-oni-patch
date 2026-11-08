@@ -434,8 +434,8 @@ static u32 WINAPI upnp_thread(void *unused)
 		u32 to = err == 718 ? mapped_to() : 0;   /* ConflictInMappingEntry */
 		if (to && to != g_local) {
 			ip_text(other, to);
-			fmt(text, "UPnP: UDP port %d already goes to %s on your network, so players on the internet reach that PC", g_port,
-			    other);
+			log_msg("upnp: UDP port %d already goes to %s", g_port, other);   /* (addresses only in the log: streams) */
+			fmt(text, "UPnP: UDP port %d already goes to another PC on your network, so players on the internet reach that PC", g_port);
 		} else {
 			fmt(text, "UPnP: the router refused (error %d). For players on the internet, forward UDP port %d by hand", err,
 			    g_port);
@@ -452,10 +452,14 @@ static u32 WINAPI upnp_thread(void *unused)
 	u32 ea = ext[0] ? inet_addr(ext) : 0xffffffffu;
 	if (ea == 0xffffffffu || !ea)
 		fmt(text, "UPnP: the router forwards UDP port %d to this PC; it didn't say its internet address", g_port);
-	else if (private_ip(ea))
-		fmt(text, "UPnP: no use, your provider shares the router's address %s: outside players need /punch", ext);
-	else
-		fmt(text, "UPnP: the router forwards UDP port %d here. Players on the internet join at %s%s", g_port, ext, port);
+	else if (private_ip(ea)) {
+		log_msg("upnp: the router's internet address is %s, a shared one", ext);
+		str_cpy(text, sizeof text, helper_on() ? "UPnP: no use, your provider shares the router's address: the server list gets outside players in" :
+		                                         "UPnP: no use, your provider shares the router's address: outside players need /punch");
+	} else {
+		log_msg("upnp: players on the internet join at %s%s", ext, port);
+		fmt(text, "UPnP: the router forwards UDP port %d here: players on the internet can join (your address: /ip)", g_port);
+	}
 	say(text);
 
 	while (!g_stop) {   /* renewed while hosting */

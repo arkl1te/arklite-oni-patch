@@ -14,7 +14,7 @@
  *                 columns (Ping, Name, Players) with + (add) and - (remove) under the list's lower
  *                 left (small buttons, see below); a second frame under it what the selected server
  *                 says (Name, Map, Connected with "(N spectating)" when any) and its Address (typed),
- *                 then a status line. Play, Back. Bookmarks are Arklite.ini [servers] count, 1, 2, ...
+ *                 then a status line. Play, Refresh, Back. Bookmarks are Arklite.ini [servers] count, 1, 2, ...
  *
  * Oni's UI art is nine-slice (PSpc): a button's corners are 55 + 72 px wide, so a button narrower
  * than 127 px gets its corners squeezed. Buttons stay 130x40 like the stock ones; the dialogs and
@@ -85,6 +85,7 @@ void *memcpy(void *, const void *, unsigned);
 #define WMcMessage_MouseUp  0x20         /* the field puts the cursor where it was clicked */
 #define WMcMessage_Paint    0x2b
 #define WMcMessage_GotFocus 0x29
+#define WMcMessage_KillFocus 0x2a
 /* [DCrDraw_PartSpec]-like: ECX draw context, EDX part, flags (0xffff: all nine), &{x, y}, width,
  * height, alpha */
 #define DCrDrawPart         ((void (ONI_FC *)(void *, void *, u32, short *, int, int, u32))0x4698b0)
@@ -307,7 +308,7 @@ static WMtWindow *small_button_add(WMtWindow *dialog, WMtWindow *anchor, WMtWind
 
 #define MAX_FIELDS 8
 #define FIELD_TEXT_RAISE 2   /* px our fields' text (and caret) sit above Oni's baseline */
-enum { FIELD_TEXT, FIELD_NUMBER, FIELD_SIGNED };   /* signed: a '-' may start it */
+enum { FIELD_TEXT, FIELD_NUMBER, FIELD_SIGNED, FIELD_DECIMAL };   /* signed: a '-' may start it; decimal: digits and one '.' */
 typedef struct {
 	WMtWindow *w;
 	int numbers, lo, hi;   /* FIELD_*, and a number field's range (applied on Enter) */
@@ -427,11 +428,47 @@ static WMtWindow *add_field(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *fon
 	return e;
 }
 
+/* For dialogs outside this file (more_options.c) */
+void ui_fields_begin(WMtWindow *dialog, u32 default_id) { fields_begin(dialog, default_id); }
+void ui_fields_end(void) { fields_end(); }
+void ui_fields_frame(void) { fields_frame(); }
+
+WMtWindow *ui_field_decimal(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, u32 id, int x, int y, int w,
+                            u32 max, const char *text)
+{
+	return add_field(dialog, anchor, font, id, x, y, w, max, text, FIELD_DECIMAL, 0, 0);
+}
+
+int ui_parse_thousandths(const char *s, int *out)
+{
+	int v = 0, any = 0, scale = 1000;
+
+	s = skip_space(s);
+	for (; *s >= '0' && *s <= '9'; s++, any = 1)
+		if ((v = v * 10 + (*s - '0')) > 1000000) return 0;
+	v *= 1000;
+	if (*s == '.') {
+		for (s++; *s >= '0' && *s <= '9'; s++, any = 1) {
+			if (scale > 1) v += (*s - '0') * (scale /= 10);
+			else if (scale == 1 && *s >= '5') { v++; scale = 0; }   /* rounds at the 4th decimal */
+			else scale = 0;
+		}
+	}
+	if (*skip_space(s)) return 0;
+	*out = v;
+	return any;
+}
+
 static void field_confirm(UiField *f)
 {
 	char text[16];
 	int v;
 
+	if (f->numbers == FIELD_DECIMAL) {   /* its dialog writes the value back as it shows numbers */
+		if (WIN_PARENT(f->w))
+			WMrMessage_Send(WIN_PARENT(f->w), WMcMessage_Command, WIN_ID(f->w) | UI_NOTIFY_CONFIRMED << 16, (u32)f->w);
+		return;
+	}
 	if (f->numbers && edit_number(f->w, &v)) {
 		fmt(text, "%d", clamp(v, f->lo, f->hi));
 		WMrMessage_Send(f->w, EFcMessage_SetText, (u32)text, 0);
@@ -595,10 +632,15 @@ static void ONI_FC edit_key(WMtWindow *w, u32 key)
 		}
 		return;
 	}
-	if (f->numbers && (key < '0' || key > '9') &&
+	if (f->numbers == FIELD_DECIMAL) {   /* digits, and a '.' when there's none outside the selection */
+		int a = sel ? lo : cursor, b = sel ? hi : cursor, dot = 0;
+		for (int i = 0; i < len; i++)
+			if (text[i] == '.' && (i < a || i >= b)) dot = 1;
+		if ((key < '0' || key > '9') && (key != '.' || dot)) return;
+	} else if (f->numbers && (key < '0' || key > '9') &&
 	    !(key == '-' && f->numbers == FIELD_SIGNED && (sel ? lo : cursor) == 0 && (text[0] != '-' || (sel && lo == 0 && hi > 0))))
 		return;
-	if (f->numbers && key != '-' && !sel && cursor == 0 && text[0] == '-') return;   /* a digit before the '-' */
+	if (f->numbers && f->numbers != FIELD_DECIMAL && key != '-' && !sel && cursor == 0 && text[0] == '-') return;   /* a digit before the '-' */
 	ins[0] = (char)key;
 	ins[1] = 0;
 	if (sel) field_replace(f, text, lo, hi, ins);
@@ -695,6 +737,10 @@ static u32 ONI_FC edit_proc(WMtWindow *w, u32 msg, u32 p1, u32 p2)
 		}
 		return r;
 	}
+	case WMcMessage_KillFocus:   /* clicked away from a decimal field: as Enter */
+		r = EFrProc(w, msg, p1, p2);
+		if (f->numbers == FIELD_DECIMAL) field_confirm(f);
+		return r;
 	case WMcMessage_GotFocus:
 	case EFcMessage_SetText:   /* the cursor is at the new text's end, nothing selected */
 		r = EFrProc(w, msg, p1, p2);
@@ -1027,7 +1073,7 @@ int mp_menu_host(const char *map_name)
 
 /* ---- Join ----------------------------------------------------------------------------------- */
 
-enum { ID_JOIN_PLAY = 1, ID_JOIN_BACK = 2, ID_JOIN_ADD = 3, ID_JOIN_REMOVE = 4, ID_JOIN_LIST = 100,
+enum { ID_JOIN_PLAY = 1, ID_JOIN_BACK = 2, ID_JOIN_ADD = 3, ID_JOIN_REMOVE = 4, ID_JOIN_REFRESH = 5, ID_JOIN_LIST = 100,
        ID_JOIN_ADDRESS = 120 };
 #define JOIN_COLUMNS    3      /* Ping, Name, Players: drawn into each row of the one list */
 #define MAX_BOOKMARKS   64
@@ -1188,15 +1234,10 @@ static int join_status(const Bookmark *b, u32 now, char *text)
 	}
 	if (!b->have_info) {
 		char me[32];
-		if (b->first_ask && now - b->first_ask >= NO_ANSWER_MS && net_my_address(me)) {   /* net.c "Hole punching" */
-			/* the longest wording that fits the line: the address must never be cut */
-			static const char *const forms[] = { "No answer. Host types: /punch %s", "No answer. Host: /punch %s", "/punch %s" };
-			int width = g_jstatus ? WIN_W(g_jstatus) : 375;
-			for (unsigned i = 0; i < sizeof forms / sizeof forms[0]; i++) {
-				fmt(text, forms[i], me);
-				if (ui_text_width(text) <= width) break;
-			}
-		} else
+		if (b->first_ask && now - b->first_ask >= NO_ANSWER_MS && net_my_address(me))   /* net.c "Hole punching" */
+			/* (no address on screen: players stream; /ip shows it in a game) */
+			str_cpy(text, TEXT_MAX, "No answer: the host may need to /punch you (/ip).");
+		else
 			str_cpy(text, TEXT_MAX, b->first_ask && now - b->first_ask >= NO_ANSWER_MS ? "No answer: no game hosted there, or a firewall."
 			                                                                          : "Asking the server...");
 		return 0;
@@ -1250,7 +1291,9 @@ static Bookmark *join_selected(void)
 static void join_show_selected(void)
 {
 	Bookmark *b = join_selected();
-	WMrMessage_Send(g_address, EFcMessage_SetText, (u32)(b ? b->address : ""), 0);
+	/* a game from the server list: its internet address isn't shown (players stream); typing one
+	 * makes the row a saved server, as for any other */
+	WMrMessage_Send(g_address, EFcMessage_SetText, (u32)(b && !b->listed ? b->address : ""), 0);
 }
 
 static void join_frame(void)
@@ -1476,6 +1519,27 @@ static void join_frame(void)
 	}
 }
 
+/* Refresh: the games found (on the network, or from the server list) go, and come back as they
+ * answer again (one that ended stays gone); the saved servers are asked again at once, and
+ * everything is introduced again (helper.c) */
+static void join_refresh(void)
+{
+	for (int i = g_nmarks - 1; i >= 0; i--)
+		if (g_marks[i].found) join_delete(i);
+	for (int i = 0; i < g_nmarks; i++) {
+		Bookmark *b = &g_marks[i];
+		b->first_ask = b->last_ask = b->last_reply = 0;
+		b->have_info = b->listed = b->helper_knows = 0;
+		b->last_intro = b->helped_at = 0;
+		if (b->resolved < 0) b->resolved = 0;   /* a name not found: looked up again */
+	}
+	g_lastBroadcast = g_lastList = 0;
+	if (g_nmarks) list_select(0);
+	else g_jsel = -1;
+	join_show_selected();
+	log_msg("join: refreshed (%d saved server%s)", g_nmarks, g_nmarks == 1 ? "" : "s");
+}
+
 static void join_init(WMtWindow *dialog)
 {
 	static const char *const headers[JOIN_COLUMNS] = { "Ping", "Name", "Players" };
@@ -1523,13 +1587,14 @@ static void join_init(WMtWindow *dialog)
 	g_infoConnected = values[2];
 	g_jstatus = ui_label(dialog, lb, play, "", 140, 386, 375, 20, UI_LEFT);
 
-	/* + and - (add, remove) at the list's lower left; Play and Back full size, centered */
+	/* + and - (add, remove) at the list's lower left; Play, Refresh and Back full size, centered */
 	small_button_add(dialog, play, back, "+", ID_JOIN_ADD, 140, 256);
 	small_button_add(dialog, play, back, "-", ID_JOIN_REMOVE, 162, 256);
 	ui_set_text(play, "Play");
-	ui_set_frame(play, 185, 425, BUTTON_W, BUTTON_H);
+	ui_set_frame(play, 115, 425, BUTTON_W, BUTTON_H);
+	ui_add(dialog, play, back, 0, ~0u, "Refresh", ID_JOIN_REFRESH, 255, 425, BUTTON_W, BUTTON_H);
 	ui_set_text(back, "Back");
-	ui_set_frame(back, 325, 425, BUTTON_W, BUTTON_H);
+	ui_set_frame(back, 395, 425, BUTTON_W, BUTTON_H);
 
 	bookmarks_load();
 	for (int i = 0; i < g_nmarks; i++) join_add_row(i);
@@ -1579,6 +1644,8 @@ static u8 ONI_FC join_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 			net_menu_join(b->address);
 		bookmarks_save();
 		WMrDialog_ModalEnd(dialog, 1);
+	} else if (id == ID_JOIN_REFRESH) {
+		join_refresh();
 	} else if (id == ID_JOIN_ADD) {
 		if (g_nmarks >= MAX_BOOKMARKS) return 1;
 		Bookmark *b = &g_marks[g_nmarks];

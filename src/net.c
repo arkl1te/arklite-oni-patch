@@ -236,6 +236,8 @@ __declspec(dllimport) int  WINAPI MoveFileExA(const char *, const char *, u32);
 __declspec(dllimport) int  WINAPI CreateHardLinkA(const char *, const char *, void *);
 __declspec(dllimport) int  WINAPI CopyFileA(const char *, const char *, int);
 __declspec(dllimport) u32  WINAPI GetLastError(void);
+__declspec(dllimport) u32  WINAPI GetFileSize(HANDLE, u32 *);
+__declspec(dllimport) int  WINAPI SetEndOfFile(HANDLE);
 __declspec(dllimport) int  WINAPI RemoveDirectoryA(const char *);
 __declspec(dllimport) int  WINAPI DeleteFileA(const char *);
 __declspec(dllimport) u32  WINAPI SetFilePointer(HANDLE, int, int *, u32);
@@ -260,7 +262,8 @@ __declspec(dllimport) u32  WINAPI GetCurrentThreadId(void);
 
 enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY, PKT_NAME,
        PKT_MAP_LIST_REQ, PKT_MAP_LIST, PKT_MAP_REQ, PKT_MAP_DATA, PKT_INFO_REQ, PKT_INFO,
-       PKT_CHAT, PKT_CHAT_ACK, PKT_END, PKT_NAMES, PKT_HIST_REQ, PKT_HIST, PKT_COOKIE };
+       PKT_CHAT, PKT_CHAT_ACK, PKT_END, PKT_NAMES, PKT_HIST_REQ, PKT_HIST, PKT_COOKIE,
+       PKT_L0_REQ, PKT_L0_DATA };
 
 #define NPL             NET_PLAYERS_MAX
 
@@ -1445,7 +1448,8 @@ static struct { SOCKADDR_IN a; u32 until, last; int quiet; } g_punch[PUNCH_MAX];
 static u32 g_intro_at;                 /* joiner: the last introduction asked for */
 static int g_helper_knows;             /* joiner: the helper said it knows the host (1) or not (-1); 0 no answer */
 static u32 g_opened_at;                /* when g_sock opened */
-static char g_hint_addr[32];           /* joiner: the address the chat last gave */
+static char g_hint_addr[32];           /* joiner: its address when the chat last gave the /punch hint */
+static int g_punch_said;               /* host: the /punch line was in the chat (helper off) */
 
 static u64 rotl64(u64 x, int b) { return x << b | x >> (64 - b); }
 
@@ -1599,7 +1603,7 @@ const char *net_punch(const char *address)
 	a.port = htons((u16)port);
 	punch_add(&a, PUNCH_MS, 0);
 	log_msg("net: /punch %s:%d: knocking for %d s", host, port, PUNCH_MS / 1000);
-	fmt(msg, "Knocking toward %s:%d for %d s: the player can join now.", host, port, PUNCH_MS / 1000);
+	fmt(msg, "Knocking toward that address for %d s: the player can join now.", PUNCH_MS / 1000);   /* (not repeated: streams) */
 	return msg;
 }
 
@@ -2270,6 +2274,7 @@ static void on_input(int l, const PktInput *p, u32 size)
  * level starts (net_map_fetch, from Join's Play), into CustomLevels\<folder>\. */
 #define MAP_PATH        112
 #define L0_SET          0x10000u     /* MAP_LIST_REQ / MAP_REQ "level" for the host's level0 pair (see "level0 download") */
+#define L0_SIG          0x10001u     /* ...for the pair's block lists (see "level0 sync") */
 #define MAP_LIST_PAGE   12
 #define MAP_MAX_FILES   512
 #define MAP_CHUNK       1400
@@ -2459,6 +2464,172 @@ static void l0_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 	}
 }
 
+/* ---- level0 sync: only the differences ---------------------------------------------------- *
+ * Two level0 versions share most of their bytes (a mod adds or changes some instances; the .raw's
+ * textures and sounds mostly stay, though at other offsets). So the joiner gets the host's pair
+ * the zsync way: the host lists, for each file, a weak rolling checksum and a strong one of each
+ * ZS block (L0_SIG: two "files" in memory, block lists, sent like a map's files); the joiner rolls
+ * over its own level0 files (GameDataFolder's and every version in AE\\cache) looking for those
+ * blocks at any offset, copies the ones it has, and asks for the rest as byte ranges (PKT_L0_REQ,
+ * up to ZS_PAIRS ranges of at most MAP_CHUNK bytes; PKT_L0_DATA each). The whole files' hashes are
+ * checked at the end; anything going wrong falls back to the full download (L0_SET).
+ * Measured 2026-11-08 on a modded level0 (12.1 + 185.5 MB) against the stock one: 128-byte blocks
+ * leave 4.1 MB of the .dat to download (its offsets into the .raw change everywhere, so bigger
+ * blocks rarely match), 1 KB blocks 28.7 MB of the .raw, the lists 2.2 MB: about 35 MB, not 197. */
+#define ZS_MAGIC        0x535a4b41u  /* "AKZS" */
+#define ZS_PAIRS        32
+typedef struct { u32 magic, block, size, nblocks; } ZsHead;   /* then nblocks x {weak, strong} */
+typedef struct { u32 off; u16 len, pad; } ZsRange;
+typedef struct { PktHead h; u32 file, count; ZsRange r[ZS_PAIRS]; } PktL0Req;
+typedef struct { PktHead h; u32 file, off, size; } PktL0Data;   /* size bytes follow */
+static const u32 g_zs_block[2] = { 128, 1024 };   /* .dat, .raw */
+static const char *const g_l0_names[2] = { "level0_Final.dat", "level0_Final.raw" };
+
+/* rsync's weak checksum of n bytes: (a & 0xffff) | b << 16, rolled one byte on by zs_roll */
+static void zs_weak(const u8 *p, u32 n, u32 *a, u32 *b)
+{
+	u32 x = 0, y = 0;
+	for (u32 i = 0; i < n; i++) { x += p[i]; y += x; }
+	*a = x;
+	*b = y;
+}
+
+static u32 zs_strong(const u8 *p, u32 n)
+{
+	u32 h = 0x811c9dc5u;
+	for (u32 i = 0; i < n; i++) h = (h ^ p[i]) * 0x01000193u;
+	return h ? h : 1;
+}
+
+/* the host's block lists, made on a thread of their own (197 MB read and hashed) */
+static struct {
+	volatile int state;                /* 0 none, 1 making, 2 ready, -1 failed */
+	char dir[64];                      /* of the pair they're for */
+	u8 *list[2];
+	u32 size[2], hash[2];
+} g_zs;
+
+static u32 WINAPI zs_make(void *unused)
+{
+	u8 *buf = VirtualAlloc(0, 1 << 20, 0x3000, 4);
+	int ok = buf != 0;
+	for (int i = 0; i < 2 && ok; i++) {
+		char path[160];
+		u32 got, total, block = g_zs_block[i], k = 0;
+		HANDLE f;
+		ZsHead *z;
+		fmt(path, "%s\\%s", g_zs.dir, g_l0_names[i]);
+		f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 3, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+		if (f == INVALID_HANDLE_VALUE) { ok = 0; break; }
+		total = GetFileSize(f, 0);
+		g_zs.size[i] = sizeof(ZsHead) + (total + block - 1) / block * 8;
+		g_zs.list[i] = VirtualAlloc(0, g_zs.size[i], 0x3000, 4);
+		if (!(z = (ZsHead *)g_zs.list[i])) { CloseHandle(f); ok = 0; break; }
+		z->magic = ZS_MAGIC;
+		z->block = block;
+		z->size = total;
+		z->nblocks = (total + block - 1) / block;
+		u32 *e = (u32 *)(z + 1);
+		while (ReadFile(f, buf, 1 << 20, &got, 0) && got)   /* (1 MB holds whole blocks) */
+			for (u32 off = 0; off < got && k < z->nblocks; off += block, k++) {
+				u32 n = got - off < block ? got - off : block, a, b;
+				zs_weak(buf + off, n, &a, &b);
+				e[2 * k] = (a & 0xffff) | b << 16;
+				e[2 * k + 1] = zs_strong(buf + off, n);
+			}
+		CloseHandle(f);
+		if (k != z->nblocks) { ok = 0; break; }
+		g_zs.hash[i] = hash_words(0x811c9dc5u, g_zs.list[i], g_zs.size[i]);   /* = hash_file of it */
+	}
+	if (buf) VirtualFree(buf, 0, 0x8000);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	g_zs.state = ok ? 2 : -1;
+	return 0;
+}
+
+/* 1: the block lists of the pair in dir are ready; else they're being made (asked again) */
+static int zs_ready(const char *dir)
+{
+	if (g_zs.state == 1) return 0;
+	if (g_zs.state != 0 && str_ieq_n(g_zs.dir, dir, sizeof g_zs.dir)) return g_zs.state == 2;
+	for (int i = 0; i < 2; i++)
+		if (g_zs.list[i]) VirtualFree(g_zs.list[i], 0, 0x8000), g_zs.list[i] = 0;
+	str_cpy(g_zs.dir, sizeof g_zs.dir, dir);
+	g_zs.state = 1;
+	if (!CreateThread(0, 0, zs_make, 0, 0, 0)) g_zs.state = -1;
+	else log_msg("net: level0 sync: making the block lists of %s for a joiner", dir);
+	return 0;
+}
+
+/* L0_SIG: the two block lists, as files */
+static void zs_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to, const char *dir)
+{
+	const PktHead *h = (const PktHead *)buf;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (!zs_ready(dir)) return;   /* the joiner asks again (it waits up to LOST_MS) */
+	if (h->type == PKT_MAP_LIST_REQ && n >= sizeof(PktMapListReq)) {
+		const PktMapListReq *q = (const PktMapListReq *)buf;
+		PktMapList p;
+		memset(&p, 0, sizeof p);
+		head(&p.h, PKT_MAP_LIST);
+		p.level = L0_SIG;
+		p.total = 2;
+		p.first = q->first;
+		for (u32 i = q->first; i < 2 && p.count < MAP_LIST_PAGE; i++, p.count++) {
+			fmt(p.f[p.count].path, "%s.zs", g_l0_names[i]);
+			p.f[p.count].size = g_zs.size[i];
+			p.f[p.count].hash = g_zs.hash[i];
+		}
+		send_to(&p, sizeof p, to);
+	} else if (h->type == PKT_MAP_REQ && n >= sizeof(PktMapReq)) {
+		static u8 out[sizeof(PktMapData) + MAP_CHUNK];
+		const PktMapReq *q = (const PktMapReq *)buf;
+		PktMapData *p = (PktMapData *)out;
+		if (q->file >= 2 || !q->count || q->count > MAP_REQ_MAX) return;
+		for (u32 c = q->chunk; c < q->chunk + q->count && c * MAP_CHUNK < g_zs.size[q->file]; c++) {
+			u32 left = g_zs.size[q->file] - c * MAP_CHUNK;
+			head(&p->h, PKT_MAP_DATA);
+			p->level = L0_SIG;
+			p->file = q->file;
+			p->chunk = c;
+			p->size = left < MAP_CHUNK ? left : MAP_CHUNK;
+			memcpy(out + sizeof *p, g_zs.list[q->file] + c * MAP_CHUNK, p->size);
+			send_to(out, sizeof *p + p->size, to);
+		}
+	}
+}
+
+/* PKT_L0_REQ: byte ranges of the pair this PC runs */
+static void zs_serve_ranges(const PktL0Req *q, const SOCKADDR_IN *to)
+{
+	static u8 out[sizeof(PktL0Data) + MAP_CHUNK];
+	PktL0Data *p = (PktL0Data *)out;
+	char path[160];
+	const char *dir = g_l0_active[0] ? g_l0_active : "GameDataFolder";
+	u32 size, got;
+
+	if (q->file >= 2 || q->count > ZS_PAIRS) return;
+	if (g_l0_file == INVALID_HANDLE_VALUE || g_l0_file_index != q->file) {
+		if (g_l0_file != INVALID_HANDLE_VALUE) CloseHandle(g_l0_file);
+		fmt(path, "%s\\%s", dir, g_l0_names[q->file]);
+		g_l0_file = CreateFileA(path, 0x80000000, 3, 0, 3, 0x80, 0);
+		g_l0_file_index = q->file;
+	}
+	if (g_l0_file == INVALID_HANDLE_VALUE) return;
+	size = GetFileSize(g_l0_file, 0);
+	for (u32 i = 0; i < q->count; i++) {
+		const ZsRange *r = &q->r[i];
+		if (!r->len || r->len > MAP_CHUNK || r->off >= size || r->len > size - r->off) continue;
+		SetFilePointer(g_l0_file, (int)r->off, 0, 0);
+		if (!ReadFile(g_l0_file, out + sizeof *p, r->len, &got, 0) || got != r->len) continue;
+		head(&p->h, PKT_L0_DATA);
+		p->file = q->file;
+		p->off = r->off;
+		p->size = r->len;
+		send_to(out, sizeof *p + r->len, to);
+	}
+}
+
 static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 {
 	const PktHead *h = (const PktHead *)buf;
@@ -2466,6 +2637,10 @@ static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 
 	if (n >= sizeof *h + 4 && *(const u32 *)(buf + sizeof *h) == L0_SET) {   /* (both requests start with the level) */
 		l0_serve(buf, n, to);
+		return;
+	}
+	if (n >= sizeof *h + 4 && *(const u32 *)(buf + sizeof *h) == L0_SIG) {
+		zs_serve(buf, n, to, g_l0_active[0] ? g_l0_active : "GameDataFolder");
 		return;
 	}
 	if (!map_can_serve()) return;
@@ -2749,12 +2924,40 @@ static void dl_lines_create(void)
 	}
 }
 
+/* The popup grows (never shrinks) to fit the lines' text: a line too long for it wrapped over the
+ * next one. The box, its full-size outline, the bar and the lines widen together and the box
+ * stays centered; only past the screen's width is a line cut ("..."). */
+#define DL_PARENT(w)            (*(WMtWindow **)((u8 *)(w) + 8))
+static void dl_fit(const char *a, const char *b)
+{
+	WMtWindow *d = ONgLoadingDialog, *bar, *parent;
+	int need, grow, max_w;
+
+	if (!d || !g_dl_lines[0]) return;
+	need = ui_text_width(a) > ui_text_width(b) ? ui_text_width(a) : ui_text_width(b);
+	need += 6;   /* (a little room: the font's last glyph overhangs its advance) */
+	if (need <= WIN_W(g_dl_lines[0])) return;
+	parent = DL_PARENT(d);
+	max_w = parent ? WIN_W(parent) - 20 : 620;
+	grow = need - WIN_W(g_dl_lines[0]);
+	if (WIN_W(d) + grow > max_w) grow = max_w - WIN_W(d);
+	if (grow <= 0) return;
+	for (WMtWindow *w = WIN_FIRSTCHILD(d); w; w = WIN_NEXT(w))   /* the outline (the box's own size) */
+		if (WIN_W(w) == WIN_W(d)) ui_set_frame(w, WIN_X(w), WIN_Y(w), WIN_W(w) + grow, WIN_H(w));
+	if ((bar = WMrDialog_GetItemByID(d, 100))) ui_set_frame(bar, WIN_X(bar), WIN_Y(bar), WIN_W(bar) + grow, WIN_H(bar));
+	for (int i = 0; i < 2; i++)
+		if (g_dl_lines[i]) ui_set_frame(g_dl_lines[i], WIN_X(g_dl_lines[i]), WIN_Y(g_dl_lines[i]), WIN_W(g_dl_lines[i]) + grow, WIN_H(g_dl_lines[i]));
+	ui_set_frame(d, WIN_X(d) - grow / 2, WIN_Y(d), WIN_W(d) + grow, WIN_H(d));
+}
+
 static void dl_draw(const char *a, const char *b, u32 percent)
 {
 	WMtWindow *d = ONgLoadingDialog;
 
-	if (g_dl_lines[0]) WMrWindow_SetTitle(g_dl_lines[0], a, 0x100);
-	if (g_dl_lines[1]) WMrWindow_SetTitle(g_dl_lines[1], b, 0x100);
+	char fit[160];
+	dl_fit(a, b);
+	if (g_dl_lines[0]) ui_fit(fit, sizeof fit, a, WIN_W(g_dl_lines[0])), WMrWindow_SetTitle(g_dl_lines[0], fit, 0x100);
+	if (g_dl_lines[1]) ui_fit(fit, sizeof fit, b, WIN_W(g_dl_lines[1])), WMrWindow_SetTitle(g_dl_lines[1], fit, 0x100);
 	if (d) WMrMessage_Send(d, LDcMessage_Progress, percent, 0);
 	M3rFrame_Begin(0);
 	WMrDisplay();
@@ -2796,7 +2999,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	u32 ntheirs = 0, nmine = 0, total = 0xffffffffu, their_map = 0, nneed = 0, nextra = 0, need_bytes = 0, biggest = 0;
 	u32 now, last_heard, last_req = 0, last_draw = 0, bytes_all = 0, began;
 	HANDLE out = INVALID_HANDLE_VALUE;
-	const char *why = 0, *what = level == L0_SET ? "level0" : "map";
+	const char *why = 0, *what = level == L0_SET ? "level0" : level == L0_SIG ? "level0 block list" : "map";
 	int ok = 0, cur = -1;
 
 	if (!g_link[0].used) return 0;
@@ -2806,9 +3009,9 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	need = (u8 *)(mine + MAP_MAX_FILES);
 	moved = need + MAP_MAX_FILES;
 	/* (level0 never comes near GameDataFolder: it's downloaded and kept in AE\\cache) */
-	fmt(path, level == L0_SET ? "cache\\.download\\%s\\" : "GameDataFolder\\CustomLevels.download\\%s\\", folder);
+	fmt(path, level >= L0_SET ? "cache\\.download\\%s\\" : "GameDataFolder\\CustomLevels.download\\%s\\", folder);
 	if (!GetFullPathNameA(path, sizeof stage, stage, 0)) str_cpy(stage, sizeof stage, path);
-	fmt(path, level == L0_SET ? "cache\\.old\\%s\\" : "GameDataFolder\\CustomLevels.backup\\%s\\", folder);
+	fmt(path, level >= L0_SET ? "cache\\.old\\%s\\" : "GameDataFolder\\CustomLevels.backup\\%s\\", folder);
 	if (!GetFullPathNameA(path, sizeof backup, backup, 0)) str_cpy(backup, sizeof backup, path);
 	dl_lines_create();
 	log_msg("net: %s download: asking the host for its list of %s's files", what, folder);
@@ -2995,7 +3198,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	}
 	{
 		char tail[32] = "";
-		if (level != L0_SET) fmt(tail, "; the host's map is %08x", their_map);
+		if (level < L0_SET) fmt(tail, "; the host's map is %08x", their_map);
 		RemoveDirectoryA(stage);   /* (only when it's empty: a map's subfolders stay) */
 		log_msg("net: %s download: done, %u bytes in %u ms%s%s%s", what, bytes_all, GetTickCount() - began,
 		        nmine ? "; old files in " : "", nmine ? backup : "", tail);
@@ -3037,6 +3240,294 @@ static int map_download(u32 level)
 	return 1;
 }
 
+/* ---- level0 sync, the joiner's side (see "level0 sync") ------------------------------------ */
+#define ZS_SCAN         (4u << 20)   /* bytes of a source file read at once */
+#define ZS_PIECES_MAX   (256u << 10) /* ranges asked for, at most (more: the full download is as good) */
+
+typedef struct { u32 off, len; } ZsPiece;
+
+/* Rolls over one of this PC's files, copying every block of the host's list it has (any offset)
+ * into out; have[] marks them. -1: cancelled */
+static int zs_scan(const char *path, const ZsHead *z, const u32 *e, int *headt, int *next, u32 mask,
+                   u8 *have, u32 *nhave, HANDLE out, u8 *buf)
+{
+	u32 B = z->block, avail = 0, p = 0, a = 0, b = 0, got, done = 0, last_pump = 0;
+	int valid = 0;
+	HANDLE f = CreateFileA(path, 0x80000000, 3, 0, 3, 0x80, 0);
+
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	for (;;) {
+		/* the bytes not looked at yet to the front, then more of the file after them */
+		if (p) {
+			memcpy(buf, buf + p, avail - p);   /* (forward copy: the regions may overlap, dst < src) */
+			avail -= p;
+			p = 0;
+		}
+		if (!ReadFile(f, buf + avail, ZS_SCAN + B - avail, &got, 0)) got = 0;
+		avail += got;
+		done += got;
+		if (avail < B) break;
+		if (done - last_pump >= ZS_SCAN) {
+			last_pump = done;
+			if (dl_cancelled()) { CloseHandle(f); return -1; }
+		}
+		while (p + B <= avail) {
+			int matched = 0;
+			if (!valid) { zs_weak(buf + p, B, &a, &b); valid = 1; }
+			u32 w = (a & 0xffff) | b << 16, strong = 0;
+			/* blocks found leave their chain, so a long run of one content (zeros) isn't walked again */
+			for (int *link = (int *)&headt[w & mask], k; (k = *link) >= 0;) {
+				if (have[k]) { *link = next[k]; continue; }
+				if (e[2 * k] != w || (strong ? strong : (strong = zs_strong(buf + p, B))) != e[2 * k + 1]) { link = &next[k]; continue; }
+				u32 wr;
+				SetFilePointer(out, (int)(k * B), 0, 0);
+				WriteFile(out, buf + p, B, &wr, 0);
+				have[k] = 1;
+				(*nhave)++;
+				matched = 1;
+				*link = next[k];
+			}
+			if (*nhave == z->nblocks) break;
+			if (matched) {   /* the next block likely follows on */
+				p += B;
+				valid = 0;
+				continue;
+			}
+			if (p + B == avail) break;   /* the next byte isn't read yet */
+			{
+				u32 o = buf[p], n = buf[p + B];
+				a += n - o;
+				b += a - B * o;
+			}
+			p++;
+		}
+		if (*nhave == z->nblocks || !got) break;
+	}
+	CloseHandle(f);
+	return 0;
+}
+
+/* The host's pair by its differences into dir (cache\<dat>-<raw>, relative), 1 when it's there.
+ * 0: try the full download; -1: cancelled */
+static int level0_sync(const char *dir)
+{
+	static u8 rbuf[2048];
+	char folder[48], sigdir[MAX_PATH], rel[96], stage[MAX_PATH], path[MAX_PATH], to[MAX_PATH], a[128], b2[128], s1[32], s2[32], s3[32];
+	u8 *list = 0, *have = 0, *buf = 0, *pgot = 0;
+	int *headt = 0, *next = 0, result = 0;
+	ZsPiece *piece = 0;
+	HANDLE out = INVALID_HANDLE_VALUE;
+	u32 began = GetTickCount(), fetched = 0, to_fetch_all = 0, full = 0;
+
+	fmt(folder, "level0-%08x-%08x", g_l0_want[0], g_l0_want[1]);
+	fmt(rel, "cache\\.sig\\%s\\", folder);
+	if (!GetFullPathNameA(rel, sizeof sigdir, sigdir, 0)) return 0;
+	{   /* 1. the block lists, like a map's files */
+		char sigfolder[64];
+		fmt(sigfolder, "%s-lists", folder);
+		if (!map_download_to(L0_SIG, sigdir, sigfolder)) return g_dl_why && str_ieq_n(g_dl_why, "cancelled", 10) ? -1 : 0;
+	}
+	fmt(rel, "cache\\.download\\%s\\", folder);
+	if (!GetFullPathNameA(rel, sizeof stage, stage, 0)) return 0;
+	buf = VirtualAlloc(0, ZS_SCAN + 4096, 0x3000, 4);
+	piece = VirtualAlloc(0, ZS_PIECES_MAX * sizeof *piece, 0x3000, 4);
+	if (!buf || !piece) goto done;
+	dl_lines_create();
+
+	for (int fi = 0; fi < 2; fi++) {
+		HANDLE lf;
+		u32 lsize, got, nhave = 0, mask, npiece = 0, need_bytes = 0;
+		const ZsHead *z;
+		const u32 *e;
+
+		/* the list */
+		fmt(path, "%s%s.zs", sigdir, g_l0_names[fi]);
+		lf = CreateFileA(path, 0x80000000, 3, 0, 3, 0x80, 0);
+		if (lf == INVALID_HANDLE_VALUE) goto done;
+		lsize = GetFileSize(lf, 0);
+		list = VirtualAlloc(0, lsize + 4, 0x3000, 4);
+		if (!list || !ReadFile(lf, list, lsize, &got, 0) || got != lsize) { CloseHandle(lf); goto done; }
+		CloseHandle(lf);
+		z = (const ZsHead *)list;
+		e = (const u32 *)(z + 1);
+		if (lsize < sizeof *z || z->magic != ZS_MAGIC || z->block != g_zs_block[fi] || !z->size ||
+		    z->nblocks != (z->size + z->block - 1) / z->block || lsize != sizeof *z + z->nblocks * 8) {
+			log_msg("net: level0 sync: the host's block list of %s is damaged", g_l0_names[fi]);
+			goto done;
+		}
+		/* its weak sums in a hash table (the short last block is always downloaded) */
+		for (mask = 1; mask < z->nblocks && mask < (1u << 20); mask <<= 1) {}
+		mask--;
+		headt = VirtualAlloc(0, (mask + 1) * 4, 0x3000, 4);
+		next = VirtualAlloc(0, z->nblocks * 4, 0x3000, 4);
+		have = VirtualAlloc(0, z->nblocks, 0x3000, 4);
+		if (!headt || !next || !have) goto done;
+		memset(headt, 0xff, (mask + 1) * 4);
+		for (u32 k = 0; k < z->nblocks; k++) {
+			if ((k + 1) * z->block > z->size) { next[k] = -1; continue; }
+			next[k] = headt[e[2 * k] & mask];
+			headt[e[2 * k] & mask] = (int)k;
+		}
+
+		/* 2. what this PC has: its own file, then every version in the cache */
+		fmt(path, "%s%s", stage, g_l0_names[fi]);
+		make_dirs(path);
+		out = CreateFileA(path, 0xc0000000 /* GENERIC_READ | GENERIC_WRITE */, 1, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+		if (out == INVALID_HANDLE_VALUE) goto done;
+		dl_draw("Looking for the host's level0 in your files...", "", 10);
+		fmt(path, "GameDataFolder\\%s", g_l0_names[fi]);
+		if (zs_scan(path, z, e, headt, next, mask, have, &nhave, out, buf) < 0) { result = -1; goto done; }
+		{
+			WIN32_FIND_DATAA fd;
+			HANDLE fh = FindFirstFileA("cache\\*", &fd);
+			if (fh != INVALID_HANDLE_VALUE) {
+				do {
+					if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.' || nhave == z->nblocks) continue;
+					fmt(path, "cache\\%s", fd.cFileName);
+					if (str_ieq_n(path, dir, sizeof path)) continue;
+					fmt(path, "cache\\%s\\%s", fd.cFileName, g_l0_names[fi]);
+					if (zs_scan(path, z, e, headt, next, mask, have, &nhave, out, buf) < 0) { FindClose(fh); result = -1; goto done; }
+				} while (FindNextFileA(fh, &fd));
+				FindClose(fh);
+			}
+		}
+		/* 3. the rest from the host, as ranges of at most MAP_CHUNK bytes */
+		for (u32 k = 0; k < z->nblocks; k++) {
+			if (have[k]) continue;
+			u32 off = k * z->block, end = off + z->block > z->size ? z->size : off + z->block;
+			if (npiece && piece[npiece - 1].off + piece[npiece - 1].len == off && piece[npiece - 1].len + (end - off) <= MAP_CHUNK)
+				piece[npiece - 1].len += end - off;
+			else if (npiece < ZS_PIECES_MAX) {
+				piece[npiece].off = off;
+				piece[npiece].len = end - off;
+				npiece++;
+			} else {
+				log_msg("net: level0 sync: too much of %s differs, the full download it is", g_l0_names[fi]);
+				goto done;
+			}
+			need_bytes += end - off;
+		}
+		log_msg("net: level0 sync: %s: %u of %u blocks of %u bytes found in this PC's files; %u bytes to download in %u pieces",
+		        g_l0_names[fi], nhave, z->nblocks, z->block, need_bytes, npiece);
+		to_fetch_all += need_bytes;
+		full += z->size;
+		pgot = VirtualAlloc(0, npiece + 1, 0x3000, 4);
+		if (!pgot) goto done;
+		{
+			u32 lo = 0, win = 64, grown_at = 0, last_loss = 0, last_draw = 0, last_heard = GetTickCount(), done_bytes = 0, left = npiece;
+			u32 *asked = VirtualAlloc(0, (npiece + 1) * 4, 0x3000, 4);
+			if (!asked) goto done;
+			while (left) {
+				u32 now = GetTickCount(), n;
+				int heard = 0, lost = 0;
+				if (dl_cancelled()) { VirtualFree(asked, 0, 0x8000); result = -1; goto done; }
+				if (now - last_heard > LOST_MS) { VirtualFree(asked, 0, 0x8000); log_msg("net: level0 sync: the host stopped answering"); goto done; }
+				while ((n = dl_receive(rbuf, sizeof rbuf))) {
+					const PktL0Data *d = (const PktL0Data *)rbuf;
+					u32 lo2 = 0, hi = npiece, w;
+					if (d->h.type != PKT_L0_DATA || n < sizeof *d || d->file != (u32)fi || n < sizeof *d + d->size) continue;
+					while (lo2 < hi) { u32 m = (lo2 + hi) / 2; if (piece[m].off < d->off) lo2 = m + 1; else hi = m; }
+					if (lo2 >= npiece || piece[lo2].off != d->off || piece[lo2].len != d->size || pgot[lo2]) continue;
+					SetFilePointer(out, (int)d->off, 0, 0);
+					if (!WriteFile(out, rbuf + sizeof *d, d->size, &w, 0) || w != d->size) { VirtualFree(asked, 0, 0x8000); goto done; }
+					pgot[lo2] = 1;
+					left--;
+					done_bytes += d->size;
+					fetched += d->size;
+					heard = 1;
+				}
+				if (heard) last_heard = now;
+				if (g_dl_rekeyed) { g_dl_rekeyed = 0; memset(asked, 0, (npiece + 1) * 4); }
+				while (lo < npiece && pgot[lo]) lo++;
+				if (lo - grown_at >= win) { win = win + 32 > DL_WINDOW_MAX ? DL_WINDOW_MAX : win + 32; grown_at = lo; }
+				{
+					PktL0Req q;
+					u32 end = lo + win < npiece ? lo + win : npiece;
+					memset(&q, 0, sizeof q);
+					for (u32 c = lo; c < end; c++) {
+						if (pgot[c] || (asked[c] && now - asked[c] < DL_RTO_MS)) continue;
+						if (asked[c]) lost = 1;
+						asked[c] = now ? now : 1;
+						q.r[q.count].off = piece[c].off;
+						q.r[q.count].len = (u16)piece[c].len;
+						if (++q.count == ZS_PAIRS) {
+							head(&q.h, PKT_L0_REQ);
+							q.file = (u32)fi;
+							send_to_host(&q, sizeof q);
+							q.count = 0;
+						}
+					}
+					if (q.count) {
+						head(&q.h, PKT_L0_REQ);
+						q.file = (u32)fi;
+						send_to_host(&q, sizeof q);
+					}
+				}
+				if (lost && now - last_loss >= DL_RTO_MS) { win = win / 2 < DL_WINDOW_MIN ? DL_WINDOW_MIN : win / 2; grown_at = lo; last_loss = now; }
+				if (now - last_draw >= DL_DRAW_MS) {
+					u32 ms = now - began ? now - began : 1;
+					size_text(s1, done_bytes, need_bytes);
+					size_text(s2, need_bytes, need_bytes);
+					speed_text(s3, fetched / ms * 1000 + fetched % ms * 1000 / ms);
+					fmt(a, "Downloading the host's level0 (%d/2): only what differs", fi + 1);
+					fmt(b2, "%s of %s (%s)", s1, s2, s3);
+					dl_draw(a, b2, need_bytes ? done_bytes / (need_bytes / 100 + 1) : 100);
+					last_draw = now;
+				} else if (!heard) Sleep(1);
+			}
+			VirtualFree(asked, 0, 0x8000);
+		}
+		/* 4. the file as the host has it, or nothing */
+		SetFilePointer(out, (int)z->size, 0, 0);
+		SetEndOfFile(out);
+		CloseHandle(out);
+		out = INVALID_HANDLE_VALUE;
+		fmt(path, "%s%s", stage, g_l0_names[fi]);
+		if (hash_file(path) != g_l0_want[fi]) {
+			log_msg("net: level0 sync: the rebuilt %s isn't the host's; the full download it is", g_l0_names[fi]);
+			goto done;
+		}
+		VirtualFree(pgot, 0, 0x8000); pgot = 0;
+		VirtualFree(have, 0, 0x8000); have = 0;
+		VirtualFree(next, 0, 0x8000); next = 0;
+		VirtualFree(headt, 0, 0x8000); headt = 0;
+		VirtualFree(list, 0, 0x8000); list = 0;
+	}
+	/* 5. into the cache folder */
+	for (int fi = 0; fi < 2; fi++) {
+		fmt(path, "%s%s", stage, g_l0_names[fi]);
+		fmt(rel, "%s\\%s", dir, g_l0_names[fi]);
+		if (!GetFullPathNameA(rel, sizeof to, to, 0) || !move_file(path, to)) goto done;
+	}
+	RemoveDirectoryA(stage);
+	for (int fi = 0; fi < 2; fi++) {   /* the block lists did their job */
+		fmt(path, "%s%s.zs", sigdir, g_l0_names[fi]);
+		DeleteFileA(path);
+	}
+	RemoveDirectoryA(sigdir);
+	log_msg("net: level0 sync: done in %u ms: %u bytes downloaded (the whole pair is %u)", GetTickCount() - began, to_fetch_all, full);
+	result = 1;
+
+done:
+	if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+	if (pgot) VirtualFree(pgot, 0, 0x8000);
+	if (have) VirtualFree(have, 0, 0x8000);
+	if (next) VirtualFree(next, 0, 0x8000);
+	if (headt) VirtualFree(headt, 0, 0x8000);
+	if (list) VirtualFree(list, 0, 0x8000);
+	if (buf) VirtualFree(buf, 0, 0x8000);
+	if (piece) VirtualFree(piece, 0, 0x8000);
+	if (result <= 0) {   /* what was rebuilt goes */
+		for (int fi = 0; fi < 2; fi++) {
+			fmt(path, "%s%s", stage, g_l0_names[fi]);
+			DeleteFileA(path);
+		}
+		RemoveDirectoryA(stage);
+	}
+	dl_lines_hide();
+	return result;
+}
+
 /* The level load's TMrLevel_Load call: the host's files first when they're wanted */
 static u16 ONI_FC level_load(u32 level, u32 edx)
 {
@@ -3047,7 +3538,8 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 		g_l0_fetch = 0;
 		fmt(rel, "%s\\", g_l0_dir);
 		fmt(folder, "level0-%08x-%08x", g_l0_want[0], g_l0_want[1]);
-		if (GetFullPathNameA(rel, sizeof dir, dir, 0) && map_download_to(L0_SET, dir, folder)) {
+		int synced = level0_sync(g_l0_dir);   /* only the differences; else the whole pair */
+		if (synced > 0 || (synced == 0 && GetFullPathNameA(rel, sizeof dir, dir, 0) && map_download_to(L0_SET, dir, folder))) {
 			fmt(path, "%s\\level0_Final.dat", g_l0_dir);
 			u32 d = hash_file(path);
 			fmt(path, "%s\\level0_Final.raw", g_l0_dir);
@@ -3933,7 +4425,8 @@ static void receive(void)
 		if (g_mode == NET_HOST && h->key != cookie_of(&from)) {   /* see "Strangers" */
 			/* a would-be joiner's request, or a player's packet whose key went wrong (its PC took a
 			 * forged PKT_COOKIE): the right one back, no bigger than what came */
-			if (((h->type == PKT_HELLO || h->type == PKT_MAP_LIST_REQ || h->type == PKT_MAP_REQ) && (u32)n >= sizeof *h + 8) ||
+			if (((h->type == PKT_HELLO || h->type == PKT_MAP_LIST_REQ || h->type == PKT_MAP_REQ || h->type == PKT_L0_REQ) &&
+			     (u32)n >= sizeof *h + 8) ||
 			    l >= 0)
 				send_cookie(&from);
 			else
@@ -3949,6 +4442,10 @@ static void receive(void)
 				stranger(&from, "the host's address without this PC's key");
 				continue;
 			}
+		}
+		if (g_mode == NET_HOST && h->type == PKT_L0_REQ && (u32)n >= sizeof(PktL0Req)) {   /* see "level0 sync" */
+			zs_serve_ranges((const PktL0Req *)buf, &from);
+			continue;
 		}
 		if (g_mode == NET_HOST && (h->type == PKT_MAP_LIST_REQ || h->type == PKT_MAP_REQ)) {
 			map_serve(buf, n, &from);
@@ -4532,7 +5029,7 @@ static int ready_frame(u32 now)
 		    stun_text(a) &&
 		    !str_ieq_n(a, g_hint_addr, sizeof g_hint_addr)) {
 			str_cpy(g_hint_addr, sizeof g_hint_addr, a);
-			fmt(t, "The host doesn't answer. If it's outside your network, it types: /punch %s", a);
+			str_cpy(t, sizeof t, "The host doesn't answer. If it's outside your network, it can let you in with /punch and your /ip");
 			chat_server(t);
 		}
 		if (g_state == S_LOBBY && g_host_heard && (int)(now - g_link[0].last_recv) > LOST_MS) {
@@ -4961,9 +5458,11 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 		const char *m = upnp_take_message();
 		char a[32], t[CHAT_MAX];
 		if (m) chat_server(m);
-		if (stun_take_change() && stun_text(a)) {   /* see "Hole punching" */
-			if (helper_on()) fmt(t, "Your internet address: %s", a);   /* the helper's line says how players get in */
-			else fmt(t, "Your internet address: %s. Players outside your network may need /punch (see /help)", a);
+		/* No address on screen unless asked (/ip): players stream their games. With the helper its
+		 * own line says how players get in; without it, how /punch helps. */
+		if (stun_take_change() && stun_text(a) && !helper_on() && !g_punch_said) {   /* see "Hole punching" */
+			g_punch_said = 1;
+			str_cpy(t, sizeof t, "Players outside your network may need /punch to get in (see /help)");
 			chat_server(t);
 		}
 	}
@@ -5760,6 +6259,7 @@ static int net_open(void)
 	g_key = 0;   /* joiner: the host gives this address its key (see "Strangers") */
 	g_opened_at = GetTickCount();
 	g_hint_addr[0] = 0;
+	g_punch_said = 0;
 	g_intro_at = 0;
 	g_helper_knows = 0;
 	if (g_mode == NET_HOST) make_secret();

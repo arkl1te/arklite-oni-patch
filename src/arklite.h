@@ -97,6 +97,7 @@ void  more_options_install(void);
 void  more_options_init(WMtWindow *dialog);                    /* after the Options dialog's init */
 int   more_options_command(WMtWindow *dialog, u32 id, u32 notify);   /* 1 if it was ours */
 int   more_options_cancel(WMtWindow *dialog);   /* Esc: 1 if it only left the More page */
+void  more_options_end(WMtWindow *dialog);      /* the dialog is going (WMcMessage_Destroy) */
 int   pause_music_mode(void);
 u32   pause_background_alpha(void);   /* 0..255 */
 float hud_scale(void);                /* 1.0 = original size */
@@ -345,6 +346,18 @@ void ui_list_draw_text(u32 p2, int x, int width, const char *text, u32 color);  
 WMtWindow *ui_label(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, const char *text, int x, int y, int w, int h, int align);
 void *ui_frame_hook(void (*fn)(void));   /* called every frame while a dialog is up; returns the old one */
 void ui_frame_hook_call(void *old);       /* from fn: the hook it replaced */
+/* Text fields with Arklite's editing (selection, caret, keys): begin when the dialog is made
+ * (Enter = default_id while no field is edited), frame from its frame hook, end when it closes */
+void ui_fields_begin(WMtWindow *dialog, u32 default_id);
+void ui_fields_frame(void);
+void ui_fields_end(void);
+/* A field for numbers like 1.250 (digits and one '.', at most max characters). Each key that
+ * changes it sends its dialog Command id | EFcNotify_Changed << 16; Enter, Tab, Escape or a click
+ * elsewhere send id | UI_NOTIFY_CONFIRMED << 16, for the dialog to write its value back tidy. */
+#define UI_NOTIFY_CONFIRMED 0x100   /* Arklite's own; Oni's notify codes are small */
+WMtWindow *ui_field_decimal(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, u32 id, int x, int y, int w,
+                            u32 max, const char *text);
+int  ui_parse_thousandths(const char *s, int *out);   /* "1.25" -> 1250; 0 if it isn't a number */
 
 /* ---- mp_board.c -------------------------------------------------------------------------- */
 
@@ -385,6 +398,7 @@ void mp_names_say(int who, const char *text);   /* chat.c: a message over that p
 void mp_sound(const char *impulse);   /* a level 0 impulse by name, no position; outside a tick */
 void chat_install(void);              /* Arklite.ini [chat] */
 void menu_wheel_install(void);        /* menu_wheel.c: the mouse wheel in Oni's menus */
+void screenshot_install(void);       /* screenshot.c: F12 saves the frame to screenshots\ */
 void chat_frame(void);                /* every frame, after the update */
 void chat_draw(int width, int height);   /* from the HUD */
 int  chat_blocking(void);             /* open (or Enter/Esc that closed it still down): the game gets the mouse but no keyboard */

@@ -11,6 +11,12 @@
  *   When Game Pauses  three checkboxes acting as one choice (the stock radio buttons use the
  *                     grey g206 art, so Oni's own checkboxes look right here):
  *                     keep the level's music, play the main theme (the original game), silence.
+ *   Mouse             Sensitivity: a slider (0.10..4.00 in steps of 0.05) and a field beside it
+ *                     for any value from 0.001 to 99.99. 1.000 is Oni's own speed. It scales
+ *                     every mouse movement Oni's input takes in (LIrActionBuffer_Add, 0x403b30,
+ *                     inputs 5 and 6), whichever way it was read: DirectInput, the Windows cursor,
+ *                     or Daodan's raw input (whose own [windows] mousesensitivity in daodan.ini
+ *                     multiplies on top). Menus use the Windows cursor and aren't affected.
  *
  * Values are saved in Arklite.ini, [options]. */
 #include "arklite.h"
@@ -31,9 +37,39 @@ static int g_pauseBackground = 33;      /* percent; 33 was Arklite's fixed value
 static int g_pauseMusic = PAUSE_MUSIC_KEEP;
 static int g_showFps;
 
+/* Mouse sensitivity in thousandths: the field takes 0.001..99.99 (5 characters fit its box), the
+ * slider 0.10..4.00 in steps of 0.05 (78 steps on a 110 px slider: 93 px of travel). From 10 up
+ * the field shows two decimals, so the value is kept in hundredths there. */
+#define cSensDefault   1000
+#define cSensMin       1
+#define cSensMax       99990
+#define cSensSlideMin  100
+#define cSensSlideStep 50
+#define cSensSteps     78
+static int g_sens = cSensDefault;
+static float g_sensFactor = 1.0f;
+
 static const char *const g_musicNames[] = { "keep", "theme", "silence" };
 
 static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static int sens_tidy(int t)
+{
+	t = clamp(t, cSensMin, cSensMax);
+	return t < 10000 ? t : (t + 5) / 10 * 10;
+}
+
+static void sens_text(char *out, int t)   /* 1.000, 0.250, 12.50 */
+{
+	if (t < 10000) fmt(out, "%d.%03d", t / 1000, t % 1000);
+	else fmt(out, "%d.%02d", t / 1000, t % 1000 / 10);
+}
+
+static void sens_set(int t)
+{
+	g_sens = sens_tidy(t);
+	g_sensFactor = g_sens / 1000.0f;
+}
 
 static void settings_load(void)
 {
@@ -47,8 +83,14 @@ static void settings_load(void)
 	for (int i = 0; i < 3; i++)
 		if (str_ieq_n(music, g_musicNames[i], sizeof music)) g_pauseMusic = i;
 	g_showFps = GetPrivateProfileIntA("options", "show_fps", 0, ini_path()) != 0;
-	log_msg("options: hud_scale %d, pause_background %d, pause_music %s, show_fps %d",
-	        g_hudScale, g_pauseBackground, g_musicNames[g_pauseMusic], g_showFps);
+	{
+		char text[24];
+		int t;
+		GetPrivateProfileStringA("options", "mouse_sensitivity", "1.000", text, sizeof text, ini_path());
+		sens_set(ui_parse_thousandths(text, &t) && t > 0 ? t : cSensDefault);
+	}
+	log_msg("options: hud_scale %d, pause_background %d, pause_music %s, show_fps %d, mouse_sensitivity %d/1000",
+	        g_hudScale, g_pauseBackground, g_musicNames[g_pauseMusic], g_showFps, g_sens);
 }
 
 static void settings_save_int(const char *key, int v)
@@ -69,8 +111,10 @@ enum {
 	ID_MORE = 113,
 	ID_HUD_SCALE = 120, ID_PAUSE_BACKGROUND,
 	ID_MUSIC_KEEP, ID_MUSIC_THEME, ID_MUSIC_SILENCE,
-	ID_SHOW_FPS,
+	ID_SHOW_FPS, ID_SENSITIVITY, ID_SENSITIVITY_VALUE,
 };
+#define ID_LAST ID_SENSITIVITY_VALUE
+#define DLGcMessage_GetDefaultID 0x3e
 #define ID_CLOSE    2
 #define ID_SOUND    102   /* stock Overall Volume slider, Sound Volume after volume.c */
 #define ID_SUBTITLE 107   /* stock checkbox */
@@ -79,20 +123,22 @@ enum {
 static WMtWindow *g_stock[MAX_WINDOWS];   /* stock controls hidden on our page */
 static WMtWindow *g_ours[MAX_WINDOWS];    /* our controls, hidden on the stock page */
 static u32 g_nstock, g_nours;
-static WMtWindow *g_dialog, *g_more, *g_hudValue, *g_backgroundValue;
+static WMtWindow *g_dialog, *g_more, *g_hudValue, *g_backgroundValue, *g_sensSlider, *g_sensField;
+static void *g_frameHookOld;
+static int g_fieldsOn;   /* ui_fields_begin ran for this dialog */
 /* New controls go right after this one in the child list. Earlier children are drawn over
  * later ones, and the frames (Title windows) have a translucent dark fill, so a control placed
  * after a frame in the list is drawn under it and looks dimmed. "Quality:" precedes every frame. */
 static WMtWindow *g_anchor;
 static int g_onOurPage, g_initializing;
 
-/* Kept on both pages: the background picture, the Graphics and Sound frames (x 5, width 300,
- * at y 50 and 175) and the Close button. */
+/* Kept on both pages: the background picture, the Graphics, Sound and misc frames (x 5, width 300,
+ * at y 50, 175 and 290) and the Close button. */
 static int keep_on_both_pages(WMtWindow *w)
 {
 	if (WIN_ID(w) == ID_CLOSE) return 1;
 	if (WIN_X(w) == 0 && WIN_Y(w) == 0) return 1;              /* pict_options_background */
-	if (WIN_X(w) == 5 && WIN_W(w) == 300 && (WIN_Y(w) == 50 || WIN_Y(w) == 175)) return 1;
+	if (WIN_X(w) == 5 && WIN_W(w) == 300 && (WIN_Y(w) == 50 || WIN_Y(w) == 175 || WIN_Y(w) == 290)) return 1;
 	return 0;
 }
 
@@ -123,6 +169,7 @@ static WMtWindow *add(WMtWindow *src, const char *text, u32 id, int x, int y, in
 
 static void show_page(int ours)
 {
+	WMrWindow_SetFocus(g_dialog);   /* a field being edited is done (and tidied) before it hides */
 	for (u32 i = 0; i < g_nstock; i++) WMrWindow_SetVisible(g_stock[i], !ours);
 	for (u32 i = 0; i < g_nours; i++)  WMrWindow_SetVisible(g_ours[i], ours);
 	if (g_more) WMrWindow_SetTitle(g_more, ours ? "Back" : "More...", 0x100);
@@ -145,6 +192,31 @@ static void check_music(void)
 	}
 }
 
+static int sens_step(int t) { return clamp((t - cSensSlideMin + cSensSlideStep / 2) / cSensSlideStep, 0, cSensSteps); }
+
+static void sens_show(int slider, int field)
+{
+	char text[16];
+	if (slider && g_sensSlider) WMrSlider_SetValue(g_sensSlider, sens_step(g_sens));
+	if (field && g_sensField) {
+		sens_text(text, g_sens);
+		WMrMessage_Send(g_sensField, EFcMessage_SetText, (u32)text, 0);
+	}
+}
+
+static void sens_save(void)
+{
+	char text[16];
+	sens_text(text, g_sens);
+	WritePrivateProfileStringA("options", "mouse_sensitivity", text, ini_path());
+}
+
+static void frame(void)
+{
+	ui_frame_hook_call(g_frameHookOld);
+	ui_fields_frame();
+}
+
 void more_options_init(WMtWindow *dialog)
 {
 	WMtWindow *close = WMrDialog_GetItemByID(dialog, ID_CLOSE);
@@ -158,7 +230,7 @@ void more_options_init(WMtWindow *dialog)
 	g_dialog = dialog;
 	g_anchor = rowLabel;
 	g_nstock = g_nours = 0;
-	g_more = g_hudValue = g_backgroundValue = 0;
+	g_more = g_hudValue = g_backgroundValue = g_sensSlider = g_sensField = 0;
 	g_onOurPage = 0;
 	if (!close || !slider || !checkbox || !rowLabel || !header || !title) {
 		log_msg("options: stock controls not found, no More... page");
@@ -191,6 +263,24 @@ void more_options_init(WMtWindow *dialog)
 	add(checkbox, "Play Main Theme (original)", ID_MUSIC_THEME, 30, 215, 270, 20);
 	add(checkbox, "Silence", ID_MUSIC_SILENCE, 30, 240, 270, 20);
 
+	/* Mouse: the misc frame (y 290..390), which has no header on the stock page. "Sensitivity:"
+	 * is 78 px; the field fits any 5 characters of digits and '.' (41 px + 8 px of its margins). */
+	add(header, "Mouse", 0, 50, 275, 150, 20);
+	add(rowLabel, "Sensitivity:", 0, 30, 305, 86, 20);
+	g_sensSlider = add(slider, "mouse sensitivity", ID_SENSITIVITY, 118, 305, 110, 20);
+	ui_fields_begin(dialog, WMrMessage_Send(dialog, DLGcMessage_GetDefaultID, 0, 0));
+	g_fieldsOn = 1;
+	{
+		char text[16];
+		sens_text(text, g_sens);
+		g_sensField = ui_field_decimal(dialog, g_anchor, rowLabel, ID_SENSITIVITY_VALUE, 234, 305, 51, 5, text);
+	}
+	if (g_sensField) {
+		WMrWindow_SetVisible(g_sensField, 0);
+		if (g_nours < MAX_WINDOWS) g_ours[g_nours++] = g_sensField;
+	}
+	g_frameHookOld = ui_frame_hook(frame);
+
 	if (hud) {
 		WMrSlider_SetRange(hud, 0, cHudScaleSteps);
 		WMrSlider_SetValue(hud, (g_hudScale - cHudScaleMin) / cHudScaleStep);
@@ -200,6 +290,8 @@ void more_options_init(WMtWindow *dialog)
 	show_percent(g_backgroundValue, g_pauseBackground);
 	check_music();
 	if (fps) WMrCheckBox_SetCheck(fps, g_showFps);
+	if (g_sensSlider) WMrSlider_SetRange(g_sensSlider, 0, cSensSteps);
+	sens_show(1, 0);
 
 	/* "More..." left of Close, same size */
 	g_more = WMrWindow_New(WIN_CLASS(close), "More...", WIN_FLAGS(close), WIN_STYLE(close), ID_MORE,
@@ -217,8 +309,28 @@ void more_options_init(WMtWindow *dialog)
 
 int more_options_command(WMtWindow *dialog, u32 id, u32 notify)
 {
-	if (dialog != g_dialog || id < ID_MORE || id > ID_SHOW_FPS) return 0;
-	if (g_initializing || notify != WMcNotify_Click) return 1;
+	if (dialog != g_dialog || id < ID_MORE || id > ID_LAST) return 0;
+	if (g_initializing) return 1;
+
+	if (id == ID_SENSITIVITY_VALUE) {
+		char text[16];
+		int t;
+
+		if (notify == UI_NOTIFY_CONFIRMED) {   /* what it was set to, written tidy */
+			sens_show(0, 1);
+		} else if (notify == EFcNotify_Changed && g_sensField) {   /* typing: at once, when it reads as a number */
+			text[0] = 0;
+			WMrMessage_Send(g_sensField, EFcMessage_GetText, (u32)text, sizeof text);
+			text[sizeof text - 1] = 0;
+			if (ui_parse_thousandths(text, &t) && t > 0 && sens_tidy(t) != g_sens) {
+				sens_set(t);
+				sens_save();
+				sens_show(1, 0);
+			}
+		}
+		return 1;
+	}
+	if (notify != WMcNotify_Click) return 1;
 
 	if (id == ID_MORE) {
 		show_page(!g_onOurPage);
@@ -240,6 +352,13 @@ int more_options_command(WMtWindow *dialog, u32 id, u32 notify)
 			settings_save_int("pause_background", v);
 			show_percent(g_backgroundValue, v);
 		}
+	} else if (id == ID_SENSITIVITY) {
+		/* a value between the slider's steps (typed) stays until the thumb really moves */
+		int step = g_sensSlider ? clamp(WMrSlider_GetValue(g_sensSlider), 0, cSensSteps) : sens_step(g_sens);
+		if (step == sens_step(g_sens)) return 1;
+		sens_set(cSensSlideMin + step * cSensSlideStep);
+		sens_save();
+		sens_show(0, 1);
 	} else if (id == ID_SHOW_FPS) {
 		WMtWindow *box = WMrDialog_GetItemByID(dialog, id);
 
@@ -262,7 +381,67 @@ int more_options_cancel(WMtWindow *dialog)
 	return 1;
 }
 
+void more_options_end(WMtWindow *dialog)
+{
+	if (dialog != g_dialog) return;
+	if (g_fieldsOn) {
+		ui_frame_hook(g_frameHookOld);
+		ui_fields_end();
+		g_fieldsOn = 0;
+	}
+	g_dialog = 0;
+	g_sensSlider = g_sensField = 0;
+}
+
+/* ---- Mouse sensitivity --------------------------------------------------------------------- */
+
+#define LIcActionBuffer_Add 0x403b30   /* ECX the action, EDX &{u32 input, float value} */
+#define LIcMouseCode_XAxis  5
+#define LIcMouseCode_YAxis  6
+
+typedef struct { u32 input; float value; } LItDeviceInput;
+
+static void ONI_FC scale_mouse(LItDeviceInput *in)
+{
+	if (in->input == LIcMouseCode_XAxis || in->input == LIcMouseCode_YAxis) in->value *= g_sensFactor;
+}
+
+/* Jumped to from 0x403b30: scale the input, then Oni's first instructions (push ebx, esi, edi;
+ * mov edi, [edx]) and on at 0x403b35 */
+__attribute__((naked)) static void action_add_entry(void)
+{
+	__asm__ volatile(
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"movl %%edx, %%ecx\n\t"
+		"call %c0\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
+		"pushl %%ebx\n\t"
+		"pushl %%esi\n\t"
+		"pushl %%edi\n\t"
+		"movl (%%edx), %%edi\n\t"
+		"pushl $0x403b35\n\t"
+		"ret\n" :: "i"(scale_mouse));
+}
+
+static void mouse_install(void)
+{
+	static const u8 entry[] = { 0x53, 0x56, 0x57, 0x8b, 0x3a };
+	u8 jmp[5] = { 0xe9 };
+	u32 rel = (u32)action_add_entry - (LIcActionBuffer_Add + 5);
+
+	if (!code_matches(LIcActionBuffer_Add, entry, sizeof entry)) {
+		log_msg("mouse sensitivity: LIrActionBuffer_Add changed, left alone");
+		return;
+	}
+	for (int i = 0; i < 4; i++) jmp[i + 1] = (u8)(rel >> (i * 8));
+	patch_write(LIcActionBuffer_Add, jmp, sizeof jmp);
+	log_msg("mouse sensitivity: patched");
+}
+
 void more_options_install(void)
 {
 	settings_load();
+	mouse_install();
 }

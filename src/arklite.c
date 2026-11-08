@@ -179,5 +179,6 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	chat_install();
 	mp_board_install();
 	menu_wheel_install();
+	screenshot_install();
 	return 1;
 }

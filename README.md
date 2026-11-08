@@ -10,18 +10,20 @@ Arklite's aim is to be the Oni update that never came.
 
 ## Features
 
-- **Network multiplayer** for 2 to 4 players (as many as the map has spawn points). Host a map from the menu, or join one from your server list or your local network. Players fight in a warm-up until enough of them are ready (F3), and anyone can join while a warm-up or match is on; matches have time and score limits, a kill feed in the top left corner (who killed whom, and how, in icons), a scoreboard (F1) and chat (Enter), which also says when someone enters or leaves the game. Type /help in the chat for its commands: /name, /w (whisper), /moves (your character's move list), /t and /t2 (taunts), /sneeze, /i (idle), /clear. The other players are predicted, so there's no input delay.
+- **Network multiplayer** for 2 to 4 players (as many as the map has spawn points). Host a map from the menu, or join one from the server list, your saved servers or your local network: games on the internet are listed and reached for you, even behind a provider's shared address. Your game never shows anyone's address, so you can stream it. Players fight in a warm-up until enough of them are ready (F3), and anyone can join while a warm-up or match is on; matches have time and score limits, a kill feed in the top left corner (who killed whom, and how, in icons), a scoreboard (F1) and chat (Enter), which also says when someone enters or leaves the game. Type /help in the chat for its commands: /name, /w (whisper), /moves (your character's move list), /t and /t2 (taunts), /sneeze, /i (idle), /clear. The other players are predicted, so there's no input delay.
 - **Pick your character with F2**, from Konoko to Mad Bomber, with their outfits and colors. Type your name there too, and it shows over your head.
 - **Barabas can regenerate** when you play him: crouch, let go of crouch, then press Action.
-- **Custom Game** on the main menu lists every custom level. Play it alone or host it. Joiners who don't have the map download it from the host.
+- **Custom Game** on the main menu lists every custom level. Play it alone or host it. Joiners who don't have the map download it from the host, and a host whose AE mods changed level0 sends joiners only what differs, kept apart from their own files.
 - **HUD scaling** from 50% to 300%, and stays (almost) sharp. The stock HUD gets tiny at high resolutions.
 - **Sound, Music and Voice volume bars**, with all character speech and taunts on Voice.
 - **An FPS counter**, off by default, in Options > More...
+- **Mouse sensitivity** in Options > More...: a slider from 0.10 to 4.00, and a box beside it for any exact value, higher or lower (1.000 is Oni's own speed).
 - **Mouse wheel in the menus**: it scrolls lists, moves the slider under the cursor and turns the pages of the F1 screen.
 - **Transparent pause menu**, and the level music keeps playing behind it if you like.
 - **255 characters**, all active at once, so big fights no longer crash the game.
 - **Fixed skybox** along the edges of the sky.
 - **Fixed tiny strikers** outside the dream lab.
+- **Screenshots with F12**, anywhere: in a level, in the menus or while a level loads. They're saved as PNG in `AE/screenshots/`, and you hear the game-saved sound when one is done.
 - **A crash log** in `AE/logs/`, dated, with the last three games kept, for when something goes wrong.
 
 Everything is in Options → **More...** and in the **Custom Game** menu. Press F1 in a match for the scoreboard, and F2 to change character.

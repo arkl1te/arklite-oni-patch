@@ -41,6 +41,7 @@ typedef u8 (ONI_FC *WMtDialogProc)(WMtWindow *dialog, u32 msg, u32 p1, u32 p2);
  * proc only ever sees the Command (the class proc calls it for 0x17 only); a button click
  * sends p2 = the button. If the dialog proc returns 0, the class proc ends the modal. */
 #define WMcMessage_Cancel     0x14
+#define WMcMessage_Destroy    0x13
 #define WMcNotify_Click       1
 #define WMcNotify_DoubleClick 2
 #define LBcMessage_AddString   0x45

@@ -446,6 +446,7 @@ static u8 ONI_FC options_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 		return 1;   /* never the stock handler, which writes Overall Volume to persist.dat */
 	}
 
+	if (msg == WMcMessage_Destroy) more_options_end(dialog);
 	g_initializing = msg == WMcMessage_InitDialog;
 	handled = original(dialog, msg, p1, p2);
 	if (msg == WMcMessage_InitDialog) {
