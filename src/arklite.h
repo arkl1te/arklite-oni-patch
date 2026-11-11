@@ -159,6 +159,7 @@ int  rollback_restore_tick(u32 tick);     /* back to the start of tick: 1, or 0 
 void rollback_impulses(int on);           /* one-shot sounds off while ticks run again */
 u32  rollback_ambients_stopped(void);     /* ambient sounds stopped because their ticks were taken back */
 u32  rollback_known_pages(void);
+const char *rollback_check_path(void);   /* this run's Arklite-rollbackcheck file, "" if none */
 int  rollback_check_begin(void);          /* after a rollback's re-run: keep its result */
 int  rollback_check_end(const char *what); /* after the same ticks ran again: 1 same, 0 game state differs */
 void rollback_check_stats(u32 *checks, u32 *bad);
@@ -552,3 +553,17 @@ void spin_particle_frame(void);  /* every frame: particles in a custom level's s
 
 void crash_log_install(void *instance);   /* log faults with registers and stack */
 void crash_log_exit(void);                /* log the stack when the process exits */
+
+
+/* ---- report.c: anonymous problem reports --------------------------------------------------- */
+enum { REPORT_DESYNC = 1, REPORT_CRASH = 2, REPORT_DROP = 3 };
+void report_install(void *instance);   /* [reports] send; sends a crash's log left by the last run */
+void report_net(u32 reason, const char *session, int slot, u32 tick, const char *dump1, const char *dump2, const char *extra);
+void report_crash(void);               /* the fault handler: this log goes at the next start */
+const char *net_session_id(void);      /* net.c: the session's ID, "none" outside one */
+int  net_local_slot(void);             /* net.c: this PC's player slot, -1 off the network */
+
+/* ---- flare_depth.c: lens flare depth tests ---------------------------------------------------- */
+void flare_depth_install(void);
+void flare_depth_present(void);        /* screenshot.c, at every SwapBuffers */
+int  screenshot_hooked(void);          /* screenshot.c: both SwapBuffers calls are hooked */

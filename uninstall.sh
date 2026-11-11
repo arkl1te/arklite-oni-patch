@@ -19,7 +19,7 @@ PURGE=0
 AE="${1:-${ONI_AE_DIR:-}}"
 if [ -z "$AE" ]; then
 	# Same search as install.sh, but only folders Arklite is installed in.
-	mapfile -t found < <(for c in "$HERE/.." "$HERE/../AE" "$HOME"/.wine/drive_c/"Program Files"*/Oni/AE "$HOME"/Games/*/drive_c/"Program Files"*/Oni/AE \
+	mapfile -t found < <(for c in "$HERE/.." "$HERE/../AE" "$HERE/../.." "$HOME"/.wine/drive_c/"Program Files"*/Oni/AE "$HOME"/Games/*/drive_c/"Program Files"*/Oni/AE \
 	                             "$HOME"/.local/share/bottles/bottles/*/drive_c/"Program Files"*/Oni/AE "$HOME"/Games/Oni/AE "$HOME"/Oni/AE; do
 		[ -e "$c/Arklite.dll" ] && (cd "$c" && pwd -P); done | sort -u)
 	case ${#found[@]} in
@@ -38,10 +38,16 @@ if is_loader "$AE/realbink.dll" || [ ! -e "$AE/realbink.dll" ]; then
 		rm -f "$AE/realbink.dll"
 		cp -L "$AE/bink_orig.dll" "$AE/realbink.dll"   # -L: older dev installs linked it
 		rm "$AE/bink_orig.dll"
-	elif [ -f "$HERE/backup/realbink.dll" ]; then
-		rm -f "$AE/realbink.dll"; cp "$HERE/backup/realbink.dll" "$AE/realbink.dll"
 	else
-		die "AE/bink_orig.dll (the original realbink.dll) is missing; run the AE Installer to restore it, then this script"
+		# No bink_orig.dll: AE keeps Bink in its Daodan package, and Oni/binkw32.dll is the same file.
+		for b in "$AE"/AEInstaller/packages/*Daodan*/plain/win_only/realbink.dll "$AE/../binkw32.dll" "$HERE/backup/realbink.dll" ""; do
+			[ -n "$b" ] || die "AE/bink_orig.dll (the original realbink.dll) is missing; run the AE Installer to restore it, then this script"
+			if [ -f "$b" ] && ! is_loader "$b" && [ "$(wc -c <"$b")" -ge 65536 ]; then
+				rm -f "$AE/realbink.dll"; cp "$b" "$AE/realbink.dll"
+				echo "AE/bink_orig.dll was missing; put Bink back from $b"
+				break
+			fi
+		done
 	fi
 else
 	rm -f "$AE/bink_orig.dll"   # realbink.dll is already the original (the AE Installer put it back)

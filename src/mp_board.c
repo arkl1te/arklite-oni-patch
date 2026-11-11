@@ -27,7 +27,8 @@
  * Scoreboard: on top, the time left (in the lobby the time limit) and the score limit on one
  * row; then Player (the host marked), Score, Ping (each player's last round trip to the host,
  * match only; on a joiner the host's row has its own) and a Mute box (chat.c) for every other
- * player of a network game, players who left in blue; under them, when anyone watches
+ * player of a network game; players who left in blue with "(left)" after the name, no ping and no Mute box (their
+ * score stays on the board); under them, when anyone watches
  * (/spectate), a Spectator list with Ping and Chat (no score); then the result once the match is
  * over. This PC's player in white, the others orange. */
 #include "arklite.h"
@@ -181,8 +182,9 @@ static void draw_row(const NetHud *h, int who, int y, int score)
 	u32 color = h->state != NETHUD_OFF && who == h->local_player ? WHITE : (h->gone >> who & 1) ? UI_BLUE : UI_ORANGE;
 	char line[32];
 
-	if (h->state != NETHUD_OFF && who == 0) {   /* the host plays player 1 */
-		static const char tag[] = "(host)";
+	int gone = h->state != NETHUD_OFF && (h->gone >> who & 1);
+	if (h->state != NETHUD_OFF && (who == 0 || gone)) {   /* the host plays player 1; a player who left says so */
+		const char *tag = gone ? "(left)" : "(host)";
 		char fit[64];
 		int tw = ui_text_width(tag);
 		ui_fit(fit, sizeof fit, mp_name(who), COL_SCORE - 60 - tw - 6);
@@ -196,10 +198,10 @@ static void draw_row(const NetHud *h, int who, int y, int score)
 		text_at(line, COL_SCORE, y, UI_RIGHT, color, 60);
 	}
 	if (h->state == NETHUD_OFF) return;
-	if (who != h->local_player && h->ping_ms[who] >= 0) fmt(line, "%d", h->ping_ms[who]);
+	if (who != h->local_player && !gone && h->ping_ms[who] >= 0) fmt(line, "%d", h->ping_ms[who]);
 	else str_cpy(line, sizeof line, "-");
 	text_at(line, COL_PING, y, UI_RIGHT, color, 45);
-	if (box && who != h->local_player) {
+	if (box && who != h->local_player && !gone) {
 		ui_set_frame(box, AREA_X + COL_MUTE, AREA_Y + y, MUTE_W, 20);
 		WMrCheckBox_SetCheck(box, chat_muted(who));
 	}
@@ -250,7 +252,7 @@ static void draw_board(void)
 	}
 	for (int who = 0; who < PLAYERS_MAX; who++) {   /* Mute boxes only on listed rows, not this PC's */
 		WMtWindow *box = g_mute[who];
-		int show = h.state != NETHUD_OFF && (shown >> who & 1) && who != h.local_player;
+		int show = h.state != NETHUD_OFF && (shown >> who & 1) && who != h.local_player && !(h.gone >> who & 1);
 		if (box && (WIN_VISIBLE(box) != 0) != show) WMrWindow_SetVisible(box, show);
 	}
 

@@ -31,8 +31,8 @@ The installer puts three files in `AE/`:
 | File | What |
 | --- | --- |
 | `Arklite.dll` | The mod. |
-| `realbink.dll` | Arklite's 3.5 KB loader. Daodan loads a DLL by this name, so the loader takes it. |
-| `bink_orig.dll` | AE's original `realbink.dll` (the Bink video DLL), renamed. The loader forwards Bink calls to it. It isn't part of the download: the installer renames your own copy. |
+| `realbink.dll` | Arklite's 3.5 KB loader. Daodan loads a DLL by this name, so the loader takes it. The zip carries it as `arklite_loader.dll`, so extracting the zip into `AE/` can't overwrite AE's own `realbink.dll`. |
+| `bink_orig.dll` | AE's original `realbink.dll` (the Bink video DLL), renamed. The loader forwards Bink calls to it. It isn't part of the download: the installer renames your own copy. If that copy was overwritten (an Arklite zip of 0.4.0 or older extracted straight into `AE/`), the installer takes Bink from the AE Installer's Daodan package or `Oni/binkw32.dll`, the same file. |
 
 It also makes `AE/GameDataFolder/CustomLevels/` and, the first time, copies `AE/persist.dat`
 (your saves and settings) to `AE/persist.dat.before-arklite`.
@@ -93,6 +93,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
 | | `characters` | 18 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
 | | `name` | Player | Your name in multiplayer games. You can also change it in the **F2** menu, which saves it here |
+| `[reports]` | `send` | 1 | 0: never send problem reports (see "Problem reports" under Troubleshooting) |
 | `[chat]` | `fade` | 10 | Seconds a chat message stays on screen while the chat is closed; 0: they stay |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
@@ -106,6 +107,7 @@ Environment variables, for testing (set them before starting `Oni.exe`):
 | `ARKLITE_HOST=1` | Hosts a network game on UDP port 27777 (or `ARKLITE_HOST=<port>`) |
 | `ARKLITE_JOIN=<ip>[:port]` | Joins the host at that address |
 | `ARKLITE_LOG=<file>` | Names the log: `AE/logs/<name>_<date>_<time>.log` (with `ARKLITE_JOIN` the default name is `Arklite-join.log`). Give each extra Oni on one PC its own, e.g. `Arklite-join3.log` |
+| `ARKLITE_FLARE_DEPTH=0` | Lens flares test their visibility as stock Oni does (one depth read each, which stalls NVIDIA cards), for comparing |
 | `ARKLITE_BENCH=<seconds>` | Once a level has run for 5 seconds, times every frame for that long, logs the frame times and closes Oni. `tools/oni-bench.sh` runs it hands off in a private KWin |
 
 On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`, `Oni.exe`.
@@ -394,8 +396,9 @@ into the warm-up, where F3 starts the next match.
 
 **F1** opens the help screen as usual, with the game still running. In a multiplayer game its
 first tab is the **Scoreboard**: the time left (before the match, the time limit) and the score limit
-on top, then every player's name, score and ping to the host. The host is marked, and players who
-left are in blue. Tick **Mute** next to a player to hide their chat messages (until you untick it
+on top, then every player's name, score and ping to the host. The host is marked. A player who
+left keeps their score there, in blue and marked "(left)", with no ping or Mute box; the score in
+the top right corner lists only the players still in the game. Tick **Mute** next to a player to hide their chat messages (until you untick it
 or close Oni). The **Objective** tab says in one sentence how to win the match.
 The host needs UDP port 27777 open. Over the internet the router must forward it to the host:
 when you host, Arklite asks the router to do that itself (UPnP, most home routers allow it), and
@@ -475,6 +478,15 @@ seconds after it stops hosting, and logs only counts.
   found, and `player 2 is #...` once a level has a second player. Check `p2_pad` in `[players]`.
 - **Oni crashes**: the end of the newest `AE/logs/Arklite_<date>_<time>.log` has the crash registers and stack. Include
   it, and the version on its first line, when you report the problem.
+- **Problem reports**: Arklite sends one by itself, once per game for each kind, when a network game goes out of sync
+  (the log, `Arklite-desync-*.bin`, `Arklite-desyncticks-*.bin` and `Arklite-rollbackcheck_*.txt`), when a player stops
+  answering or the host is lost (the log), and after a crash (that run's log, at the next start). It goes to the Arklite
+  helper (`[net] helper`, TCP on the same port), packed (LZ4): a desync's is about 1 MB. Before anything leaves your PC,
+  internet addresses become `[address]`, player names `player N`, the server's name `[server name]`, chat messages are
+  left out, and paths are cut to the game's folder (`<Oni>\`) and Arklite.dll's (`<Arklite>\`): any other folder
+  becomes `[path]\`. The dumps hold only game state. The helper keeps no address and deletes reports after 30 days.
+  Every PC of one game tags its report with the same game ID, so a desync's reports from both sides are read together.
+  The log says `report: sent an anonymous ... report` each time. `[reports] send=0` turns them off.
 
 ## Building from source
 

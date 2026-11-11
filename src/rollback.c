@@ -28,6 +28,7 @@ __declspec(dllimport) u32    WINAPI GetModuleFileNameA(void *, char *, u32);
 __declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
 __declspec(dllimport) int    WINAPI VirtualFree(void *, u32, u32);
 __declspec(dllimport) int    WINAPI CloseHandle(HANDLE);
+__declspec(dllimport) HANDLE WINAPI HeapCreate(u32, u32, u32);
 
 #define ONgGameState        (*(u8 **)0x5ece7c)
 #define GS_TICK(gs)         (*(u32 *)((gs) + 0x144))
@@ -437,6 +438,7 @@ typedef struct {
 } Engine;
 
 static Engine *g_e;
+static char g_vpath[MAX_PATH];   /* the rollback check file (rollback_check_path) */
 
 static void rb_unwatch(void);
 static void rb_unprotect(void);
@@ -1098,6 +1100,118 @@ static void *pool_alloc(HANDLE h, u32 flags, u32 n, int any)
 	return p;
 }
 
+/* ---- Oni's memory between ticks ------------------------------------------------------------ *
+ * Everything Oni allocates comes from its C runtime (VC6): blocks up to *0x55c014 (1016) bytes
+ * from its small-block heap (__sbh_alloc_block 0x524196, in 1 MB regions of its own), bigger
+ * ones from the heap *0x6d9200. Both are game memory: a rollback puts their pages back as they
+ * were at a tick's start, the allocators' own free lists included (the small-block heap keeps
+ * them inside the pages it hands out). That's right for what ticks allocate, but between ticks
+ * the main thread allocates too: every dialog and window (WMrWindow_New 0x475160 through
+ * 0x424ab0), so the pause menu, its sub-dialogs and the F1 Scoreboard. A rollback to a tick from
+ * before such a window put its page back over it: its memory held older bytes (freed game data)
+ * and the allocator took it for free again, so the next ticks put game data where the window
+ * lived. The window manager then read floats and text as pointers (the Linux host's crashes of
+ * 2026-11-10, at 0x46db31 and 0x476298 under the pause menu), and its writes changed game data
+ * on that PC alone.
+ * So while snapshots are on, the main thread's allocations between ticks come from a heap of
+ * Arklite's (g_side), which nothing ever puts back: the small-block heap declines them (its
+ * three callers, malloc, realloc and calloc, then ask HeapAlloc, as when it's full), its in-place
+ * resize too (realloc then moves the block), and rb_heap_alloc / rb_heap_realloc serve them from
+ * g_side. A survey of a match with bots opening the pause menu found only the window manager
+ * allocating there. Free, realloc and _msize find such a block by its address (g_side_set) at
+ * any time, after the match too. One freed inside a tick isn't freed: a rollback can run that
+ * tick again (and free it again), or not free it at all; it stays as a leak (logged). */
+#define SBH_ALLOC_FN        0x524196   /* __sbh_alloc_block(size): 0 when it can't */
+#define SBH_RESIZE_FN       0x52464b   /* __sbh_resize_block(header, block, size): 0 when it can't */
+#define SBH_RESIZE_CALL     0x51fcf0   /* realloc's */
+static const u32 g_sbh_alloc_calls[] = { 0x51fc70 /* malloc */, 0x51fd01 /* realloc */, 0x523d21 /* calloc */ };
+#define SIDE_BITS           15
+#define SIDE_SLOTS          (1u << SIDE_BITS)   /* open addressing: 0 empty, 1 deleted */
+static HANDLE g_side;
+static u32 g_side_set[SIDE_SLOTS];
+static u32 g_side_live, g_side_used, g_side_most, g_side_kept, g_side_logs;
+
+static u32 side_hash(u32 p) { return ((p >> 3) * 2654435761u) >> (32 - SIDE_BITS); }
+
+static u32 *side_find(u32 p)
+{
+	for (u32 i = side_hash(p), n = 0; n < SIDE_SLOTS; i = (i + 1) & (SIDE_SLOTS - 1), n++) {
+		if (g_side_set[i] == p) return &g_side_set[i];
+		if (!g_side_set[i]) return 0;
+	}
+	return 0;
+}
+
+static int side_has(const void *p) { return g_side && p && side_find((u32)p) != 0; }
+
+static int side_add(void *p)
+{
+	if (g_side_used >= SIDE_SLOTS / 2) return 0;   /* (deleted slots count: the set stays fast) */
+	for (u32 i = side_hash((u32)p); ; i = (i + 1) & (SIDE_SLOTS - 1))
+		if (g_side_set[i] <= 1) {
+			if (!g_side_set[i]) g_side_used++;
+			g_side_set[i] = (u32)p;
+			if (++g_side_live > g_side_most) g_side_most = g_side_live;
+			return 1;
+		}
+}
+
+static void side_remove(const void *p)
+{
+	u32 *e = side_find((u32)p);
+	if (e) {
+		*e = 1;
+		g_side_live--;
+	}
+}
+
+/* The main thread between ticks while snapshots are on */
+static int between_ticks(void)
+{
+	Engine *e = g_e;
+	return g_side && e && e->active && !e->in_body && GetCurrentThreadId() == e->main_tid;
+}
+
+static void *side_alloc(u32 flags, u32 n)
+{
+	void *p = g_heap_alloc(g_side, flags & HEAP_ZERO_MEMORY, n ? n : 1);
+	if (p && !side_add(p)) {   /* the set is full: Oni's heap after all, as before */
+		g_heap_free(g_side, 0, p);
+		if (g_side_logs++ < 4) log_msg("rollback: %d blocks made between ticks are alive: the next one comes from Oni's heap", g_side_live);
+		return 0;
+	}
+	return p;
+}
+
+static void *__cdecl rb_sbh_alloc(u32 n)
+{
+	return between_ticks() ? 0 : ((void *(__cdecl *)(u32))SBH_ALLOC_FN)(n);
+}
+
+static int __cdecl rb_sbh_resize(void *header, void *block, u32 n)
+{
+	return between_ticks() ? 0 : ((int (__cdecl *)(void *, void *, u32))SBH_RESIZE_FN)(header, block, n);
+}
+
+static void rb_side_install(void)
+{
+	u32 ok = 0;
+	for (u32 i = 0; i < sizeof g_sbh_alloc_calls / sizeof g_sbh_alloc_calls[0]; i++)
+		if (code_matches(g_sbh_alloc_calls[i], (const u8[]){ 0xe8 }, 1) &&
+		    g_sbh_alloc_calls[i] + 5 + *(const u32 *)(g_sbh_alloc_calls[i] + 1) == SBH_ALLOC_FN) ok++;
+	if (code_matches(SBH_RESIZE_CALL, (const u8[]){ 0xe8 }, 1) &&
+	    SBH_RESIZE_CALL + 5 + *(const u32 *)(SBH_RESIZE_CALL + 1) == SBH_RESIZE_FN) ok++;
+	if (ok != 4 || *(const HANDLE *)0x6d9200 == 0 || !(g_side = HeapCreate(0, 0, 0))) {
+		g_side = 0;
+		log_msg("rollback: Oni's allocator isn't as expected (%d of 4 calls): windows opened in a match stay in game memory", ok);
+		return;
+	}
+	for (u32 i = 0; i < sizeof g_sbh_alloc_calls / sizeof g_sbh_alloc_calls[0]; i++)
+		patch_call(g_sbh_alloc_calls[i], SBH_ALLOC_FN, (u32)rb_sbh_alloc);
+	patch_call(SBH_RESIZE_CALL, SBH_RESIZE_FN, (u32)rb_sbh_resize);
+	log_msg("rollback: what Oni allocates between ticks (windows, dialogs) comes from Arklite's heap: a rollback never puts it back");
+}
+
 static void rb_new_memory(const void *p, u32 n)
 {
 	Engine *e = g_e;
@@ -1117,9 +1231,12 @@ static int rb_heap_grew(const void *p, u32 n)
 
 static u32 g_grow_logs;
 
+
 static void *WINAPI rb_heap_alloc(HANDLE h, u32 flags, u32 n)
 {
-	void *p = pool_alloc(h, flags, n, 0), *q;
+	void *p, *q;
+	if (h == ONgCrtHeap && between_ticks() && (p = side_alloc(flags, n))) return p;
+	p = pool_alloc(h, flags, n, 0);
 	if (p) return p;
 	p = g_heap_alloc(h, flags, n);
 	/* the heap grew for it: given back at once (the heap as it was), and a pool slot instead. Any
@@ -1142,6 +1259,25 @@ static void *WINAPI rb_heap_alloc(HANDLE h, u32 flags, u32 n)
 static void *WINAPI rb_heap_realloc(HANDLE h, u32 flags, void *old, u32 n)
 {
 	int slot = pool_slot(old);
+	if (side_has(old)) {   /* one of Arklite's heap (made between ticks) */
+		void *p = g_heap_realloc(g_side, flags, old, n);
+		if (p && p != old) {
+			side_remove(old);
+			if (!side_add(p)) log_msg("rollback: a block made between ticks moved and its set is full");
+		}
+		return p;
+	}
+	if (slot < 0 && h == ONgCrtHeap && between_ticks() && !(flags & HEAP_REALLOC_IN_PLACE_ONLY)) {
+		/* a block of Oni's heap resized between ticks: moved to Arklite's (the old one's freeing
+		 * may come back with a rollback: a leak, never a clash) */
+		u32 had = g_heap_size(h, 0, old);
+		void *p = side_alloc(flags, n);
+		if (p) {
+			memcpy(p, old, had < n ? had : n);
+			g_heap_free(h, 0, old);
+			return p;
+		}
+	}
 	if (slot >= 0) {   /* a pool block: in its slot while it fits, else to the heap */
 		u32 had = g_pool_size[slot];
 		void *p;
@@ -1235,12 +1371,22 @@ static void rb_freed(u32 base)
 static u32 WINAPI rb_heap_size(HANDLE h, u32 flags, const void *p)
 {
 	int slot = pool_slot(p);
+	if (side_has(p)) return g_heap_size(g_side, 0, p);
 	return slot >= 0 ? g_pool_size[slot] : g_heap_size(h, flags, p);
 }
 
 static int WINAPI rb_heap_free(HANDLE h, u32 flags, void *p)
 {
 	int slot = pool_slot(p);
+	if (side_has(p)) {
+		Engine *e = g_e;
+		if (e && e->active && e->in_body) {   /* inside a tick: kept (see "Oni's memory between ticks") */
+			if (g_side_kept++ < 4) log_msg("rollback: tick %d freed a block made between ticks: kept", e->last_tick);
+			return 1;
+		}
+		side_remove(p);
+		return g_heap_free(g_side, 0, p);
+	}
 	if (slot >= 0) {
 		g_pool_size[slot] = 0;
 		return 1;
@@ -1279,6 +1425,7 @@ static void rb_check_allocs(void)
 	}
 }
 
+
 static void rb_hook_iat(u32 slot, const u8 *site, void *hook, void **orig)
 {
 	if (!code_matches((u32)site, (const u8[]){ 0xff, 0x15 }, 2) || *(const u32 *)(site + 2) != slot) {
@@ -1298,6 +1445,7 @@ static void rb_hook_alloc(void)
 	rb_hook_iat(IAT_VirtualAlloc, (const u8 *)0x524515, (void *)rb_virtual_alloc, (void **)&g_virtual_alloc);
 	rb_hook_iat(IAT_HeapFree, (const u8 *)0x51fc1c, (void *)rb_heap_free, (void **)&g_heap_free);
 	rb_hook_iat(IAT_HeapSize, (const u8 *)0x52521e, (void *)rb_heap_size, (void **)&g_heap_size);
+	if (g_heap_alloc && g_heap_realloc && g_heap_free && g_heap_size) rb_side_install();
 	/* the pool only works when every heap call Oni makes knows it */
 	if (g_heap_alloc && g_heap_realloc && g_heap_free && g_heap_size)
 		g_pool = VirtualAlloc(0, POOL_SLOTS * POOL_SLOT, 0x3000 /* MEM_COMMIT | MEM_RESERVE */, 4);
@@ -2074,6 +2222,9 @@ int rollback_restore_tick(u32 tick)
 	return 1;
 }
 
+/* report.c: this run's rollback check file, "" if none */
+const char *rollback_check_path(void) { return g_vpath; }
+
 u32 rollback_known_pages(void) { return g_e && g_e->active ? g_e->npages : 0; }
 
 /* ---- Checking rollbacks in a match (net.c) ------------------------------------------------ *
@@ -2125,6 +2276,7 @@ int rollback_check_end(const char *what)
 	if (!e->vout || e->vout == INVALID_HANDLE_VALUE) {
 		char path[MAX_PATH];
 		e->vout = log_file_create("Arklite-rollbackcheck.txt", path);
+		str_cpy(g_vpath, sizeof g_vpath, path);
 		g_out = e->vout;
 		out("Arklite rollback check: a rollback's ticks run once more with the same inputs; the two runs compared.");
 		out("A character that differs is game state a rollback leaves behind. 'first time' = the rollback's run,");

@@ -276,11 +276,12 @@ static int draw_problem(const NetHud *h, int width, int y)
 	return y + g_line_height + LINE_GAP;
 }
 
-/* The players listed: a network game's, or the ones on this PC */
+/* The players listed: a network game's still in it (one who left isn't: the F1 Scoreboard keeps their
+ * score, marked "(left)"), or the ones on this PC */
 static u32 players_shown(const NetHud *h)
 {
 	u32 mask = 0;
-	if (h->state != NETHUD_OFF) return h->present | h->gone;
+	if (h->state != NETHUD_OFF) return h->present;
 	for (int who = 0; who < PLAYERS_MAX; who++)
 		if (players_char(who)) mask |= 1u << who;
 	return mask;

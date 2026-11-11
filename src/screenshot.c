@@ -281,9 +281,14 @@ static void capture(void *dc)
 	}
 }
 
+/* Both presents come through swap_buffers (flare_depth.c counts frames there) */
+static int g_hooked;
+int  screenshot_hooked(void) { return g_hooked; }
+
 /* Stands in for SwapBuffers at both present calls: same stdcall signature */
 static int WINAPI swap_buffers(void *dc)
 {
+	flare_depth_present();
 	if (g_done) {   /* the game-saved sound, as chat's mp_sound plays it */
 		static int warned;
 		u8 *sound = SSrImpulse_GetByName("autosave");
@@ -312,6 +317,7 @@ void screenshot_install(void)
 		memcpy(call + 1, &rel, 4);
 		patch_write(g_sites[i], call, sizeof call);
 	}
+	g_hooked = 1;
 	if (!CreateThread(0, 0, key_thread, 0, 0, 0)) { log_msg("screenshot: couldn't start the F12 watcher"); return; }
 	log_msg("screenshot: patched (F12)");
 }

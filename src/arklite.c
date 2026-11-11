@@ -49,7 +49,11 @@
  *     vertexlight.bin, applied to the level's quad colors every frame; their sounds, and a
  *     flickering light's ambient Sound object playing only while the flicker fails.
  *   - Particles that turn with Catwalk's spinning groups (spin_particle.c): spinparticles.bin.
- *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log. */
+ *   - Crash log (crash_log.c): faults and the exit stack go to Arklite.log.
+ *   - Anonymous problem reports (report.c): a desync's, a dropped player's or a crash's log and dumps to
+ *     the Arklite helper, without addresses, names, chat or absolute paths ([reports] send=0: off).
+ *   - Lens flares without stalls (flare_depth.c): on NVIDIA every flare read the depth buffer on its
+ *     own, waiting for the GPU each time (Muro's combo: 170 FPS to 15); now one read a frame. */
 
 #include "arklite.h"
 
@@ -180,5 +184,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	mp_board_install();
 	menu_wheel_install();
 	screenshot_install();
+	flare_depth_install();
+	report_install(instance);
 	return 1;
 }

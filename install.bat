@@ -4,20 +4,21 @@ rem
 rem   install.bat ["C:\path\to\Oni\AE"]
 rem
 rem Without a path it looks for AE around the folder this file is in (the zip extracted into Oni\AE,
-rem into Oni, or next to Oni), then in the default install folder, then it asks.
+rem into Oni, or next to Oni; it also works from inside AE), then in the default install folder, then it asks.
 rem   AE\Arklite.dll    the mod
-rem   AE\realbink.dll   Arklite's loader (Daodan loads this name)
+rem   AE\realbink.dll   Arklite's loader (Daodan loads this name). The zip carries it as arklite_loader.dll,
+rem                     so extracting the zip into AE can't overwrite AE's own realbink.dll (Bink).
 rem   AE\bink_orig.dll  AE's original realbink.dll (Bink), renamed; the loader forwards to it
 setlocal EnableExtensions
 set "HERE=%~dp0"
 set "ONI_SHA256=363cf09684ca6b729b62f22f90701d7ebf9a33778e55b191f5040bccdcdd013d"
 
 if not exist "%HERE%Arklite.dll" ( echo error: Arklite.dll is not next to install.bat & goto fail )
-if not exist "%HERE%realbink.dll" ( echo error: realbink.dll is not next to install.bat & goto fail )
+if not exist "%HERE%arklite_loader.dll" ( echo error: arklite_loader.dll is not next to install.bat & goto fail )
 
 set "AE=%~1"
 rem An AE folder has Oni.exe and realbink.dll (or bink_orig.dll once Arklite is in); Oni\ has no realbink.dll.
-for %%D in ("%HERE%.." "%HERE%..\AE" "%HERE%AE" "%ProgramFiles(x86)%\Oni\AE" "%ProgramFiles%\Oni\AE") do (
+for %%D in ("%HERE%.." "%HERE%..\AE" "%HERE%AE" "%HERE%..\.." "%ProgramFiles(x86)%\Oni\AE" "%ProgramFiles%\Oni\AE") do (
 	if not defined AE if exist "%%~D\Oni.exe" if exist "%%~D\realbink.dll" set "AE=%%~fD"
 	if not defined AE if exist "%%~D\Oni.exe" if exist "%%~D\bink_orig.dll" set "AE=%%~fD"
 )
@@ -41,13 +42,20 @@ if defined SIZE (
 	move /y "%AE%\realbink.dll" "%AE%\bink_orig.dll" >nul || goto denied
 )
 :have_bink
+rem No Bink left: an Arklite zip of 0.4.0 or older, extracted straight into AE, put its loader over it.
+rem AE keeps Bink in its Daodan package, and Oni\binkw32.dll is the same file.
+if not exist "%AE%\bink_orig.dll" for /d %%B in ("%AE%\AEInstaller\packages\*Daodan*") do call :restore_bink "%%~fB\plain\win_only\realbink.dll"
+if not exist "%AE%\bink_orig.dll" call :restore_bink "%AE%\..\binkw32.dll"
 if not exist "%AE%\bink_orig.dll" ( echo error: no original realbink.dll ^(Bink^) to keep; run the AE Installer again, then install.bat & goto fail )
 
 rem One copy of the save file from before Arklite (custom levels can write save points to it).
 if exist "%AE%\persist.dat" if not exist "%AE%\persist.dat.before-arklite" copy /y "%AE%\persist.dat" "%AE%\persist.dat.before-arklite" >nul
 
-copy /y "%HERE%Arklite.dll" "%AE%\Arklite.dll" >nul || goto denied
-copy /y "%HERE%realbink.dll" "%AE%\realbink.dll" >nul || goto denied
+rem Extracted straight into AE: Arklite.dll is already in place (copy can't copy a file onto itself).
+set "SAME="
+for %%A in ("%AE%") do for %%H in ("%HERE%.") do if /i "%%~fA"=="%%~fH" set "SAME=1"
+if not defined SAME copy /y "%HERE%Arklite.dll" "%AE%\Arklite.dll" >nul || goto denied
+copy /y "%HERE%arklite_loader.dll" "%AE%\realbink.dll" >nul || goto denied
 if not exist "%AE%\GameDataFolder\CustomLevels" mkdir "%AE%\GameDataFolder\CustomLevels"
 echo Arklite installed into "%AE%".
 echo Start Oni as usual; the newest log in AE\logs lists what was patched.
@@ -60,3 +68,11 @@ echo Arklite was not installed.
 :end
 endlocal
 if "%~1"=="" pause
+exit /b
+
+:restore_bink
+if exist "%AE%\bink_orig.dll" exit /b
+if not exist "%~1" exit /b
+if %~z1 LSS 65536 exit /b
+copy /y "%~1" "%AE%\bink_orig.dll" >nul && echo AE's realbink.dll ^(Bink^) had been replaced; put it back from "%~f1".
+exit /b

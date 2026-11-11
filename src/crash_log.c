@@ -58,6 +58,7 @@ static long WINAPI fault_handler(u32 **info)
 	        R(0xb0), R(0xa4), R(0xac), R(0xa8), R(0xa0), R(0x9c), R(0xb4), R(0xc4));
 	log_stack(R(0xc4));
 #undef R
+	if (g_faults == 1) report_crash();   /* its log goes with the next start's problem report */
 	/* the same access violation again at once: the crash's own handling ran into it (a broken
 	 * heap, its lock held), and the Linux host froze there with the game on screen instead of
 	 * closing. Closing now lets the others see this player gone */

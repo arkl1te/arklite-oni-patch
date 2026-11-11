@@ -460,6 +460,8 @@ static u32 g_delay = 4;
 static int g_record = 1;               /* [net] record: Arklite-net-host.akr / -join.akr */
 
 static u32 g_level, g_last_tick;
+static char g_session[40];             /* the session's ID on every PC (level, starting seeds): problem reports */
+static char g_dump_img[MAX_PATH], g_dump_ticks[MAX_PATH];   /* the desync dumps written, for report.c */
 static u32 g_ticks;                    /* ticks run this session */
 static u32 g_gen;                      /* our inputs are made for ticks < g_gen */
 static u32 g_stall_frames, g_stall_ticks, g_last_stall_log;   /* frames held back by others' inputs */
@@ -894,6 +896,10 @@ static const char *mode_name(void) { return g_mode == NET_HOST ? "host" : "join"
 
 int net_active(void) { return g_mode != NET_OFF; }
 
+/* report.c: the session's ID ("none" outside one) and this PC's player slot (-1 off the network) */
+const char *net_session_id(void) { return g_session[0] ? g_session : "none"; }
+int net_local_slot(void) { return g_mode == NET_OFF ? -1 : g_mode == NET_HOST ? 0 : g_slot; }
+
 int net_synced(void)
 {
 	return g_mode != NET_OFF && (g_state == S_WAIT || g_state == S_RUN || g_state == S_LOST || g_state == S_OVER ||
@@ -1008,6 +1014,7 @@ static void dump_images(u32 slot, u32 tick)
 	WriteFile(f, g_images[slot], g_nimages[slot] * sizeof(CharImage), &w, 0);
 	CloseHandle(f);
 	log_msg("net: wrote %s (%d characters at tick %d): send it with the other PC's", path, g_nimages[slot], tick);
+	str_cpy(g_dump_img, sizeof g_dump_img, path);
 }
 
 /* The last TRING ticks one by one, for the desync dump's second file (Arklite-desyncticks-host.bin
@@ -1081,6 +1088,7 @@ static void tring_dump(u32 tick)
 		if (t && g_tring[t % TRING].tick == t) WriteFile(f, &g_tring[t % TRING], sizeof(TickRec), &w, 0);
 	CloseHandle(f);
 	log_msg("net: wrote %s (%d ticks up to %d, one by one): send it with the other PC's", path, n, tick);
+	str_cpy(g_dump_ticks, sizeof g_dump_ticks, path);
 }
 
 static void log_summary(u32 slot)
@@ -1112,8 +1120,10 @@ static void compare_hash(int l, u32 slot)
 			log_msg("net:   RNG seeds here %08x/%08x (the hash covers them; if every character matches, these differ)",
 			        g_mine[slot].seeds[0], g_mine[slot].seeds[1]);
 			log_summary(slot);
+			g_dump_img[0] = g_dump_ticks[0] = 0;
 			dump_images(slot, tick);
 			tring_dump(tick);
+			report_net(REPORT_DESYNC, g_session, net_local_slot(), tick, g_dump_img, g_dump_ticks, rollback_check_path());
 		}
 	}
 }
@@ -1354,8 +1364,10 @@ static void catchup_check(u32 slot)
 	        tick, g_mine[slot].hash, want);
 	log_msg("net:   RNG seeds here %08x/%08x", g_mine[slot].seeds[0], g_mine[slot].seeds[1]);
 	log_summary(slot);
+	g_dump_img[0] = g_dump_ticks[0] = 0;
 	dump_images(slot, tick);
 	tring_dump(tick);
+	report_net(REPORT_DESYNC, g_session, net_local_slot(), tick, g_dump_img, g_dump_ticks, rollback_check_path());
 	g_cu_abort = 1;
 }
 
@@ -4641,6 +4653,7 @@ static void begin_run(void)
 		mp_sound("objective_new");
 		g_fight_at = GetTickCount() | 1;
 	}
+	fmt(g_session, "L%d-%08x%08x", g_level, g_seed, g_local_seed);
 	log_msg("net: %s on (%s, player %d of %d), RNG %08x/%08x, input delay %d ticks; limits: %d min, %d points",
 	        g_warm ? "warm-up" : "game", mode_name(), g_slot + 1, g_nplayers, g_seed, g_local_seed, g_delay, g_time_limit, g_score_limit);
 }
@@ -4689,6 +4702,7 @@ static void catchup_begin(void)
 	/* here, not in the first live frame (rolling_frame): that frame's time is time the others may
 	 * wait for this PC (on Windows the roster and its textures are part of a ~1.4 s first frame) */
 	hud_textures_prepare();
+	fmt(g_session, "L%d-%08x%08x", g_level, g_seed, g_local_seed);
 	log_msg("net: catching up with the host's %s (player %d), RNG %08x/%08x", g_warm ? "warm-up" : "match", g_slot + 1, g_seed,
 	        g_local_seed);
 }
@@ -4822,8 +4836,10 @@ static void host_check_silence(u32 now)
 		if (g_link[l].used && (g_link[l].waiting || g_link[l].joining) && (int)(now - g_link[l].last_recv) > LOST_MS)
 			lobby_leave(l);
 	for (int l = 1; l < (int)g_nplayers; l++)
-		if (g_link[l].used && !gone(l) && (int)(now - g_link[l].last_recv) > LOST_MS)
+		if (g_link[l].used && !gone(l) && (int)(now - g_link[l].last_recv) > LOST_MS) {
 			mark_gone(l, 0, "stopped answering", 1);
+			report_net(REPORT_DROP, g_session, net_local_slot(), g_ticks, 0, 0, 0);
+		}
 }
 
 /* ---- Input -------------------------------------------------------------------------------- */
@@ -4852,6 +4868,8 @@ static void take_record(const u32 *rec)
 	for (int i = 11; i < 12; i++) g_pending[i] = r[i];
 }
 
+static int me_watching(void);   /* "Watching", below */
+
 static void make_input(void)
 {
 	u32 *in = g_in[g_slot][g_gen % RING];
@@ -4866,6 +4884,11 @@ static void make_input(void)
 		memcpy(in, g_last_local, 0x30);      /* the buttons stay held, no aim */
 		in[7] = in[8] = in[9] = in[10] = 0;
 	}
+	/* a watcher's keys and mouse move only its own camera (free flight reads them in take_record,
+	 * clicks come from the mouse itself): the others get none of them, so their guess of this
+	 * record (the last one, buttons held, no mouse) is always right and a watcher never makes
+	 * them roll back */
+	if (me_watching()) memset(in, 0, 11 * 4);
 	/* the F2 choice, a chat emote and whether this PC's player watches (players.c) */
 	in[11] = char_menu_record_word() | players_emote_take() | players_spectate_word();
 	if (g_mode == NET_HOST) {             /* and who has a character (players.c, "Joining and leaving") */
@@ -5550,6 +5573,7 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 		server_line(mp_name(0), "left the game");
 		g_lost_left = 0;
 		g_state = S_LOST;
+		report_net(REPORT_DROP, g_session, net_local_slot(), g_ticks, 0, 0, 0);
 	}
 
 	if (g_state == S_LOST && g_warm) {   /* nothing to finish: find the host again from the lobby */

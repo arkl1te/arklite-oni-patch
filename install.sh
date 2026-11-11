@@ -4,11 +4,14 @@
 #
 #   ./install.sh [path/to/Oni/AE]      (or set ONI_AE_DIR; otherwise common Wine prefixes are searched)
 #
-# From a release zip it copies Arklite.dll and realbink.dll into AE/. From the source repository
-# it builds them if needed and links them instead, so a rebuild is picked up without reinstalling.
+# From a release zip it copies Arklite.dll and arklite_loader.dll (as realbink.dll) into AE/; the zip
+# can be extracted anywhere, AE/ itself included. From the source repository it builds them if needed
+# and links them instead, so a rebuild is picked up without reinstalling.
 #
 #   AE/Arklite.dll                  the mod
-#   AE/realbink.dll                 Arklite's loader (Daodan loads this name)
+#   AE/realbink.dll                 Arklite's loader (Daodan loads this name). The zip carries it as
+#                                   arklite_loader.dll, so extracting the zip into AE/ can't overwrite
+#                                   AE's own realbink.dll (Bink).
 #   AE/bink_orig.dll                AE's original realbink.dll (Bink), renamed; the loader forwards to it
 #   AE/GameDataFolder/CustomLevels  where Custom Game looks for levels
 set -euo pipefail
@@ -22,7 +25,7 @@ is_loader() { [ -L "$1" ] || { [ -f "$1" ] && grep -aqF "$MARKER" "$1"; }; }
 
 find_ae() {
 	local c
-	for c in "$HERE/.." "$HERE/../AE" "$HOME"/.wine/drive_c/"Program Files (x86)"/Oni/AE \
+	for c in "$HERE/.." "$HERE/../AE" "$HERE/../.." "$HOME"/.wine/drive_c/"Program Files (x86)"/Oni/AE \
 	         "$HOME"/.wine/drive_c/"Program Files"/Oni/AE \
 	         "$HOME"/Games/*/drive_c/"Program Files (x86)"/Oni/AE \
 	         "$HOME"/Games/*/drive_c/"Program Files"/Oni/AE \
@@ -54,6 +57,7 @@ fi
 
 # Release zip or source repository?
 if [ -f "$HERE/Arklite.dll" ]; then
+	[ -f "$HERE/arklite_loader.dll" ] || die "arklite_loader.dll is not next to install.sh"
 	SRC="$HERE"; MODE=copy
 else
 	[ -f "$HERE/build/Arklite.dll" ] && [ -f "$HERE/build/realbink.dll" ] || "$HERE/build.sh"
@@ -66,15 +70,28 @@ if [ -e "$AE/realbink.dll" ] && ! is_loader "$AE/realbink.dll"; then
 	rm -f "$AE/bink_orig.dll"
 	mv "$AE/realbink.dll" "$AE/bink_orig.dll"
 elif [ ! -e "$AE/bink_orig.dll" ]; then
-	die "$AE has no original realbink.dll (Bink) to keep; run the AE Installer again, then this script"
+	# No Bink left: an Arklite zip of 0.4.0 or older, extracted straight into AE/, put its loader over it.
+	# AE keeps Bink in its Daodan package, and Oni/binkw32.dll is the same file.
+	for b in "$AE"/AEInstaller/packages/*Daodan*/plain/win_only/realbink.dll "$AE/../binkw32.dll"; do
+		if [ -f "$b" ] && ! is_loader "$b" && [ "$(wc -c <"$b")" -ge 65536 ]; then
+			cp "$b" "$AE/bink_orig.dll"
+			echo "AE's realbink.dll (Bink) had been replaced; put it back from $b"
+			break
+		fi
+	done
+	[ -e "$AE/bink_orig.dll" ] || die "$AE has no original realbink.dll (Bink) to keep; run the AE Installer again, then this script"
 fi
 
 # One copy of the save file from before Arklite (custom levels can write save points to it).
 [ -f "$AE/persist.dat" ] && [ ! -e "$AE/persist.dat.before-arklite" ] && cp -p "$AE/persist.dat" "$AE/persist.dat.before-arklite"
 
 if [ $MODE = copy ]; then
-	rm -f "$AE/Arklite.dll" "$AE/realbink.dll"
-	cp "$SRC/Arklite.dll" "$SRC/realbink.dll" "$AE/"
+	# Extracted straight into AE/: Arklite.dll is already in place.
+	if [ ! "$SRC/Arklite.dll" -ef "$AE/Arklite.dll" ]; then
+		rm -f "$AE/Arklite.dll"; cp "$SRC/Arklite.dll" "$AE/"
+	fi
+	rm -f "$AE/realbink.dll"
+	cp "$SRC/arklite_loader.dll" "$AE/realbink.dll"
 	[ -L "$AE/GameDataFolder/CustomLevels" ] || mkdir -p "$AE/GameDataFolder/CustomLevels"
 else
 	ln -sfn "$SRC/Arklite.dll"  "$AE/Arklite.dll"

@@ -21,10 +21,12 @@ Arklite's aim is to be the Oni update that never came.
 - **Mouse wheel in the menus**: it scrolls lists, moves the slider under the cursor and turns the pages of the F1 screen.
 - **Transparent pause menu**, and the level music keeps playing behind it if you like.
 - **255 characters**, all active at once, so big fights no longer crash the game.
+- **No more slowdown from glowing moves on NVIDIA cards**: Muro's combos and the ninjas' special moves used to drop the game from 170 FPS to 10-15, because every glow asked the graphics card about itself one at a time. Now one question a frame answers them all, and they look exactly the same.
 - **Fixed skybox** along the edges of the sky.
 - **Fixed tiny strikers** outside the dream lab.
 - **Screenshots with F12**, anywhere: in a level, in the menus or while a level loads. They're saved as PNG in `AE/screenshots/`, and you hear the game-saved sound when one is done.
 - **A crash log** in `AE/logs/`, dated, with the last three games kept, for when something goes wrong.
+- **Anonymous problem reports**: when a network game goes out of sync, a player drops or Oni crashes, Arklite sends its log (and the game's state around a desync) to the Arklite helper so the bug can be found. Addresses, player names, chat and your folders are taken out first. Turn it off with `send=0` under `[reports]` in `AE/Arklite.ini`.
 
 Everything is in Options → **More...** and in the **Custom Game** menu. Press F1 in a match for the scoreboard, and F2 to change character.
 
