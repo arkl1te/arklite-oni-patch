@@ -391,9 +391,9 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
   (up to 23 letters), and press Enter to keep it (Esc puts the old one back). It's saved, so
   you keep it next time. The score shows everyone's name, and when you look straight at
   another player, their name appears over their head.
-- **Phase cloak**: a player who picks up invisibility sees their own shimmer, but everyone else
-  sees nothing of them: no body, shadow or name, not even when they're hit. Only when they land a
-  blow does their shimmer flash up for a moment and fade.
+- **Phase cloak**: a player who picks up invisibility sees themselves half see-through (50%,
+  without the shimmer), but everyone else sees nothing of them: no body, shadow or name, not even
+  when they're hit. Only when they land a blow does their shimmer flash up for a moment and fade.
   Spectators (/spectate) see every cloaked player as Oni shows them, the fading body and the
   shimmer, with their name. When the cloak wears off the character is back to normal: in stock
   Oni it never fully ended, so motion blur (the ninja's dash afterimages) never came back.

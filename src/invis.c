@@ -1,5 +1,5 @@
-/* The phase cloak in network games: the cloaked player sees themselves as Oni shows them (the
- * fading body, the shimmer); every other player sees nothing of them at all, except the shimmer
+/* The phase cloak in network games: the cloaked player sees themselves half there (the body at
+ * 50% opacity, no shimmer); every other player sees nothing of them at all, except the shimmer
  * flashing up when the cloaked player lands a blow. Being hit shows nothing.
  *
  * Oni (ONrCharacter_Invis_Update 0x4ef530, the character draw around 0x4e1d00 with ESI the active
@@ -23,6 +23,10 @@
  *     that note the game tick of the blow (and answer invis_active as before, so the game itself
  *     does what it did). Its opacity is the one Oni would have given the body for the blow: 0.6,
  *     fading 0.0085 a tick, gone ~71 ticks (1.2 s) later (Oni's own shimmer never passes 0.22).
+ * For the character this screen belongs to (in a network game, not a spectator's screen): the
+ * body and shadow alpha are at least 0.5 while invis_active (Oni's fade from 1 at pickup stops at
+ * 0.5, and its fade back in at the end starts once it passes 0.5; a blow's 0.6 still shows), and
+ * the shimmer isn't drawn (user request, 2026-11-13).
  * Off the network everything is as in Oni (single player's cloaked ninjas keep their shimmer and
  * flashes), and so it is for a spectator (/spectate, net_watching): they take no part in the
  * fight, so they see every cloaked player as Oni draws them, the fading body and the shimmer, and
@@ -67,6 +71,7 @@ void *memcpy(void *, const void *, unsigned);
 #define INVIS_FADE_IN_TICKS   120      /* Invis_Update: the last ticks fade the body back in */
 #define FLASH                 0.6f     /* 0x52a9d4: a blow's alpha */
 #define FLASH_FADE            0.0085f  /* 0x52b33c: fading a tick */
+#define SELF_ALPHA            0.5f     /* the cloaked player's own body, on their own screen */
 #define SHIMMER_SCALE         0.22f    /* 0x52b300 = 255 * 0.22: the shimmer's opacity is that times 1 - alpha */
 
 #define ONcDraw_BodyAlpha     0x4e1dcc   /* mov edx,[esi+0x2818] */
@@ -125,6 +130,13 @@ static int as_stock(u8 *c)
 	return !net_active() || !gs || c == GS_PLAYER(gs) || net_watching() != -1;
 }
 
+/* The character this screen belongs to, in a network game (not on a spectator's screen) */
+static int self_view(u8 *c)
+{
+	u8 *gs = ONgGameState;
+	return net_active() && gs && c == GS_PLAYER(gs) && net_watching() == -1;
+}
+
 int invis_hidden(u8 *c)
 {
 	u8 *a;
@@ -138,15 +150,19 @@ int invis_hidden(u8 *c)
 u32 invis_body_alpha(u8 *act, u8 *c)
 {
 	u32 bits;
-	memcpy(&bits, &ACT_INVIS_ALPHA(act), 4);
-	if (ACT_INVIS_ACTIVE(act) && CHR_INVIS_LEFT(c) > INVIS_FADE_IN_TICKS && !as_stock(c)) return 0;
+	float a = ACT_INVIS_ALPHA(act);
+	if (ACT_INVIS_ACTIVE(act)) {
+		if (CHR_INVIS_LEFT(c) > INVIS_FADE_IN_TICKS && !as_stock(c)) return 0;
+		if (a < SELF_ALPHA && self_view(c)) a = SELF_ALPHA;
+	}
+	memcpy(&bits, &a, 4);
 	return bits;
 }
 
 /* Whether the shimmer is drawn */
 u32 invis_shimmer_shown(u8 *act, u8 *c)
 {
-	if (!ACT_INVIS_ACTIVE(act)) return 0;
+	if (!ACT_INVIS_ACTIVE(act) || self_view(c)) return 0;
 	return as_stock(c) || flash(c) > 0;
 }
 
@@ -332,5 +348,5 @@ void invis_install(void)
 		}
 	}
 	call_at(ONcThrow_Attacker, throw_attacker, 6);
-	log_msg("invis: in network games other players see a cloaked player only as a shimmer when they strike");
+	log_msg("invis: in network games a cloaked player sees themselves half see-through, others see them only as a shimmer when they strike");
 }

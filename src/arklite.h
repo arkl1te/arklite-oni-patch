@@ -750,6 +750,6 @@ int  screenshot_hooked(void);          /* screenshot.c: both SwapBuffers calls a
 
 /* ---- invis.c: the phase cloak in network games ----------------------------------------------- */
 void motion_blur_install(void);        /* motion_blur.c: afterimages without depth writes */
-void invis_install(void);              /* only the cloaked player sees their own shimmer */
+void invis_install(void);              /* the cloaked player sees themselves at 50% */
 void sprite_aspect_install(void);      /* sprite_aspect.c: screen-facing sprites keep their shape on wide screens */
 int  invis_hidden(u8 *c);              /* cloaked (or still fading back in): no name tag over it */
