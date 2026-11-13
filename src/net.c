@@ -2797,6 +2797,7 @@ static u32 g_dl_level;                 /* the level whose load downloads the hos
 static u32 g_dl_declined;              /* its download failed or was cancelled: not again */
 static WMtWindow *g_dl_lines[2];       /* the two lines under the loading popup's bar */
 static WMtWindow *g_dl_lines_of;       /* the popup they were made in (0: none made since the last one closed) */
+static u32 g_dl_lines_made;            /* pairs made so far (a new pair may sit where an old one was) */
 static u32 g_req_chunk[DL_SLOTS], g_req_time[DL_SLOTS];   /* piece + 1 asked for last, and when */
 
 static void session_end(const char *why);
@@ -2881,10 +2882,28 @@ static int l0_own_dir(void)
 	return 1;
 }
 
-static int level0_swap_start(const u32 *want)
+/* The host's level0 (want) for the next load: 2 back to this PC's own, 1 the host's pair is whole
+ * in its cache folder (both: g_l0_dir and g_l0_want set, g_l0_pending is the caller's), 0 not here
+ * (downloaded in the reload, g_l0_fetch), -1 not possible */
+static int level0_swap_ready(const u32 *want)
 {
 	char path[128];
+
+	fmt(g_l0_dir, "cache\\%08x-%08x", want[0], want[1]);
+	g_l0_want[0] = want[0];
+	g_l0_want[1] = want[1];
+	if (g_l0_active[0] && want[0] == g_l0_installed[0] && want[1] == g_l0_installed[1])
+		return l0_own_dir() ? 2 : -1;   /* this PC runs another host's level0, and this host has the installed one */
+	fmt(path, "%s\\level0_Final.dat", g_l0_dir);
+	if (hash_file(path) != want[0]) return 0;
+	fmt(path, "%s\\level0_Final.raw", g_l0_dir);
+	return hash_file(path) == want[1] ? 1 : 0;
+}
+
+static int level0_swap_start(const u32 *want)
+{
 	u32 level = g_level;
+	int r;
 
 	if (g_l0_tried[0] == want[0] && g_l0_tried[1] == want[1]) return 0;
 	g_l0_tried[0] = want[0];
@@ -2894,11 +2913,9 @@ static int level0_swap_start(const u32 *want)
 		log_msg("net: this host's level0 (%08x %08x) isn't the one this Oni switched to: restart Oni to join it", want[0], want[1]);
 		return 0;
 	}
-	g_l0_want[0] = want[0];
-	g_l0_want[1] = want[1];
-	if (g_l0_active[0] && want[0] == g_l0_installed[0] && want[1] == g_l0_installed[1]) {
-		/* this PC runs another host's level0, and this host has the installed one: back to it */
-		if (!l0_own_dir()) return 0;
+	r = level0_swap_ready(want);
+	if (r < 0) return 0;
+	if (r == 2) {
 		log_msg("net: the host has this PC's own level0: reloading level %d with it", level);
 		g_l0_pending = 1;
 		session_end("switching back to this PC's level0");
@@ -2906,17 +2923,13 @@ static int level0_swap_start(const u32 *want)
 		reload_level(level, 0);
 		return 1;
 	}
-	fmt(path, "%s\\level0_Final.dat", g_l0_dir);
-	if (hash_file(path) == want[0]) {
-		fmt(path, "%s\\level0_Final.raw", g_l0_dir);
-		if (hash_file(path) == want[1]) {
-			log_msg("net: the host's level0 is in %s: reloading level %d with it", g_l0_dir, level);
-			g_l0_pending = 1;
-			session_end("switching to the host's level0");
-			g_load_step = "Switching to the host's level0";
-			reload_level(level, 0);
-			return 1;
-		}
+	if (r == 1) {
+		log_msg("net: the host's level0 is in %s: reloading level %d with it", g_l0_dir, level);
+		g_l0_pending = 1;
+		session_end("switching to the host's level0");
+		g_load_step = "Switching to the host's level0";
+		reload_level(level, 0);
+		return 1;
 	}
 	/* not here (or not whole): from the host, in the reload's loading popup (see "level0 download") */
 	log_msg("net: the host's level0 (%08x %08x) isn't in %s: reloading level %d to download it", want[0], want[1], g_l0_dir, level);
@@ -2925,6 +2938,27 @@ static int level0_swap_start(const u32 *want)
 	g_load_step = "Getting the host's level0";
 	reload_level(level, 0);
 	return 1;
+}
+
+/* Join's Play: the Join list says which level0 the host runs (l0). When this PC has it whole in
+ * its cache (or it's this PC's own again), the first load opens it at once, as the reload for the
+ * host's refusal would have: one level load fewer for every Windows AE joiner of a Linux host
+ * (2026-11-13). Not here: the host's refusal downloads it in a reload, as before; and a list
+ * that was wrong only costs that reload, the handshake compares the files as always. */
+void net_join_level0(const u32 *l0)
+{
+	int r;
+
+	if (g_mode != NET_JOIN || (!l0[0] && !l0[1])) return;
+	if (l0[0] == g_files[2] && l0[1] == g_files[3]) return;   /* on it already */
+	if (level0_swaps() >= L0_SWAPS_MAX) return;   /* (the refusal says why) */
+	r = level0_swap_ready(l0);
+	if (r <= 0) return;
+	g_l0_tried[0] = l0[0];
+	g_l0_tried[1] = l0[1];
+	g_l0_pending = 1;
+	if (r == 2) log_msg("net: the host has this PC's own level0: the level loads with it");
+	else log_msg("net: the host's level0 is in %s: the level loads with it", g_l0_dir);
 }
 
 /* A path below the map's folder that stays in it */
@@ -3045,6 +3079,7 @@ static void dl_lines_create(void)
 		win_insert_after(w, label);   /* before the outline, which would dim it */
 		g_dl_lines[i] = w;
 	}
+	g_dl_lines_made++;
 }
 
 /* The popup grows (never shrinks) to fit the lines' text: a line too long for it wrapped over the
@@ -3073,7 +3108,8 @@ static void dl_fit(const char *a, const char *b)
 	ui_set_frame(d, WIN_X(d) - grow / 2, WIN_Y(d), WIN_W(d) + grow, WIN_H(d));
 }
 
-static void dl_draw(const char *a, const char *b, u32 percent)
+/* The lines' text and the bar, drawn by the next frame */
+static void dl_set(const char *a, const char *b, u32 percent)
 {
 	WMtWindow *d = ONgLoadingDialog;
 
@@ -3082,6 +3118,11 @@ static void dl_draw(const char *a, const char *b, u32 percent)
 	if (g_dl_lines[0]) ui_fit(fit, sizeof fit, a, WIN_W(g_dl_lines[0])), WMrWindow_SetTitle(g_dl_lines[0], fit, 0x100);
 	if (g_dl_lines[1]) ui_fit(fit, sizeof fit, b, WIN_W(g_dl_lines[1])), WMrWindow_SetTitle(g_dl_lines[1], fit, 0x100);
 	if (d) WMrMessage_Send(d, LDcMessage_Progress, percent, 0);
+}
+
+static void dl_draw(const char *a, const char *b, u32 percent)
+{
+	dl_set(a, b, percent);
 	M3rFrame_Begin(0);
 	WMrDisplay();
 	M3rFrame_End();
@@ -3982,6 +4023,10 @@ static const char *g_load_a;           /* this load's first line; 0: not shown *
 static char g_load_map[64];
 static u32 g_load_files;               /* files opened so far in this load */
 static int g_load_count_on, g_load_quit;
+static WMtWindow *g_cover_dialog;      /* the popup the joiner's cover made between loads (see below) */
+static u32 g_cover_loads;              /* level loads so far (the cover's steps) */
+static int g_cover_pending;            /* Join's Play or ARKLITE_JOIN: the cover starts with the next level load */
+static void cover_begin(void);
 
 static void load_pump(void)
 {
@@ -4030,7 +4075,12 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 	g_load_a = 0;
 	g_load_files = 0;
 	g_load_count_on = g_load_quit = 0;
-	g_dl_lines_of = 0;   /* a new popup (ONrLevel_Load's, 0x505a0b) */
+	g_cover_loads++;
+	if (g_cover_pending && g_mode == NET_JOIN) cover_begin();
+	g_cover_pending = 0;
+	/* a new popup (ONrLevel_Load's, 0x505a0b); or the one a joiner's cover kept up between its
+	 * loads, which ONrLevel_Load uses as it is (0x505a09), its lines already in it */
+	if (!g_cover_dialog || ONgLoadingDialog != g_cover_dialog) g_dl_lines_of = 0;
 	if (ONgLoadingDialog && (g_load_step || g_mode == NET_JOIN)) {
 		const char *name = custom_game_level_name(level & 0xff);
 		g_load_a = g_load_step ? g_load_step : "Joining the game";
@@ -4106,6 +4156,7 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 		WMrWindow_SetTitle(g_dl_lines[1], "Setting up the level", 0x100);
 	g_load_a = 0;
 	g_dl_lines_of = 0;   /* (the popup closes when ONrLevel_Load is done) */
+	g_cover_dialog = 0;  /* (the cover's too: ONrLevel_Load deletes whichever it showed, 0x50687d) */
 	return r;
 }
 
@@ -4158,6 +4209,179 @@ int net_map_fetch(char *folder, u32 size, u32 level)
 const char *net_map_fetch_error(void)
 {
 	return g_dl_why ? g_dl_why : "?";
+}
+
+/* ---- One loading popup while joining ------------------------------------------------------- *
+ * A joiner loads the level two or three times before it plays: the Join list's load, a reload
+ * with the host's level0 when its own differs (every Windows AE joiner of a Linux host: AE's XML
+ * patches), and the reload for the session it joins (the warm-up or the match, then catching up).
+ * Between them the lobby ran for a moment: a few frames of the level ("Press F3 to be ready /
+ * Connecting to the host...") and the level script's music, started again by every load. The
+ * user's recording from the Windows PC (2026-11-13, 60 fps): Play at 4.65 s, the level at 5.02,
+ * a popup, the level at 5.47, a popup, the catch-up at 5.80, in the game at 6.7; music started
+ * three times (script_debug.txt). Under Wine the same, shorter.
+ *
+ * Now from Play (or ARKLITE_JOIN) until this PC is in the game, the screen is one loading popup:
+ * between loads the game's display (0x4fb480, net.c display) draws nothing and Oni's own loading
+ * popup stays up, made the way ONrLevel_Load makes it (net_map_fetch's recipe); ONrLevel_Load
+ * uses a popup that's there instead of making one (0x505a09) and deletes it at its end, so the
+ * next frame makes another. Its lines say the step and the catch-up's percent. Every channel is
+ * silent meanwhile (volume_hush): the loads start the music and the level's sounds as always,
+ * heard once it's over. Drawing isn't game state (a dedicated server draws nothing at all), and
+ * the frames and ticks run as before. It ends:
+ *   - in the game (S_RUN, not joining), or the session over (S_LOST, S_OVER);
+ *   - in the host's lobby, COVER_LOBBY_MS after its first word with no reload or catch-up coming;
+ *   - a refusal on the lobby screen (not one being fixed by a reload: g_problem_hidden);
+ *   - the pause menu (Esc: the way out stays), leaving the network game or the level;
+ *   - COVER_WAIT_MS on one step with nothing happening (no word from the host, say) but the
+ *     catch-up, whose percent moves; the lobby screen then says what it always said. */
+#define COVER_LOBBY_MS 1000
+#define COVER_WAIT_MS  15000
+static int g_cover;
+static u32 g_cover_began, g_cover_step_at, g_cover_heard_at, g_cover_seen_loads, g_cover_first_load;
+static int g_cover_state;
+
+/* How far a joiner's catch-up is, 0..100 */
+static int joining_pct(void)
+{
+	int pct = !g_hist_avail ? 0 : g_hist_avail < 40000000u ? (int)(g_ticks * 100 / g_hist_avail) :
+	          (int)(g_ticks / (g_hist_avail / 100));   /* (no 64-bit division: -nostdlib) */
+	return pct > 100 ? 100 : pct;
+}
+
+static void cover_begin(void)
+{
+	if (g_cover) return;
+	g_cover = 1;
+	g_cover_began = g_cover_step_at = GetTickCount();
+	g_cover_heard_at = 0;
+	g_cover_state = -1;
+	g_cover_seen_loads = g_cover_loads;
+	g_cover_first_load = g_cover_loads - 1;   /* (from level_load, which counted this one) */
+	volume_hush(1);
+}
+
+static void cover_end(const char *why)
+{
+	if (!g_cover) return;
+	g_cover = 0;
+	if (g_cover_dialog && ONgLoadingDialog == g_cover_dialog) {   /* between loads: closed as ONrLevel_Load closes it */
+		WMrWindow_Delete(g_cover_dialog);
+		ONgLoadingDialog = 0;
+		ONiUI_SetContext(ONgLoadingContext);
+		g_dl_lines[0] = g_dl_lines[1] = 0;
+		g_dl_lines_of = 0;
+	}
+	g_cover_dialog = 0;
+	volume_hush(0);
+	log_msg("net: joining: one loading popup for %u ms over %u level loads, until %s", GetTickCount() - g_cover_began,
+	        g_cover_loads - g_cover_first_load, why);
+}
+
+static const char *cover_done(u32 now)
+{
+	if (g_mode != NET_JOIN) return "this PC stopped joining";
+	if (live_menu_open()) return "the pause menu opened";
+	if (g_state == S_RUN && !g_joining) return "it was in the game";
+	if (g_state == S_LOST || g_state == S_OVER) return "the session ended";
+	if (g_problem && !g_problem_hidden) return "a refusal to show";
+	if (g_state == S_LOBBY && g_cover_heard_at && now - g_cover_heard_at >= COVER_LOBBY_MS) return "it was in the host's lobby";
+	if (g_state != S_CATCHUP && now - g_cover_step_at >= COVER_WAIT_MS) return "nothing happened for a while";
+	return 0;
+}
+
+/* The popup up (made as ONrLevel_Load makes it, when there's none) with this step's lines: 1 when it
+ * is the cover's, ready to be drawn */
+static int cover_popup(void)
+{
+	u32 pct = 100;
+	const char *a, *b = g_load_map;
+	char line[64];
+
+	if (!ONgLoadingDialog) {
+		void *ui;
+		ONgLoadingContext = ONiUI_GetContext();
+		if ((ui = ONiUI_FindContext(ONcUIContextOni))) ONiUI_SetContext(ui);
+		WMrDialog_Create(ONcLoadingDialogID, 0, ONrLoadingDialog_Proc, 0xffffffffu, &ONgLoadingDialog);
+		if (!ONgLoadingDialog) {
+			ONiUI_SetContext(ONgLoadingContext);
+			cover_end("no loading popup could be made");
+			return 0;
+		}
+		g_cover_dialog = ONgLoadingDialog;
+	}
+	if (ONgLoadingDialog != g_cover_dialog) return 0;   /* (someone else's popup: drawn as it is, over the game) */
+	dl_lines_create();
+	if (g_state == S_CATCHUP || (g_state == S_RUN && g_joining == 2)) {
+		a = g_warm ? "Joining the warm-up" : "Joining the match";
+		if (g_state == S_CATCHUP) {
+			pct = (u32)joining_pct();
+			fmt(line, "Catching up with the host (%u%%)", pct);
+			b = line;
+		} else {
+			b = "Coming into the game";
+		}
+	} else if (g_state == S_WAIT) {
+		a = g_warm ? "Starting the warm-up" : "Starting the match";
+		b = "Waiting for the other players";
+	} else if (g_state == S_LOBBY && !g_host_heard) {
+		a = "Connecting to the host...";
+	} else {
+		a = "Joining the game";
+	}
+	{	/* only when it changes: the popup is Oni's memory, and rollback runs from "Coming into the game" on */
+		static u32 set_in;
+		static char set[200];
+		char now_set[200];
+		int same = 1;
+		fmt(now_set, "%s|%s|%u", a, b, pct);
+		for (int i = 0; same && (set[i] || now_set[i]); i++) same = set[i] == now_set[i];
+		if (set_in != g_dl_lines_made || !same) {
+			dl_set(a, b, pct);
+			set_in = g_dl_lines_made;
+			str_cpy(set, sizeof set, now_set);
+		}
+	}
+	return 1;
+}
+
+/* The game display's frame (net.c display) while joining: 1 when it's the popup's, the game not
+ * drawn; the main loop's UI draw (0x476140) then draws the popup */
+static int cover_frame(void)
+{
+	u32 now = GetTickCount();
+	const char *why;
+
+	if (!g_cover) return 0;
+	if (g_cover_state != (int)g_state || g_cover_seen_loads != g_cover_loads) {   /* a new step */
+		g_cover_state = (int)g_state;
+		g_cover_seen_loads = g_cover_loads;
+		g_cover_step_at = now;
+		g_cover_heard_at = 0;
+	}
+	if (g_state == S_LOBBY && g_host_heard && !g_cover_heard_at) g_cover_heard_at = now | 1;
+	if ((why = cover_done(now))) {
+		cover_end(why);
+		return 0;
+	}
+	return cover_popup();
+}
+
+/* The level's start (0x4f4d40, which ONrLevel_Load calls at 0x5068be just after closing its popup)
+ * draws one frame black, the fade it then lifts (0x4f515e: 0x4f5220 with alpha 1). Between a
+ * joiner's loads that was a black flash between two popups (Windows recording, 2026-11-13: 2
+ * frames; the probe: one black frame at every load's end): under the cover, the popup instead. */
+#define ONcLevelStart_FadeCall  0x4f515e
+#define ONrFade_Frame           0x4f5220   /* (ecx: splash or 0, float alpha), ret 4 */
+static void ONI_FC level_fade_frame(void *splash, u32 edx, float alpha)
+{
+	if (g_cover && g_mode == NET_JOIN && cover_popup()) {
+		M3rFrame_Begin(0);
+		WMrDisplay();
+		M3rFrame_End();
+		return;
+	}
+	((void (ONI_FC *)(void *, u32, float))ONrFade_Frame)(splash, edx, alpha);
 }
 
 /* What the Join list and the server list show of this game: the players (a dedicated server's own
@@ -5712,9 +5936,7 @@ void net_hud(NetHud *h)
 	           g_state == S_RUN || g_state == S_LOST || g_state == S_OVER ? NETHUD_MATCH : NETHUD_OFF;
 	if (g_mode == NET_JOIN && (g_state == S_CATCHUP || (g_state == S_RUN && g_joining == 2))) {
 		h->joining = g_state == S_CATCHUP ? 1 : 2;
-		h->joining_pct = !g_hist_avail ? 0 : g_hist_avail < 40000000u ? (int)(g_ticks * 100 / g_hist_avail) :
-		                 (int)(g_ticks / (g_hist_avail / 100));   /* (no 64-bit division: -nostdlib) */
-		if (h->joining_pct > 100) h->joining_pct = 100;
+		h->joining_pct = joining_pct();
 	}
 	h->local_player = g_mode == NET_JOIN ? g_slot : 0;
 	h->local_char = local_char();
@@ -6605,6 +6827,7 @@ static void display(void)
 	u8 *gs = ONgGameState, *p1 = gs ? GS_PLAYER(gs) : 0, *view = view_character(p1);
 	u32 b0;
 
+	if (cover_frame()) return;   /* a joiner between its loads: the loading popup, not the game */
 	if (!view || view == p1) {
 		display_rest();
 		return;
@@ -7179,6 +7402,8 @@ static void join_install(void)
 	view_install();
 	if (patch_call(ONcLevelLoad_TMCall, (u32)TMrLevel_Load, (u32)level_load))
 		log_msg("net: a map that differs from the host's is downloaded while the level loads");
+	if (!patch_call(ONcLevelStart_FadeCall, ONrFade_Frame, (u32)level_fade_frame))
+		log_msg("net: the level start's black frame at 0x%x isn't the expected call: a joiner may see it flash", ONcLevelStart_FadeCall);
 	sounds_join_install();
 }
 
@@ -7192,6 +7417,9 @@ static void lobby_goodbye(void)
 /* Out of the network game this PC was in (the main menu's Custom Game picks the next mode) */
 static void net_leave(void)
 {
+	g_cover_pending = 0;
+	g_l0_pending = g_l0_fetch = 0;   /* (a switch Join's Play set up for a load that never came) */
+	cover_end("this PC left from the menu");
 	lobby_goodbye();
 	session_end("left from the menu");
 	upnp_stop();
@@ -7282,6 +7510,7 @@ void net_menu_join(const char *address)
 	str_cpy(g_join, sizeof g_join, address);
 	net_prepare();
 	join_install();
+	g_cover_pending = 1;   /* from the level load it starts (a start that fails leaves the menu as it is) */
 	log_msg("net: joining %s", g_join);
 }
 
@@ -7529,7 +7758,7 @@ void net_install(void)
 	log_msg("net: %s, input delay %d ticks; the game waits at the level's start for the %s",
 	        g_mode == NET_HOST ? "hosting" : "joining", g_delay, g_mode == NET_HOST ? "joiner" : "host");
 	net_prepare();
-	if (g_mode == NET_JOIN) join_install();
+	if (g_mode == NET_JOIN) join_install(), g_cover_pending = 1;
 	else view_install();   /* a watching host's view */
 	if (g_mode == NET_HOST && ded_env[0]) dedicated_begin();
 	/* a second Oni on the same PC, for testing: skip "There is already an instance". Daodan
@@ -7556,6 +7785,8 @@ void net_install(void)
  * and the goodbye at process exit came after Winsock was gone. The mode stays for the next level. */
 void net_main_menu(void)
 {
+	cover_end("this PC left to the main menu");
+	g_cover_pending = g_mode == NET_JOIN;   /* (the mode stays: the next level joins again) */
 	lobby_goodbye();
 	session_end("left to the main menu");
 }

@@ -238,10 +238,13 @@ int volume_channel_is_music(u8 *channel) { return channel_category(channel) == C
 
 /* ---- Hooks -------------------------------------------------------------------------------- */
 
+/* net.c's one loading popup while joining: every channel silent until it ends (volume_hush) */
+static volatile int g_hush;
+
 /* The engine's own dB for the channel, plus the slider's attenuation */
 static void ONI_FC channel_set_volume(u8 *channel, u32 unused, float volume)
 {
-	int v = g_volume[channel_category(channel)];
+	int v = g_hush ? 0 : g_volume[channel_category(channel)];
 	long db;
 
 	if (v >= 100) {
@@ -342,6 +345,17 @@ static void refresh_channels(void)
 		}
 	}
 	SSrUnlock(SSgLock);
+}
+
+/* Silence while a joiner's loads and reloads run under one loading popup (net.c "One loading popup
+ * while joining"): the level's music and sounds start on every load as always, unheard, and are
+ * heard once it's over. Only the volume DirectSound gets; what plays is untouched. */
+void volume_hush(int on)
+{
+	on = on != 0;
+	if (g_hush == on) return;
+	g_hush = on;
+	refresh_channels();
 }
 
 /* ---- Options dialog -------------------------------------------------------------------------- */

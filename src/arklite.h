@@ -120,6 +120,7 @@ int  custom_game_folder_dir(const char *folder, char *out, u32 size);   /* its f
 
 void volume_install(void);
 int  volume_channel_is_music(u8 *channel);   /* channel owned by a Music play (call under the sound lock) */
+void volume_hush(int on);                   /* every channel silent while on (net.c: a joiner's loading popup) */
 /* arklite.c: stop every playing channel as the pause menu does (0x483660 plays them again), the
  * level's music on unless keep_music is 0 */
 void sound_pause_channels(int keep_music);
@@ -301,6 +302,7 @@ void server_chat_line(const char *line);   /* chat.c: what the chat shows reache
 int  net_map_fetch(char *folder, u32 size, u32 level);   /* folder: the host's map, changed when it's on another now */
 const char *net_map_fetch_error(void);
 void net_load_file(const char *ref, u32 count);   /* custom_game.c open hook: the loading popup's file line and bar */
+void net_join_level0(const u32 *l0);   /* Join's Play, after net_menu_join: the host's level0 from the first load when it's here */
 /* What a server says about itself, for the Join list */
 #define NET_INFO_MODS       48            /* mods a server's answer names (it says how many it has) */
 #define NET_INFO_MEASURING  0xfffffffeu   /* l0_bytes: the host is still measuring it */

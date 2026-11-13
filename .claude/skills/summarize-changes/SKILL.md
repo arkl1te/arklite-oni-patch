@@ -67,6 +67,12 @@ Fix F10 swallowing the next key.
 - Describe user-visible behavior (menus, shortcuts, buttons, OSD messages, saved files) in plain
   terms. Name a proc, file or setting only when there is no better way to say it.
 - Split unrelated changes into separate items, and leave out steps of a single change.
+- **No redundancy: every item is one unique action, listed once, in exactly one list.** Decide
+  whether each action is a change, something new or a fix, and put it only there. Never describe
+  the same action twice: not as a "Make ..." in Changes and again as its "Fix ..." in Fixes, and
+  not as several items for its parts or its result (a bug and the mechanism that fixes it are one
+  item; so are a feature and its edge cases). Before writing the block, check every pair of items:
+  if two describe the same action or one is part of the other, merge them or drop the lesser.
 - Don't list patch/diff noise (whitespace, reordering) unless that's all there is.
 - Don't include `.claude/` in the summary.
 - After the code block, flag anything that shouldn't go into the commit unnoticed, such as leftover

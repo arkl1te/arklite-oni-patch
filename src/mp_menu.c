@@ -2538,6 +2538,7 @@ static u8 ONI_FC join_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 			net_menu_join(where);
 		} else
 			net_menu_join(b->address);
+		if (b->have_info && b->info.same_version && b->info.has_download) net_join_level0(b->info.l0);   /* one load fewer */
 		bookmarks_save();
 		WMrDialog_ModalEnd(dialog, 1);
 	} else if (id == ID_JOIN_REFRESH) {
