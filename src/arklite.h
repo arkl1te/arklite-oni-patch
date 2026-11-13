@@ -300,6 +300,7 @@ void server_chat_line(const char *line);   /* chat.c: what the chat shows reache
  * net_menu_join, from the menu, in the loading popup); 1 when it's here. Else why not: */
 int  net_map_fetch(char *folder, u32 size, u32 level);   /* folder: the host's map, changed when it's on another now */
 const char *net_map_fetch_error(void);
+void net_load_file(const char *ref, u32 count);   /* custom_game.c open hook: the loading popup's file line and bar */
 /* What a server says about itself, for the Join list */
 #define NET_INFO_MODS       48            /* mods a server's answer names (it says how many it has) */
 #define NET_INFO_MEASURING  0xfffffffeu   /* l0_bytes: the host is still measuring it */
@@ -748,4 +749,5 @@ int  screenshot_hooked(void);          /* screenshot.c: both SwapBuffers calls a
 /* ---- invis.c: the phase cloak in network games ----------------------------------------------- */
 void motion_blur_install(void);        /* motion_blur.c: afterimages without depth writes */
 void invis_install(void);              /* only the cloaked player sees their own shimmer */
+void sprite_aspect_install(void);      /* sprite_aspect.c: screen-facing sprites keep their shape on wide screens */
 int  invis_hidden(u8 *c);              /* cloaked (or still fading back in): no name tag over it */

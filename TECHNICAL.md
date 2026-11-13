@@ -125,6 +125,7 @@ Environment variables, for testing (set them before starting `Oni.exe`):
 | `ARKLITE_FLARE_DEPTH=0` | Lens flares test their visibility as stock Oni does (one depth read each, which stalls NVIDIA cards), for comparing |
 | `ARKLITE_DECOR_FIX=0` | Decorative particles that only look draw from the game tick's shared effects random numbers again, as before 0.5.0 (two PCs whose particle quality differs then desync at once), for comparing |
 | `ARKLITE_MOTION_BLUR_FIX=0` | Motion blur afterimages draw with depth writes, as stock Oni does, for comparing |
+| `ARKLITE_SPRITE_ASPECT=0` | Screen-facing sprites (aiming rings, glows, sky stars) are sized for 4:3 as stock Oni does, so they stretch on wide screens, for comparing |
 | `ARKLITE_BENCH=<seconds>` | Once a level has run for 5 seconds, times every frame for that long, logs the frame times and closes Oni. `tools/oni-bench.sh` runs it hands off in a private KWin |
 
 On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`, `Oni.exe`.

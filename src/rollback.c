@@ -142,11 +142,11 @@ __attribute__((naked, noinline, used)) static u32 ONI_FC hash_page(const u32 *p)
 }
 
 /* Hash every page of the listed regions still writable now into out[], 0 for gone ones */
-static void hash_all(u32 *out)
+static void hash_regions(u32 *out, const Region *regs, u32 nregs)
 {
 	MEMORY_BASIC_INFORMATION m;
-	for (u32 i = 0; i < g_nregions; i++) {
-		const Region *r = &g_regions[i];
+	for (u32 i = 0; i < nregs; i++) {
+		const Region *r = &regs[i];
 		for (u32 a = r->base; a < r->base + r->size; ) {
 			if (VirtualQuery((void *)a, &m, sizeof m) != sizeof m) break;
 			u32 end = (u32)m.BaseAddress + m.RegionSize;
@@ -156,6 +156,8 @@ static void hash_all(u32 *out)
 		}
 	}
 }
+
+static void hash_all(u32 *out) { hash_regions(out, g_regions, g_nregions); }
 
 static void compare(const u32 *before, const u32 *after, u16 *count)
 {
@@ -790,9 +792,14 @@ static void rb_start(void)
 	 * came apart at tick 7140 (the host's own player 0.386 units off on the joiner); its other
 	 * sessions started with 0 or 1 and stayed in sync. So they're known and shared from the
 	 * start, as a page another thread touches later is: put back only in the dwords ticks
-	 * alone change (tmask, omask). Known pages are never protected, so no new faults. */
-	hash_all(g_h0);
-	hash_all(g_h1);
+	 * alone change (tmask, omask). Known pages are never protected, so no new faults.
+	 * Only the candidate regions are hashed (the loop below skips every other page): hashing all
+	 * of the process's writable memory twice froze a joiner's screen for 1.4 s as it came into
+	 * the game, every join (Windows and Wine logs, 2026-11-13). */
+	u32 hash_t0 = GetTickCount();
+	hash_regions(g_h0, e->regs, e->nregs);
+	hash_regions(g_h1, e->regs, e->nregs);
+	hash_t0 = GetTickCount() - hash_t0;
 	e->npages = e->overflow = 0;
 	{
 		u32 n = 0, logged = 0;
@@ -832,7 +839,7 @@ static void rb_start(void)
 	u32 pages = 0;
 	for (u32 i = 0; i < e->nregs; i++) pages += e->regs[i].size >> PAGE_SHIFT;
 	log_msg("rollback: snapshots on: %d allocations of Oni's runtime, %d candidate regions (%d KB), %d pages changed by "
-	        "other threads at the start", e->noni, e->nregs, pages * 4, e->nforeign_pages);
+	        "other threads at the start (hashed in %u ms)", e->noni, e->nregs, pages * 4, e->nforeign_pages, hash_t0);
 }
 
 static void rb_reset(const char *why)

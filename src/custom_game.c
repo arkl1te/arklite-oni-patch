@@ -353,6 +353,15 @@ static u16 ONI_FC open_level_file_hook(char *ref, void **out)
 	u16 error;
 
 	ref = level0_swap_ref(ref);
+	{	/* the loading popup's file line and bar (net.c "What the loading popup says") */
+		u32 slot = 0, n = 0;
+		for (u32 i = 0; i < TMgLevelFileCount; i++)
+			if (TMgLevelFiles[i].ref == ref) { slot = TMgLevelFiles[i].file_index >> 25; break; }
+		if (slot)
+			for (u32 i = 0; i < TMgLevelFileCount; i++)
+				if ((TMgLevelFiles[i].file_index >> 25) == slot) n++;
+		net_load_file(ref, n);
+	}
 	error = TMrLevel_OpenFile(ref, out);
 
 	if (g_slot < 0) return error;

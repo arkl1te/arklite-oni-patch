@@ -36,26 +36,33 @@ order. No title line goes above a list: each one ends with its `=== End of ... =
 by a blank line between lists:
 
 ```
-Make frame stepping instant by keeping the frames around a paused position in textures.
-Bump the version to 0.20.0.
+Make F2 list every character, mods' included, as portraits.
+Make force fields and phase cloaks respawn after 60 seconds.
+Ship server.bat and server.sh in the zip; the installer puts them in AE.
+Bump the version to 0.5.0.
 === End of Changes ===
 
-Add YouTube seek bar previews from storyboards, with a toggle in the seek bar's context menu.
-Add Ctrl+D to duplicate playlist entries.
+Add dedicated servers: no window or sound, with an admin console.
+Add server console commands: say, players, kick, ban, start, quit.
+Add photo mode on F10 in single player, cutscenes included.
 === End of New ===
 
-Fix the end of audio files being cut off (gapless-audio=no, ao=pulse).
-Stop listed YouTube playlists from adding their videos again after a restart.
+Fix sounds looping forever after a rollback.
+Fix F10 swallowing the next key.
 === End of Fixes ===
 ```
 
 - Keep all three end lines, even for a list with no items.
+- **Short lines: about 60-80 characters, never much more.** Brief, concise, straight. When an
+  item needs more, split it into several items (one per aspect: the feature, its options, its
+  UI...) instead of packing lists of options, examples, parentheses or env vars into one line.
+  Details belong in the docs, not here.
 - **Changes**: existing behavior that now works differently, plus refactors, docs and the version.
 - **New**: features, options, shortcuts and tools that didn't exist before.
 - **Fixes**: anything that was broken and now isn't, whichever verb describes it best.
 - Sort each list from major to minor: what users will notice most goes first; internals, docs and
   the version go last.
-- One line per item, brief and informative, ending in a period.
+- One line per item, ending in a period.
 - Every item must begin with a verb in the imperative: Fix, Add, Make, Show, Separate, Clarify...
 - Describe user-visible behavior (menus, shortcuts, buttons, OSD messages, saved files) in plain
   terms. Name a proc, file or setting only when there is no better way to say it.

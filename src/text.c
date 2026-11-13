@@ -75,6 +75,7 @@ typedef struct {
 typedef struct { int cx, cy; } SIZE;
 
 __declspec(dllimport) HANDLE WINAPI CreateCompatibleDC(HANDLE);
+__declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(void *), void *, u32, u32 *);
 __declspec(dllimport) int    WINAPI DeleteDC(HANDLE);
 __declspec(dllimport) HANDLE WINAPI CreateDIBSection(HANDLE, const BITMAPINFO *, u32, void **, HANDLE, u32);
 __declspec(dllimport) HANDLE WINAPI SelectObject(HANDLE, HANDLE);
@@ -565,10 +566,17 @@ static int faces_ready(void)
 #define FONTS_MAX 40
 
 typedef struct {
-	u8  *font;
+	u8  *font;                            /* set when the arrays are the font's (fonts_publish) */
 	u8  *arrays;                          /* LEADS glyph arrays: arrays 0x80.. of the font */
 	u8  made[(TEXT_MAP_COUNT + 7) / 8];   /* the code's pixels are drawn */
+	volatile int state;                   /* FS_FREE, FS_MEASURE (the thread's), FS_DONE (to publish) */
+	int cancel;                           /* text_font_remove came while it was measured */
+	u8  *pend;                            /* the font being measured */
+	int points, style, asc, desc;
 } Font;
+#define FS_FREE    0
+#define FS_MEASURE 1
+#define FS_DONE    2
 
 static Font g_font[FONTS_MAX];
 static int  g_nfonts;
@@ -649,50 +657,131 @@ static Font *font_of(const u8 *font)
 	return 0;
 }
 
-/* Gives an Oni font the glyph arrays 0x80.. (big_font.c calls it for the sizes it makes) */
+/* Measuring a font's advances takes GDI a call per character outside a few ranges (all of Hangul):
+ * Oni's 15 Tahoma fonts took 2.5 s on the Windows joiner, the lobby's screen held still and the
+ * host's answer waiting behind it (2026-11-13). So the advances are measured on a thread
+ * (fonts_thread), exactly as before, into memory of the font's own, and the arrays become the
+ * font's on the main thread (fonts_publish, every frame): until then the font draws ASCII only, as
+ * one Arklite hasn't seen. Nothing here is game state (rollback snapshots Oni's memory, not this). */
+static volatile int g_fonts_thread;    /* a thread is measuring */
+static u32 g_measure_t0;
+static int g_measure_logged = 1;
+
+static u32 WINAPI fonts_thread(void *unused)
+{
+	for (;;) {
+		int found = 0;
+		for (int i = 0; i < g_nfonts; i++) {
+			Font *r = &g_font[i];
+			HANDLE dc;
+			if (r->state != FS_MEASURE) continue;
+			found = 1;
+			if ((dc = CreateCompatibleDC(0))) {
+				for (int f = 0; f < g_faces; f++) {
+					HANDLE gf = gdi_font(g_face_name[f], r->points, r->style), old;
+					if (!gf) continue;
+					old = SelectObject(dc, gf);
+					set_advances(dc, r->arrays, f, r->asc, r->asc + r->desc);
+					SelectObject(dc, old);
+					DeleteObject(gf);
+				}
+				DeleteDC(dc);
+			} else {
+				r->cancel = 1;
+			}
+			__sync_synchronize();
+			r->state = FS_DONE;
+		}
+		if (found) continue;
+		g_fonts_thread = 0;
+		__sync_synchronize();
+		for (int i = 0; i < g_nfonts && !found; i++) found = g_font[i].state == FS_MEASURE;
+		if (!found || !__sync_bool_compare_and_swap(&g_fonts_thread, 0, 1)) return 0;
+	}
+}
+
+/* Gives an Oni font the glyph arrays 0x80.. (big_font.c calls it for the sizes it makes): measured
+ * on the thread, the font's once fonts_publish sees them done */
 void text_font_add(u8 *font)
 {
 	Font *r = 0;
-	HANDLE dc;
 	int points, style, asc, desc;
 
 	if (!font || !faces_ready() || font_of(font)) return;
+	for (int i = 0; i < g_nfonts; i++)
+		if (g_font[i].state != FS_FREE && g_font[i].pend == font && !g_font[i].cancel) return;   /* being measured */
 	for (int a = LEAD0; a < LEAD0 + LEADS; a++)
 		if (FONT_ARRAYS(font)[a]) {
 			log_msg("text: a font (%d point) has its own glyph array %02x: left as it is", FONT_SIZE(font), a);
 			return;
 		}
-	for (int i = 0; i < g_nfonts && !r; i++)
-		if (!g_font[i].font) r = &g_font[i];
-	if (!r) {
-		if (g_nfonts == FONTS_MAX) {
-			log_msg("text: more than %d fonts, the rest draw ASCII only", FONTS_MAX);
-			return;
-		}
-		r = &g_font[g_nfonts++];
-	}
 	points = FONT_SIZE(font);
 	style = (int)FONT_STYLE(font);
 	asc = FONT_ASCENDER(font);
 	desc = FONT_DESCENDER(font);
 	if (points <= 0 || points > 200 || asc <= 0 || desc < 0) return;
+	for (int i = 0; i < g_nfonts && !r; i++)
+		if (!g_font[i].font && g_font[i].state == FS_FREE) r = &g_font[i];
+	if (!r) {
+		if (g_nfonts == FONTS_MAX) {
+			log_msg("text: more than %d fonts, the rest draw ASCII only", FONTS_MAX);
+			return;
+		}
+		r = &g_font[g_nfonts];
+		memset(r, 0, sizeof *r);
+		__sync_synchronize();
+		g_nfonts++;
+	}
 	memset(r, 0, sizeof *r);
 	r->arrays = VirtualAlloc(0, LEADS * ARRAY_BYTES, 0x3000, 4);
-	if (!r->arrays || !(dc = CreateCompatibleDC(0))) {
+	if (!r->arrays) {
 		log_msg("text: no memory for a font's glyphs");
 		return;
 	}
-	for (int f = 0; f < g_faces; f++) {
-		HANDLE gf = gdi_font(g_face_name[f], points, style), old;
-		if (!gf) continue;
-		old = SelectObject(dc, gf);
-		set_advances(dc, r->arrays, f, asc, asc + desc);
-		SelectObject(dc, old);
-		DeleteObject(gf);
+	r->pend = font;
+	r->points = points;
+	r->style = style;
+	r->asc = asc;
+	r->desc = desc;
+	if (g_measure_logged) {
+		g_measure_t0 = GetTickCount();
+		g_measure_logged = 0;
 	}
-	DeleteDC(dc);
-	r->font = font;
-	for (int a = 0; a < LEADS; a++) FONT_ARRAYS(font)[LEAD0 + a] = r->arrays + a * ARRAY_BYTES;
+	__sync_synchronize();
+	r->state = FS_MEASURE;
+	if (__sync_bool_compare_and_swap(&g_fonts_thread, 0, 1) && !CreateThread(0, 0, fonts_thread, 0, 0, 0)) {
+		g_fonts_thread = 0;
+		fonts_thread(0);   /* (no thread: measured here, as before) */
+	}
+}
+
+/* Every frame (main thread): measured fonts get their arrays */
+static void fonts_publish(void)
+{
+	int busy = 0, published = 0;
+
+	for (int i = 0; i < g_nfonts; i++) {
+		Font *r = &g_font[i];
+		if (r->state == FS_MEASURE) busy = 1;
+		if (r->state != FS_DONE) continue;
+		__sync_synchronize();
+		if (r->cancel) {
+			VirtualFree(r->arrays, 0, 0x8000);
+			memset(r, 0, sizeof *r);
+			continue;
+		}
+		r->font = r->pend;
+		for (int a = 0; a < LEADS; a++) FONT_ARRAYS(r->font)[LEAD0 + a] = r->arrays + a * ARRAY_BYTES;
+		r->pend = 0;
+		r->state = FS_FREE;
+		published++;
+	}
+	if (!busy && !g_measure_logged && published) {
+		int n = 0;
+		for (int i = 0; i < g_nfonts; i++) n += g_font[i].font != 0;
+		log_msg("text: %d fonts draw names and chat beyond ASCII (measured on a thread in %u ms)", n, GetTickCount() - g_measure_t0);
+		g_measure_logged = 1;
+	}
 }
 
 /* The advance of the two-byte character at s in Oni's Tahoma of that size and style (0: none) */
@@ -712,6 +801,8 @@ int text_advance(int points, int style, const char *s)
 void text_font_remove(u8 *font)
 {
 	Font *r = font_of(font);
+	for (int i = 0; i < g_nfonts; i++)
+		if (g_font[i].state != FS_FREE && g_font[i].pend == font) g_font[i].cancel = 1;   /* fonts_publish frees it */
 	if (!r) return;
 	for (int a = 0; a < LEADS; a++) FONT_ARRAYS(font)[LEAD0 + a] = 0;
 	VirtualFree(r->arrays, 0, 0x8000);
@@ -732,6 +823,7 @@ static void fonts_scan(void)
 
 	static u32 last;
 	u32 now = GetTickCount();
+	fonts_publish();
 	if (g_tsft_seen != 0xffffffffu && now - last < 1000) return;   /* a lookup by name: once a second */
 	last = now;
 	if (TMrInstance_GetDataPtr(TAG_TSFF, "Tahoma", &family)) family = 0;
@@ -745,7 +837,8 @@ static void fonts_scan(void)
 		if (!TMrInstance_GetDataPtr_ByNumber(TAG_TSFT, i, (void **)&f) && f) text_font_add(f);
 	}
 	if (g_faces_ready && (g_nfonts != (int)had || !logged)) {
-		log_msg("text: %d fonts draw names and chat beyond ASCII (Tahoma family: %u, fonts loaded: %u)", g_nfonts, in_family, n);
+		log_msg("text: %u Tahoma fonts to measure for names and chat beyond ASCII (Tahoma family: %u, fonts loaded: %u)", in_family + n,
+		        in_family, n);
 		logged = 1;
 	}
 }

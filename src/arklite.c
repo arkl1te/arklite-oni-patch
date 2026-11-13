@@ -199,6 +199,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	flare_depth_install();
 	invis_install();
 	motion_blur_install();
+	sprite_aspect_install();
 	photo_install();
 	report_install(instance);
 	return 1;

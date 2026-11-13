@@ -615,6 +615,7 @@ static u32 g_end_players, g_end_ready_count, g_end_left_ms, g_end_rx;   /* joine
 
 /* A level reload that waits for the live dialogs to close (reload_level) */
 static u32 g_reload;                   /* level + 1, 0: none */
+static const char *g_load_step;        /* why net.c loads the level next: the loading popup's first line (level_load) */
 static int g_reload_seeds;             /* load it with g_match_seed / g_match_local_seed */
 
 /* The server, as the Host dialog (or Arklite.ini [host]) has it */
@@ -2795,6 +2796,7 @@ static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 static u32 g_dl_level;                 /* the level whose load downloads the host's files first */
 static u32 g_dl_declined;              /* its download failed or was cancelled: not again */
 static WMtWindow *g_dl_lines[2];       /* the two lines under the loading popup's bar */
+static WMtWindow *g_dl_lines_of;       /* the popup they were made in (0: none made since the last one closed) */
 static u32 g_req_chunk[DL_SLOTS], g_req_time[DL_SLOTS];   /* piece + 1 asked for last, and when */
 
 static void session_end(const char *why);
@@ -2833,6 +2835,7 @@ static int map_download_start(void)
 	log_msg("net: the host's map differs from this PC's: reloading level %d to download it", level);
 	g_dl_level = level;
 	session_end("downloading the host's map");
+	g_load_step = "Loading the host's map";
 	reload_level(level, 0);
 	return 1;
 }
@@ -2899,6 +2902,7 @@ static int level0_swap_start(const u32 *want)
 		log_msg("net: the host has this PC's own level0: reloading level %d with it", level);
 		g_l0_pending = 1;
 		session_end("switching back to this PC's level0");
+		g_load_step = "Switching back to your own level0";
 		reload_level(level, 0);
 		return 1;
 	}
@@ -2909,6 +2913,7 @@ static int level0_swap_start(const u32 *want)
 			log_msg("net: the host's level0 is in %s: reloading level %d with it", g_l0_dir, level);
 			g_l0_pending = 1;
 			session_end("switching to the host's level0");
+			g_load_step = "Switching to the host's level0";
 			reload_level(level, 0);
 			return 1;
 		}
@@ -2917,6 +2922,7 @@ static int level0_swap_start(const u32 *want)
 	log_msg("net: the host's level0 (%08x %08x) isn't in %s: reloading level %d to download it", want[0], want[1], g_l0_dir, level);
 	g_l0_fetch = 1;
 	session_end("downloading the host's level0");
+	g_load_step = "Getting the host's level0";
 	reload_level(level, 0);
 	return 1;
 }
@@ -3020,7 +3026,13 @@ static void dl_lines_create(void)
 {
 	WMtWindow *d = ONgLoadingDialog, *label = 0, *bar;
 
+	if (d && g_dl_lines_of == d && g_dl_lines[0]) {   /* already in this popup (the join's lines, see level_load) */
+		for (int i = 0; i < 2; i++)
+			if (g_dl_lines[i]) WMrWindow_SetVisible(g_dl_lines[i], 1);
+		return;
+	}
 	g_dl_lines[0] = g_dl_lines[1] = 0;
+	g_dl_lines_of = d;
 	if (!d || !(bar = WMrDialog_GetItemByID(d, 100))) return;
 	for (WMtWindow *w = WIN_FIRSTCHILD(d); w; w = WIN_NEXT(w))
 		if (WIN_ID(w) == 0 && WIN_W(w) < WIN_W(d)) { label = w; break; }
@@ -3955,9 +3967,78 @@ int net_join_download(const NetServerInfo *s, u32 *bytes)
 }
 
 /* The level load's TMrLevel_Load call: the host's files first when they're wanted */
+/* ---- What the loading popup says while a network game loads ----------------------------------- *
+ * A joiner loads the level up to three times before it plays (the Join list's load, again with the
+ * host's level0, again for the warm-up or the match), each in Oni's loading popup: a 350x150 box,
+ * its bar at 10% for the whole file reading (the long part: ONrLevel_Load moves it only between
+ * its steps, 0x5059d0), on a black screen. On the Windows joiner (2560x1440) that read as a black
+ * screen with no progress until the game came on (user's report, 2026-11-13). Now the popup's two
+ * lines under the bar (the map download's, dl_lines_create) say which step it is ("Switching to the
+ * host's level0") and which file is being read ("level14_Final.dat (3 of 13)"), and the bar moves
+ * from 10% to 20% file by file (custom_game.c's open hook calls net_load_file). Windows messages
+ * are handled at each of those frames, so Windows doesn't take the window for hung. Only for loads
+ * net.c starts and a joiner's first one; the game's own loads are as Oni shows them. */
+static const char *g_load_a;           /* this load's first line; 0: not shown */
+static char g_load_map[64];
+static u32 g_load_files;               /* files opened so far in this load */
+static int g_load_count_on, g_load_quit;
+
+static void load_pump(void)
+{
+	struct { void *hwnd; u32 msg, wp, lp, time, x, y; } m;
+
+	if (g_load_quit) return;
+	while (PeekMessageW(&m, 0, 0, 0, 1 /* PM_REMOVE */)) {
+		if (m.msg == 0x12 /* WM_QUIT */) {   /* for Oni's own loop, after the load */
+			PostQuitMessage((int)m.wp);
+			g_load_quit = 1;
+			return;
+		}
+		TranslateMessage(&m);
+		DispatchMessageW(&m);
+	}
+}
+
+static void load_show(const char *b, u32 percent)
+{
+	if (!g_load_a || !ONgLoadingDialog) return;
+	dl_lines_create();   /* (the same two lines again: a download hides them when it's done) */
+	if (!g_dl_lines[0]) return;
+	load_pump();
+	dl_draw(g_load_a, b, percent);
+}
+
+void net_load_file(const char *ref, u32 count)
+{
+	const char *name = ref;
+	char b[96];
+
+	if (!g_load_count_on || !g_load_a) return;
+	for (const char *p = ref; *p; p++)
+		if (*p == '\\' || *p == '/') name = p + 1;
+	g_load_files++;
+	if (count < g_load_files) count = g_load_files;
+	fmt(b, "%s (%u of %u)", name, g_load_files, count);
+	load_show(b, 10 + 10 * (g_load_files - 1) / count);
+}
+
 static u16 ONI_FC level_load(u32 level, u32 edx)
 {
 	u32 l = g_dl_level;
+	u16 r;
+
+	g_load_a = 0;
+	g_load_files = 0;
+	g_load_count_on = g_load_quit = 0;
+	g_dl_lines_of = 0;   /* a new popup (ONrLevel_Load's, 0x505a0b) */
+	if (ONgLoadingDialog && (g_load_step || g_mode == NET_JOIN)) {
+		const char *name = custom_game_level_name(level & 0xff);
+		g_load_a = g_load_step ? g_load_step : "Joining the game";
+		if (name) str_cpy(g_load_map, sizeof g_load_map, name);
+		else fmt(g_load_map, "Level %u", level & 0xff);
+		load_show(g_load_map, 10);
+	}
+	g_load_step = 0;
 
 	if (g_l0_fetch) {
 		char rel[80], dir[MAX_PATH], folder[40], path[128];
@@ -3999,6 +4080,7 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 			g_l0_installed[0] = g_files[2];
 			g_l0_installed[1] = g_files[3];
 		}
+		load_show(back ? "Opening your own level0" : "Opening the host's level0", 10);
 		if (level0_swap(g_l0_dir)) {
 			g_files[2] = g_l0_want[0];
 			g_files[3] = g_l0_want[1];
@@ -4016,7 +4098,15 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 		g_dl_level = 0;
 		if (!map_download(l)) g_dl_declined = l;
 	}
-	return TMrLevel_Load(level, edx);
+	load_show(g_load_map, 10);
+	g_load_count_on = 1;
+	r = TMrLevel_Load(level, edx);
+	g_load_count_on = 0;
+	if (g_load_a && g_dl_lines[1] && ONgLoadingDialog)   /* shown at ONrLevel_Load's next step (20%) */
+		WMrWindow_SetTitle(g_dl_lines[1], "Setting up the level", 0x100);
+	g_load_a = 0;
+	g_dl_lines_of = 0;   /* (the popup closes when ONrLevel_Load is done) */
+	return r;
 }
 
 static void begin_run(void);
@@ -4056,6 +4146,7 @@ int net_map_fetch(char *folder, u32 size, u32 level)
 		WMrDialog_Create(ONcLoadingDialogID, 0, ONrLoadingDialog_Proc, 0xffffffffu, &ONgLoadingDialog);
 	}
 	ok = map_fetch_into(level, folder, size);   /* (a half-made folder isn't a map: what arrived stays in CustomLevels.download) */
+	g_dl_lines_of = 0;
 	if (ONgLoadingDialog) {
 		WMrWindow_Delete(ONgLoadingDialog);
 		ONgLoadingDialog = 0;
@@ -4275,6 +4366,7 @@ static void back_to_lobby(const char *why)
 	 * (a warm-up goes on), which must not read as a repeat. A failed catch-up keeps it: HELLO
 	 * says catchup_failed for that session. */
 	if (g_mode == NET_JOIN && g_go_taken != g_cu_failed) g_go_taken = 0;
+	g_load_step = "Back to the lobby";
 	reload_level(level, 0);
 }
 
@@ -5427,6 +5519,7 @@ static void start_match(void)
 	session_end(g_warm ? "warm-up starting" : "match starting");
 	g_quiet_end = 0;
 	players_set_count(g_nplayers);
+	g_load_step = !g_warm ? "Starting the match" : g_mode == NET_JOIN ? "Joining the warm-up" : "Starting the warm-up";
 	reload_level(level, 1);
 }
 
