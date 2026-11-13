@@ -10,11 +10,14 @@ Arklite's aim is to be the Oni update that never came.
 
 ## Features
 
-- **Network multiplayer** for 2 to 4 players (as many as the map has spawn points). Host a map from the menu, or join one from the server list, your saved servers or your local network: games on the internet are listed and reached for you, even behind a provider's shared address. Your game never shows anyone's address, so you can stream it. Players fight in a warm-up until enough of them are ready (F3), and anyone can join while a warm-up or match is on; matches have time and score limits, a kill feed in the top left corner (who killed whom, and how, in icons), a scoreboard (F1) and chat (Enter), which also says when someone enters or leaves the game. Type /help in the chat for its commands: /name, /w (whisper), /moves (your character's move list), /t and /t2 (taunts), /sneeze, /i (idle), /clear. The other players are predicted, so there's no input delay.
-- **Pick your character with F2**, from Konoko to Mad Bomber, with their outfits and colors. Type your name there too, and it shows over your head.
+- **Network multiplayer** for 2 to 4 players (as many as the map has spawn points). Host a map from the menu, or join one from the server list, your saved servers or your local network: games on the internet are listed and reached for you, even behind a provider's shared address. Your game never shows anyone's address, so you can stream it. Players fight in a warm-up until enough of them are ready (F3), and anyone can join while a warm-up or match is on; matches have time and score limits, a kill feed in the top left corner (who killed whom, and how, in icons), a scoreboard (F1) and chat (Enter), which also says when someone enters or leaves the game. Names and chat can be in Spanish, Russian, Japanese or Chinese, typed with any keyboard layout or input method. Type /help in the chat for its commands: /name, /w (whisper), /moves (your character's move list), /t and /t2 (taunts), /sneeze, /i (idle), /clear. The other players are predicted, so there's no input delay.
+- **Dedicated servers**: host a map without playing it, from the Host page or with `server.bat` / `server.sh`. Oni's window goes away and a console takes the commands: talk to the players, list them, kick or ban, start the match, change the limits.
+- **Pick your character with F2**, from Konoko to Mad Bomber, and the characters your mods add (Hanako, Naomi, Janice, RAYMAN...), with their outfits and colors. Type your name there too, and it shows over your head.
 - **Barabas can regenerate** when you play him: crouch, let go of crouch, then press Action.
-- **Custom Game** on the main menu lists every custom level. Play it alone or host it. Joiners who don't have the map download it from the host, and a host whose AE mods changed level0 sends joiners only what differs, kept apart from their own files.
+- **Custom Game** on the main menu lists every custom level. Play it alone or host it. Joiners who don't have the map download it from the host, and a host whose AE mods changed level0 sends joiners only what differs, kept apart from their own files. The Host page lets you switch the map, shows how much a new player without mods will download and which mods you have installed, has **Mutators** in Unreal Tournament's style (double-click to move one between Available and Enabled): allow Mutant Muro, Shinatama and Hasegawa, or Mini Striker (they're left out of the character menu otherwise), Daodan for All (overhealed, everyone gets Konoko's Daodan power and Muro's shield), No Weapons, a Screaming Cannon whose cell flies twice as fast, a Plasma Rifle that fires twice as fast, a Super Ball Gun whose ball flies twice as fast, or Bombs For Days (everyone dies as the Mad Bomber does), and sets a message of the day that every player who enters sees in the chat. **Double-click a blue map to host it.** The Join page shows the selected server's mods and how much you'd download to join it.
 - **HUD scaling** from 50% to 300%, and stays (almost) sharp. The stock HUD gets tiny at high resolutions.
+- **HUD Centering** in Options > More...: from the corners (0%) to the two rings side by side in the middle (100%), handy on wide screens. The default, 4:3, puts the rings where a 4:3 screen would have them. The multiplayer corners (score, kill feed, chat, FPS) come in with them.
+- **Multiplayer text grows with the resolution**: as it was at 1050 pixels tall, bigger above, smaller below.
 - **Sound, Music and Voice volume bars**, with all character speech and taunts on Voice.
 - **An FPS counter**, off by default, in Options > More...
 - **Mouse sensitivity** in Options > More...: a slider from 0.10 to 4.00, and a box beside it for any exact value, higher or lower (1.000 is Oni's own speed).
@@ -22,13 +25,14 @@ Arklite's aim is to be the Oni update that never came.
 - **Transparent pause menu**, and the level music keeps playing behind it if you like.
 - **255 characters**, all active at once, so big fights no longer crash the game.
 - **No more slowdown from glowing moves on NVIDIA cards**: Muro's combos and the ninjas' special moves used to drop the game from 170 FPS to 10-15, because every glow asked the graphics card about itself one at a time. Now one question a frame answers them all, and they look exactly the same.
-- **Fixed skybox** along the edges of the sky.
+- **Fixed skybox** along the edges of the sky, and no black gaps in its corners on wide screens.
 - **Fixed tiny strikers** outside the dream lab.
+- **Photo mode with F10** in single player, cutscenes included: the game freezes and the camera flies free or circles a character, with tilt (Q/E), zoom (mouse wheel) and a settings panel on Tab: field of view, flight speed, hiding the HUD or your character, a thirds grid, cinema bars and a button that steps the game one frame. F10 again puts everything back as it was. It doesn't work in multiplayer.
 - **Screenshots with F12**, anywhere: in a level, in the menus or while a level loads. They're saved as PNG in `AE/screenshots/`, and you hear the game-saved sound when one is done.
 - **A crash log** in `AE/logs/`, dated, with the last three games kept, for when something goes wrong.
 - **Anonymous problem reports**: when a network game goes out of sync, a player drops or Oni crashes, Arklite sends its log (and the game's state around a desync) to the Arklite helper so the bug can be found. Addresses, player names, chat and your folders are taken out first. Turn it off with `send=0` under `[reports]` in `AE/Arklite.ini`.
 
-Everything is in Options → **More...** and in the **Custom Game** menu. Press F1 in a match for the scoreboard, and F2 to change character.
+Everything is in Options → **More...** and in the **Custom Game** menu. Press F1 in a match for the scoreboard, and F2 to change character. Press F10 in single player for photo mode.
 
 ## For modders
 
@@ -38,7 +42,7 @@ Everything is in Options → **More...** and in the **Custom Game** menu. Press 
 - **A floor for the sky.** A sky with a sixth texture draws it under the box.
 - **Kill cameras in multiplayer.** A level's `cm_detach` keeps only the dead player's camera in place, until they respawn.
 - **255 characters, 255 active, 255 shadows**, up from 128, 64 and 32.
-- **Multiplayer maps from any level.** Every character with the IsPlayer flag is a spawn point, and each weapon or power-up can set its own respawn time.
+- **Multiplayer maps from any level.** Every character with the IsPlayer flag is a spawn point, and each weapon or power-up can set its own respawn time (force fields and phase cloaks always come back after 60 seconds).
 - **Maps travel by themselves.** A joiner whose map differs or is missing gets the host's copy.
 - **Jump straight in for testing.** `ARKLITE_AUTOSTART=<folder>` starts a level from the command line, and `ARKLITE_SAVEPOINT=<n>` starts it at a save point.
 - **Record and replay** a level's input, with every tick checked against the recording.
@@ -47,8 +51,9 @@ Everything is in Options → **More...** and in the **Custom Game** menu. Press 
 ## Install
 
 You need Oni with the [Anniversary Edition](https://oni.bungie.org/) installed. Download
-`Arklite-<version>.zip` from the [Releases](../../releases) page and extract it into `Oni/AE/`.
-Close Oni, then:
+`Arklite-<version>.zip` from the [Releases](../../releases) page and extract it into `Oni/AE/`
+(it makes an `Arklite-<version>` folder there). Copying the files alone into the AE folder doesn't
+install anything: run the installer. Close Oni, then:
 
 ### Windows
 

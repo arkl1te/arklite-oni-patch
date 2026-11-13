@@ -54,6 +54,12 @@ else
 fi
 
 rm -f "$AE/Arklite.dll"
+# The dedicated server's scripts (only Arklite's own: a link, or one that says it), and the console
+# files a server writes.
+for s in server.sh server.bat; do
+	if [ -L "$AE/$s" ] || grep -qsF "Arklite dedicated server" "$AE/$s"; then rm -f "$AE/$s"; fi
+done
+rm -f "$AE/Arklite-console.sh" "$AE/Arklite-console.key"
 if [ -L "$AE/GameDataFolder/CustomLevels" ]; then
 	rm "$AE/GameDataFolder/CustomLevels"
 else

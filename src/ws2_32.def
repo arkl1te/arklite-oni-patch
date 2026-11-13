@@ -17,3 +17,5 @@ EXPORTS
   send@16
   recv@16
   getsockname@12
+  listen@8
+  accept@12

@@ -74,6 +74,35 @@ void fmt(char *buf, const char *f, ...);       /* wvsprintfA: at most 1024 bytes
 const char *skip_space(const char *s);
 int  parse_float(const char **s, float *out);  /* "-12.5": advances *s; 0 if no number */
 
+/* ---- text.c: characters beyond ASCII (Spanish, Russian, Japanese, Chinese) ---------------- *
+ * Arklite's text is ASCII plus two-byte codes (both bytes >= 0x80) that Oni's fonts draw. */
+void text_install(void);
+void text_frame(void);                         /* every frame: fonts, typing, the IME */
+int  text_put(char *d, u32 c);                 /* the character c (Unicode) as 1 or 2 bytes into d; 0: none */
+u32  text_get(const char *s, int *n);          /* the character at s (Unicode, '?' if broken), n its bytes */
+int  text_next(const char *s, int i);          /* the index after the character at i */
+int  text_prev(const char *s, int i);          /* the index of the character before i */
+int  text_wide(const char *s, int i);          /* the character at i is two bytes */
+int  text_has_wide(const char *s);
+int  text_clean(char *d, unsigned size, const char *s);   /* printable ASCII and whole codes only; d == s is fine */
+int  text_from_utf8(char *d, unsigned size, const char *s);
+int  text_to_utf8(char *d, unsigned size, const char *s);
+int  text_to_utf16(u16 *d, unsigned count, const char *s);
+int  text_to_utf8_n(char *d, unsigned size, const char *s, int n);     /* s[0, n) */
+int  text_to_utf16_n(u16 *d, unsigned count, const char *s, int n);
+void ini_text(const char *section, const char *key, const char *fallback, char *out, unsigned size);
+void ini_text_write(const char *section, const char *key, const char *value);   /* \uXXXX beyond ASCII */
+void text_font_add(u8 *font);                  /* big_font.c: its fonts get the glyphs too */
+void text_font_remove(u8 *font);
+void text_multibyte_begin(void);              /* Oni reads two-byte characters until the matching end (Daodan reads bytes) */
+void text_multibyte_end(void);
+int  text_advance(int points, int style, const char *s);   /* a two-byte character's advance in Oni's Tahoma (0: none) */
+const char *text_composition(void);            /* what the IME is composing for the chat ("" if nothing) */
+void text_ime_spot(int x, int y, int h, int screen_w, int screen_h);   /* the IME's windows at the chat's field */
+#define TEXT_TARGET_CHAT  1
+#define TEXT_TARGET_NAME  2
+#define TEXT_TARGET_FIELD 3
+
 /* ---- custom_game.c ----------------------------------------------------------------------- */
 
 void custom_game_install(void);
@@ -81,13 +110,19 @@ const char *custom_game_level_ini(u32 level);   /* level.ini of the custom level
 const char *custom_game_level_dir(u32 level);   /* that level's folder (ends with '\'), or 0 */
 const char *custom_game_level_folder(u32 level); /* that folder's name in CustomLevels, or 0 */
 int  custom_game_remount(u32 level);             /* list its files again and mount them (net.c's map download) */
+int  custom_game_mount_folder(u32 level, const char *folder);   /* CustomLevels\<folder> in that slot instead */
+int  custom_game_folder_path(const char *folder, char *out, u32 size);   /* CustomLevels\<folder>\, there or not */
 const char *custom_game_level_name(u32 level);   /* the custom level's name (level.ini), or 0 */
 int  custom_game_has_folder(const char *folder);  /* CustomLevels\<folder> holds a level */
+int  custom_game_folder_dir(const char *folder, char *out, u32 size);   /* its folder (ends with '\\'), 1 if it holds a level */
 
 /* ---- volume.c ----------------------------------------------------------------------------- */
 
 void volume_install(void);
 int  volume_channel_is_music(u8 *channel);   /* channel owned by a Music play (call under the sound lock) */
+/* arklite.c: stop every playing channel as the pause menu does (0x483660 plays them again), the
+ * level's music on unless keep_music is 0 */
+void sound_pause_channels(int keep_music);
 
 /* ---- more_options.c ----------------------------------------------------------------------- */
 
@@ -101,6 +136,8 @@ void  more_options_end(WMtWindow *dialog);      /* the dialog is going (WMcMessa
 int   pause_music_mode(void);
 u32   pause_background_alpha(void);   /* 0..255 */
 float hud_scale(void);                /* 1.0 = original size */
+float hud_center(void);               /* HUD Centering: 0 = rings in the corners, 1 = side by side in the middle */
+int   hud_center_43(void);            /* HUD Centering is 4:3 (the default): the rings where a 4:3 screen has them */
 int   show_fps(void);                 /* the FPS counter is on */
 
 /* ---- hud_scale.c -------------------------------------------------------------------------- */
@@ -110,6 +147,14 @@ void hud_scale_install(void);
  * own text to these, which scale it with the rest of the HUD */
 u32  ONI_FC hud_text_sprite(const float *points, const void *uvs);   /* for 0x41a5e0 */
 void ONI_FC hud_timer_display(void *center);                         /* for 0x4fd500 */
+/* How far HUD Centering moves a block toward the middle: the block reaches extent px in from its
+ * screen edge (left side, or the right), and at 100% stops halfGap px short of the middle.
+ * Positive moves right (left side), negative left. */
+int  hud_center_shift(int width, int left, int extent, int halfGap);
+/* How far HUD Centering moves the left (or right) ring, in px; negative to the left */
+int  hud_ring_shift(int left);
+/* The HUD Centering slider's step (step percent each) nearest to 4:3 at this resolution */
+int  hud_center_43_step(int step);
 
 /* ---- hud_smooth.c ------------------------------------------------------------------------- */
 
@@ -187,16 +232,78 @@ int  net_synced(void);   /* in a session every PC runs the same (warm-up or matc
 #define NET_SERVER_NAME_MAX 48
 void net_menu_local(void);     /* Play (a mode set at startup stays) */
 /* time_limit in minutes, score_limit in points (below 0: reached going down); 0: none */
-void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit);
-#define NET_PLAYERS_MAX     4      /* the Host dialog's Max players: 2 to this */
+void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules);
+/* The host's mutators (the Host page's Mutators; protocol 21: LOBBY carries them). The first three
+ * let players pick characters that are otherwise left out; Daodan gives every character Konoko's
+ * and Muro's overhealing powers. */
+#define NET_CHARS_MUTANT_MURO 1   /* mutantmuro */
+#define NET_CHARS_SHINATAMA   2   /* SH_generic, SH_dream_lab and Hasegawa (Shinzom_generic) */
+#define NET_CHARS_MINI_STRIKER 4  /* striker_dream_lab, the half-size striker */
+#define NET_CHARS_ALL         7
+#define NET_MUT_DAODAN        8   /* every class superHypo and superShield (mp_rules.c) */
+#define NET_MUT_NO_WEAPONS    16  /* no weapons in the map, none at the spawns (mutators.c) */
+#define NET_MUT_FAST_SCREAMER 32  /* the Screaming Cell flies twice as fast */
+#define NET_MUT_FAST_PLASMA   64  /* the Plasma Rifle fires twice as fast */
+#define NET_MUT_BOMBS         128 /* everyone dies as the Mad Bomber: a blast 3 s later */
+#define NET_MUT_FAST_BALL     256 /* the Super Ball Gun's ball flies twice as fast */
+#define NET_MUTATORS_ALL      511
+int  net_mutator(u32 bit);             /* the game has that mutator (never when not networked) */
+u32  net_char_rules(void);             /* NET_CHARS_*: the game's (every one when not networked) */
+int  net_mutator_daodan(void);         /* the game has the Daodan mutator (never when not networked) */
+/* the mutators Arklite.ini saved: [host] mutant_muro, shinatama_hasegawa, mini_striker, daodan,
+ * no_weapons, fast_screamer, fast_plasma, bombs, fast_ball */
+u32  net_host_char_rules_saved(void);
+#define NET_PLAYERS_MAX     4      /* the Host dialog's Max players: 2 to this (a dedicated server's too) */
+#define NET_SLOTS           5      /* the netcode's places: slot 0 is the host's (a dedicated server's own,
+                                      always watching), so a dedicated server still takes NET_PLAYERS_MAX */
 #define NET_TIME_LIMIT_MAX  999
 #define NET_SCORE_LIMIT_MAX 999
+#define NET_MOTD_MAX        (CHAT_MAX - 13)  /* the message of the day (Arklite.ini [host] motd): a chat line after "Server MOTD: " */
 void net_menu_join(const char *address);   /* host[:port] */
+/* A dedicated server (server.c): hosting, with this PC's own player always watching and never
+ * counted as one of the players; no drawing, no sound, a console for the admin */
+void net_menu_dedicated(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules);
+int  net_dedicated(void);      /* this PC runs a dedicated server, or (joiner) plays on one */
+int  net_dedicated_host(void); /* this PC runs a dedicated server */
+/* What a player with no mods downloads to join this PC's game the first time (the Host dialog):
+ * the map, a custom level's folder (dir ends with '\\'; 0: an original level, nothing), 0 when it
+ * can't be sent; level0, measured on a thread: 1 known, 0 still measuring, -1 unknown */
+int  net_join_map_bytes(const char *dir, u32 *bytes);
+int  net_join_level0_bytes(u32 *bytes);
+/* The dedicated server's console commands (server.c reads them, net.c does them); each returns a
+ * line for the console */
+typedef struct {
+	int used, slot, playing, watching, joining, gone, ping, score;
+	char name[24], addr[32];
+} NetPlayerRow;
+int  net_server_players(NetPlayerRow *rows, int max);   /* the joiners, in slot order */
+int  net_server_say(const char *text);                  /* a server line to every player; 0 if nobody's there */
+int  net_server_find(const char *who);                  /* a slot by number (2..) or name; -1 none, -2 more than one */
+const char *net_server_kick(int slot, u32 minutes, const char *reason);   /* minutes 0: until the server closes */
+u32  net_server_port(void);                              /* the game's UDP port (the Linux console: TCP) */
+const char *net_server_unban(const char *who);          /* number from bans, name, IP, "all", or "" (only one out) */
+const char *net_server_bans(char *out, u32 size);
+const char *net_server_start(void);                     /* the match now (from the warm-up) */
+const char *net_server_warmup(void);                    /* back to a warm-up now (from a match) */
+const char *net_server_status(char *out, u32 size);
+void net_server_set_limits(int minutes, int score, int have_minutes, int have_score);
+void net_server_set_name(const char *name);
+void net_server_set_max_players(u32 n);
+void net_server_quit(void);                             /* goodbye to everyone, then Oni closes */
+/* server.c */
+void server_install(void);                 /* the main loop's draw block (skipped while a dedicated server runs) */
+void server_start(void);                   /* net.c: a dedicated server begins: console, no window, no sound */
+int  server_running(void);
+void server_print(const char *f, ...);     /* a line on the console (and in the log) */
+void server_chat_line(const char *line);   /* chat.c: what the chat shows reaches the console too */
 /* Joining without the host's map: downloads its CustomLevels\<folder> from the host (after
  * net_menu_join, from the menu, in the loading popup); 1 when it's here. Else why not: */
-int  net_map_fetch(const char *folder, u32 level);
+int  net_map_fetch(char *folder, u32 size, u32 level);   /* folder: the host's map, changed when it's on another now */
 const char *net_map_fetch_error(void);
 /* What a server says about itself, for the Join list */
+#define NET_INFO_MODS       48            /* mods a server's answer names (it says how many it has) */
+#define NET_INFO_MEASURING  0xfffffffeu   /* l0_bytes: the host is still measuring it */
+#define NET_INFO_UNKNOWN    0xffffffffu
 typedef struct {
 	u32 token, ping_ms;
 	int same_version;          /* it runs this Arklite's protocol (else nothing below is known) */
@@ -204,7 +311,15 @@ typedef struct {
 	u32 from_addr;             /* where the reply came from (network order) */
 	u16 from_port;
 	char name[NET_SERVER_NAME_MAX], folder[64], map[48];
+	/* from the server itself (not the helper's list): what joining it downloads, its mods */
+	int has_download;
+	u32 l0[2], l0_bytes, map_hash, map_bytes, map_ok, nmods;
+	u32 mods[NET_INFO_MODS][2];   /* package number, bytes */
 } NetServerInfo;
+/* What this PC downloads to join that server: *bytes and how it's known */
+enum { NETDL_EXACT, NETDL_ABOUT, NETDL_MEASURING, NETDL_UNKNOWN, NETDL_IMPOSSIBLE };
+int  net_join_download(const NetServerInfo *s, u32 *bytes);
+void net_join_download_forget(void);   /* the Join page opened: maps on disk are hashed again */
 /* host[:port] looked up on a thread, one at a time: start (0 if one is still going), then poll
  * every frame: -1 not yet, 0 not found, 1 addr/port (network order) */
 int  net_resolve_start(const char *address);
@@ -235,7 +350,7 @@ typedef struct {
 	int lost;                  /* joiner's match: 1 the host stopped answering, 2 it left */
 	u32 time_limit;            /* the match's limits (the host's): minutes, 0 none */
 	int score_limit;           /* 0: none; below 0: reached going down */
-	int ping_ms[NET_PLAYERS_MAX];   /* each player's last round trip to the host (the host's row: a joiner's own), -1: not known */
+	int ping_ms[NET_SLOTS];   /* each player's last round trip to the host (the host's row: a joiner's own), -1: not known */
 	int over;                  /* match: a limit was reached, the game stands until everyone pressed fire */
 	int over_ready;            /* this PC's player pressed fire */
 	u32 over_players, over_ready_count;
@@ -248,10 +363,12 @@ typedef struct {
 /* What differs between the two PCs, so the host doesn't let the joiner in */
 enum {
 	NETBAD_PROTO = 1, NETBAD_DLL = 2, NETBAD_DAODAN = 4, NETBAD_DAODAN_INI = 8, NETBAD_LEVEL0 = 16,
-	NETBAD_MAP = 32, NETBAD_PLAYERS = 64, NETBAD_FULL = 128,
+	NETBAD_MAP = 32, NETBAD_PLAYERS = 64, NETBAD_FULL = 128, NETBAD_KICKED = 256,
 };
-#define NETBAD_LAST NETBAD_FULL
+#define NETBAD_LAST NETBAD_KICKED
+const char *net_kick_note(void);   /* joiner: why the server removed this PC, and for how long ("" none) */
 void net_hud(NetHud *h);
+void net_fly_move(float *pos, float *vel, float dt);   /* pos moves by vel * dt, stopped and slid along the level's walls */
 int  net_watching(void);         /* this PC's player watches: the player it shows, -2 free flight; -1 not watching */
 u8  *net_swapped_konoko(void);   /* Konoko while the joiner's display runs with player 2 in gs+0xac, else 0 */
 const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
@@ -297,7 +414,13 @@ const char *net_punch(const char *address);   /* host: knock toward that player 
 enum { MPMENU_CANCEL, MPMENU_NEW, MPMENU_JOIN };
 void mp_menu_install(void);   /* text fields: keys and caret */
 int  mp_menu_choose(void);
-int  mp_menu_host(const char *map_name);   /* 1: Host (net.c is set up), 0: Cancel */
+/* 1: Host (net.c is set up), 0: Cancel; map_dir: a custom level's folder (ends with '\\'), 0 for others */
+/* Host Game: maps (the Map dropdown), start the one shown first; map_dir(i, out, size): a custom
+ * level's folder, ending with '\\' (1), or 0 for an original level. The chosen map, -1: Cancel. */
+/* This PC's installed AE mods (package numbers of 8000 and up): up to max {number, bytes}, the count
+ * of all of them returned (scanned once) */
+u32  ui_installed_mods(u32 (*out)[2], u32 max);
+int  mp_menu_host(const char *const *maps, int nmaps, int start, int (*map_dir)(int, char *, u32));
 /* 1: Join (net.c is set up); the host's map: its CustomLevels folder ("" for a numbered level) and level */
 int  mp_menu_join(char *folder, u32 folder_size, u32 *level);
 void mp_menu_join_failed(const char *folder, const char *why);   /* the map download stopped: the Join list says why */
@@ -335,6 +458,8 @@ void ui_set_text_fit(WMtWindow *w, const char *text);   /* cut with "..." to the
 /* Tahoma Bold 10 (the menus' font): width in pixels, and src cut with "..." to fit width */
 int  ui_text_width(const char *s);
 void ui_fit(char *dst, unsigned size, const char *src, int width);
+int  ui_field_focused(void);           /* one of Arklite's menu text fields has the keyboard */
+int  ui_field_type(u32 c);             /* a character typed beyond ASCII into it; 0: not taken */
 /* A label (copy of font's font) with its text cut to w */
 enum { UI_LEFT, UI_CENTER, UI_RIGHT };
 #define UI_LABEL_STYLE 0x110000   /* the Options dialog's labels: vertically centered */
@@ -359,6 +484,10 @@ void ui_fields_end(void);
 WMtWindow *ui_field_decimal(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, u32 id, int x, int y, int w,
                             u32 max, const char *text);
 int  ui_parse_thousandths(const char *s, int *out);   /* "1.25" -> 1250; 0 if it isn't a number */
+/* A field for whole numbers from lo to hi (a '-' may start it when lo < 0), at most max characters;
+ * each key that changes it sends Command id | EFcNotify_Changed << 16, Enter puts it in range */
+WMtWindow *ui_field_integer(WMtWindow *dialog, WMtWindow *anchor, WMtWindow *font, u32 id, int x, int y, int w,
+                            u32 max, const char *text, int lo, int hi);
 
 /* ---- mp_board.c -------------------------------------------------------------------------- */
 
@@ -373,7 +502,18 @@ void mp_hud_text(const char *s, int x, int y, int align, u32 color);   /* only w
 void mp_hud_text_plain(const char *s, int x, int y, int align, u32 color);   /* not bold */
 u32  mp_hud_style(u32 style);   /* the HUD text style from here on (0 plain, the HUD's bold); returns the one before */
 int  mp_hud_line_height(void);
+int  mp_hud_px(int px);         /* px at the reference height (1050), at this screen's height */
+void mp_hud_prepare(void);      /* hud_textures_prepare: the fonts' textures and this screen's fonts */
+
+/* ---- big_font.c --------------------------------------------------------------------------- */
+
+void  big_font_install(void);   /* from mp_hud_install */
+void  big_font_prepare(void);   /* every font texture made (before rollback starts) */
+/* The family to draw with: family itself, or a copy with Tahoma points (plain and bold) and
+ * big_points (bold) appended where family lacks them, made from the system's Tahoma */
+void *big_font_family(void *family, int points, int big_points);
 int  mp_hud_text_width(const char *s, int n);   /* the first n characters (n < 0: all), trailing spaces included */
+int  mp_hud_text_width_plain(const char *s, int n);   /* the same in mp_hud_text_plain's style */
 
 /* ---- mp_names.c -------------------------------------------------------------------------- */
 
@@ -399,9 +539,26 @@ void mp_names_say(int who, const char *text);   /* chat.c: a message over that p
 void mp_sound(const char *impulse);   /* a level 0 impulse by name, no position; outside a tick */
 void chat_install(void);              /* Arklite.ini [chat] */
 void menu_wheel_install(void);        /* menu_wheel.c: the mouse wheel in Oni's menus */
+int  menu_wheel_hud_take(void);       /* notches turned while the F2 menu is up (up is positive) */
 void screenshot_install(void);       /* screenshot.c: F12 saves the frame to screenshots\ */
+void screenshot_request(void);       /* save the next frame drawn, as F12 does */
+int  screenshot_pending(void);       /* the next frame drawn will be saved */
+int  menu_wheel_photo_take(void);    /* menu_wheel.c: whole notches turned while photo mode is on (up is positive) */
+
+/* ---- photo.c ----------------------------------------------------------------------------- */
+
+/* Photo mode (single player only): F10 stops the game and frees the camera */
+void photo_install(void);
+int  photo_update(u32 count, void *actions, u32 *ticks_run, u32 *err);   /* lockstep.c's update hook, first: 1 if it ran the frame */
+int  photo_active(void);
+int  photo_owns_camera(void);        /* net.c's camera hook does nothing */
+int  photo_hides(u8 *c);             /* net.c's on-screen test: c isn't drawn */
+int  photo_overlay_take(void);       /* screenshot.c, each frame: its hints or grid were drawn in it (and forgets) */
+int  photo_hides_hud(void);          /* photo mode is on without Show HUD (hud_scale.c: no subtitles) */
+void photo_draw(int width, int height);   /* mp_hud.c's always-on draw call, its fine font set */
 void chat_frame(void);                /* every frame, after the update */
 void chat_draw(int width, int height);   /* from the HUD */
+int  chat_typing(void);               /* the chat is open */
 int  chat_blocking(void);             /* open (or Enter/Esc that closed it still down): the game gets the mouse but no keyboard */
 void chat_receive(int who, const char *text);   /* net.c: player who (another PC's) said it */
 void chat_server(const char *text);   /* net.c: a server line ("Name entered the game") */
@@ -419,8 +576,9 @@ void chat_set_muted(int who, int on);
 #define PLAYERS_CHOICE_TAG 0x7fa00000u
 #define PLAYERS_CHOICE_MASK 0xffe00000u
 /* In the host's (Konoko's) word 11 of a network game: PLAYERS_PRESENT_FLAG | the players who
- * have a character, a bit per player at PLAYERS_PRESENT_SHIFT (players.c adds and removes them in
- * that tick; net.c sets it, see "Joining a game in progress") */
+ * have a character, a bit per player 1..4 at PLAYERS_PRESENT_SHIFT (player 0, the host, is always
+ * there; players.c adds and removes them in that tick; net.c sets it, see "Joining a game in
+ * progress") */
 #define PLAYERS_PRESENT_FLAG 0x00100000u
 #define PLAYERS_PRESENT_SHIFT 16
 /* Bits 12-15 of anyone's word 11: an emote for that tick (PLAYERS_EMOTE_*, players.c); bit 11:
@@ -443,8 +601,12 @@ u32  players_spectate_word(void);             /* net.c make_input: PLAYERS_SPECT
 int  players_spectating(int who);             /* tick state: slot who watches */
 u32  players_spectators(void);                /* a bit per slot */
 int  players_hidden(u8 *c);                   /* not drawn: a watching host's parked Konoko */
+void players_set_dedicated(int on);           /* net.c: the host is a dedicated server: one more player, from Konoko's placement */
 void char_menu_install(void);
 void char_menu_level0_changed(void);   /* class numbers changed: the roster is resolved again */
+void char_menu_rules_changed(void);    /* net_char_rules() changed: the roster is resolved again */
+int  char_menu_class_allowed(int number);   /* ONCC instance number: may a player pick it (net_char_rules) */
+int  char_menu_class_female(const char *name);   /* a woman (the Daodan mutator's particles) */
 void respawn_fx_level0_changed(void);  /* its base classes come from the new level 0 */
 void level0_swap_install(void);
 char *level0_swap_ref(char *ref);      /* the file to open for a level file table entry */
@@ -465,7 +627,7 @@ void players_install(void);
 const u32 *players_begin_frame(void);         /* player 2's record for this frame, or 0 */
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
 /* Players in a game: slot 0 Konoko, 1..PLAYERS_MAX-1 the next Player-flagged placements */
-#define PLAYERS_MAX NET_PLAYERS_MAX
+#define PLAYERS_MAX NET_SLOTS   /* places; a listen host's game has NET_PLAYERS_MAX at most */
 void players_net_frame(const u32 (*records)[6][12], u32 n);   /* networked: slot s's tick i gets records[s][i] (slot 0 unused) */
 void players_set_count(u32 n);                /* players spawned at the next level load (2 by default) */
 u32  players_count(void);
@@ -505,11 +667,24 @@ void obit_add(int killer, int victim, int kind, u8 *weapon);   /* in a tick; kil
 void obit_reset(void);
 void obit_textures_prepare(void);              /* hud_textures_prepare: before rollback starts */
 void obit_draw(int x, int y, int local);       /* from the HUD: lines from y down, left edge x */
+int  obit_width(void);                          /* the feed's widest line, for HUD Centering */
 
 /* ---- mp_rules.c -------------------------------------------------------------------------- */
 
 void mp_rules_install(void);   /* multiplayer maps: free for all, damage x1.25, overhealing drains 1.25x faster */
-void mp_rules_level(void);     /* a level's characters are about to be made: Ninjabot's weapon hand */
+void mp_rules_level(void);     /* a level's characters are about to be made: Ninjabot's weapon hand, the Daodan mutator */
+void mp_rules_level_end(void); /* a level unloads: the classes the Daodan mutator changed are put back */
+/* mutators.c: the gameplay mutators' data, set at a level's load and put back at its unload; bombs going off */
+void mutators_level(void);
+void mutators_level_end(void);
+void mutators_tick(void);
+/* lockstep.c: the particle calls that pick the effects stream for decorative particles */
+u8 *ONI_FC lockstep_p3_create_particle(u8 *cls, u32 time);
+u8 *ONI_FC lockstep_p3_create_effect(void *spec, void *data);
+u8 ONI_FC lockstep_p3_send_event(u8 *cls, u8 *particle, u32 event, float time);
+void lockstep_decor_level_log(void);                  /* every tick (lockstep.c), after the game's */
+int  mutators_body_gone(const u8 *c);      /* a player whose bomb went off: not drawn */
+void players_spawn_weapons(int blank);     /* players.c: the spawn placements' weapons blanked (1) or back (0) */
 
 /* ---- regen.c ----------------------------------------------------------------------------- */
 
@@ -539,6 +714,7 @@ void live_menu_close(void);    /* end every live dialog (as Esc does), before a 
 /* WMrDialog_ModalBegin for every dialog (lockstep.c wraps the calls): in a multiplayer game a
  * dialog outside a tick runs with the game going on behind it, one inside a tick isn't shown */
 int  lockstep_in_tick(void);   /* lockstep.c: inside a tick, on its thread */
+int  lockstep_recording(void); /* lockstep.c: ARKLITE_RECORD or ARKLITE_REPLAY is on */
 u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u32 *result, int in_tick);
 
 /* ---- vertex_light.c ---------------------------------------------------------------------- */
@@ -548,6 +724,7 @@ void vertex_light_level_end(void);   /* from any level unload */
 void vertex_light_install(void);     /* flickering lights' ambients play only while they fail */
 void vertex_light_frame(void);   /* every frame: animated corners of a custom level (vertexlight.bin) */
 void spin_particle_frame(void);  /* every frame: particles in a custom level's spinning groups (spin_particle.c) */
+void spin_particle_level_end(void);   /* from any level unload (particle_table.c) */
 
 /* ---- crash_log.c -------------------------------------------------------------------------- */
 
@@ -567,3 +744,8 @@ int  net_local_slot(void);             /* net.c: this PC's player slot, -1 off t
 void flare_depth_install(void);
 void flare_depth_present(void);        /* screenshot.c, at every SwapBuffers */
 int  screenshot_hooked(void);          /* screenshot.c: both SwapBuffers calls are hooked */
+
+/* ---- invis.c: the phase cloak in network games ----------------------------------------------- */
+void motion_blur_install(void);        /* motion_blur.c: afterimages without depth writes */
+void invis_install(void);              /* only the cloaked player sees their own shimmer */
+int  invis_hidden(u8 *c);              /* cloaked (or still fading back in): no name tag over it */

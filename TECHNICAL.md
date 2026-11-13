@@ -15,6 +15,7 @@ setting, and how custom levels, player 2 and network games work.
 
 1. Download `Arklite-<version>.zip` from the [Releases](../../releases) page and extract it
    anywhere (into `Oni/` or `Oni/AE/` works best: the installer finds the game on its own).
+   Extracting alone installs nothing: the game only sees Arklite once the installer has run.
 2. Close Oni.
 3. Run the installer:
    - **Windows**: double-click `install.bat`. If Oni is in a protected folder such as
@@ -65,6 +66,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | Section | Key | Default | What |
 | --- | --- | --- | --- |
 | `[options]` | `hud_scale` | 100 | HUD scale in percent, 50–300 |
+| | `hud_center` | `4:3` | HUD Centering: `4:3` puts the rings where a 4:3 screen of the same height has them (no change on 4:3 or narrower screens), or a percentage, 0–100 in steps of 5: 0 leaves the rings in the bottom corners, 100 puts them side by side in the middle. The score, time, FPS, kill feed and chat move in too, each stopping short of the middle. On the slider, 4:3 is the step nearest to it, labelled "4:3" |
 | | `pause_background` | 33 | Opacity of the black behind the pause menu, 0–100 |
 | | `pause_music` | `keep` | `keep` (level music goes on), `theme` (original menu theme) or `silence` |
 | | `show_fps` | 0 | 1: FPS counter in the top right corner, refreshed every 6 frames |
@@ -88,13 +90,26 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `max_players` | 4 | The Host dialog's last value: players 2 to 4 (spectators have no limit). Matches of 3 or 4 players are untested |
 | | `time_limit` | 10 | Minutes a match lasts; 0: no time limit (the Host dialog saves it) |
 | | `score_limit` | 20 | Points that win a match; 0: no score limit. Below 0, e.g. -5: the first player whose score goes down to it wins, by suicides (the Host dialog saves it) |
+| | `mutant_muro` | 0 | The Mutant Muro mutator: 1, players may pick Mutant Muro in the character menu (F2); 0, he's left out. The Host page's Mutators save it, and joiners get the host's |
+| | `shinatama_hasegawa` | 0 | The same for Shinatama and Hasegawa |
+| | `mini_striker` | 0 | The same for Mini Striker (striker_dream_lab, the half-size Striker variation) |
+| | `daodan` | 0 | The Daodan for All mutator: every character, overhealed, gets Konoko's Daodan power (stronger blows) and Muro's shield, shown as Daodan particles (Konoko's on women, Muro's on men) instead of the shield texture |
+| | `no_weapons` | 0 | The No Weapons mutator: the map's weapons and the players' spawn weapons are left out (power-ups stay) |
+| | `fast_screamer` | 0 | The Fast Screamer mutator: the Screaming Cannon's cell flies twice as fast |
+| | `fast_plasma` | 0 | The Fast Plasma mutator: the Plasma Rifle fires twice as fast |
+| | `bombs` | 0 | The Bombs For Days mutator: everyone dies as the Mad Bomber does, a blast three seconds later. With or without it, a bomb's body vanishes when it goes off and leaves a black scorch |
+| | `fast_ball` | 0 | The Fast Ball mutator: the Super Ball Gun's ball flies twice as fast |
+| | `motd` | (empty) | The message of the day: a server line in the chat ("Server MOTD: ...") for each player who enters the game, only them. The Host page's field saves it; up to 114 characters here, as many as fit in the field there. Empty: none |
 | `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by + and - |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
-| | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's) |
-| | `characters` | 18 of the game's characters | The **F2** menu's characters: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 24). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
+| | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's). Force fields and phase cloaks always take 60 |
+| | `characters` | every character loaded | The **F2** menu's characters, when you want your own list instead of every character in the game and your mods: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 96). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
 | | `name` | Player | Your name in multiplayer games. You can also change it in the **F2** menu, which saves it here |
 | `[reports]` | `send` | 1 | 0: never send problem reports (see "Problem reports" under Troubleshooting) |
 | `[chat]` | `fade` | 10 | Seconds a chat message stays on screen while the chat is closed; 0: they stay |
+| `[photo]` | `speed` | 100 | Photo mode's flight speed in hundredths (100 = 1.00 times, 160 units a second), 10–2000 (the panel saves it) |
+| | `stop_at_walls`, `pause_sounds` | 1 | Photo mode's panel toggles (it saves them) |
+| | `show_hud`, `hide_player`, `thirds_grid`, `cinema_bars` | 0 | The same |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 
@@ -108,6 +123,8 @@ Environment variables, for testing (set them before starting `Oni.exe`):
 | `ARKLITE_JOIN=<ip>[:port]` | Joins the host at that address |
 | `ARKLITE_LOG=<file>` | Names the log: `AE/logs/<name>_<date>_<time>.log` (with `ARKLITE_JOIN` the default name is `Arklite-join.log`). Give each extra Oni on one PC its own, e.g. `Arklite-join3.log` |
 | `ARKLITE_FLARE_DEPTH=0` | Lens flares test their visibility as stock Oni does (one depth read each, which stalls NVIDIA cards), for comparing |
+| `ARKLITE_DECOR_FIX=0` | Decorative particles that only look draw from the game tick's shared effects random numbers again, as before 0.5.0 (two PCs whose particle quality differs then desync at once), for comparing |
+| `ARKLITE_MOTION_BLUR_FIX=0` | Motion blur afterimages draw with depth writes, as stock Oni does, for comparing |
 | `ARKLITE_BENCH=<seconds>` | Once a level has run for 5 seconds, times every frame for that long, logs the frame times and closes Oni. `tools/oni-bench.sh` runs it hands off in a private KWin |
 
 On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`, `Oni.exe`.
@@ -116,13 +133,14 @@ On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`,
 
 The button asks whether to start a **New** custom game or **Join** one through the network.
 
-**New** lists every level in `GameDataFolder/CustomLevels/` plus any installed level whose
+**New** lists every level in `GameDataFolder/CustomLevels/` (Arklite makes the folder at startup
+and whenever the list is read, if it's missing, so it's there before the first map) plus any installed level whose
 number isn't from the original game, with how many players it has room for (its Player-flagged
 characters, the spawn points); the ones that can be played in multiplayer are blue. **Play** plays it alone. **Host** opens the host settings (map,
-server name, port, max players; the last ones used are kept; anyone can spectate) and starts the level
+server name, port, max players, the mutators, the message of the day; the last ones used are kept; anyone can spectate) and starts the level
 as a network game others can join. A map needs two or more spawn points to be hosted; the list
-says so under it when the selected one hasn't. **Dedicate** (a server without a game window) isn't
-built yet. In the text fields, **Enter** or **Esc** confirms what you typed and leaves the field (Esc doesn't close the screen while you're in a field), and **Tab** goes to the next field. Text is selected as in Windows: **Shift** with the arrows, **Home** and **End** (and **Ctrl** for whole words), a double click selects a word, a triple click everything, **Ctrl+A** too.
+says so under it when the selected one hasn't. **Dedicate** starts the map as a dedicated server
+(see below). **Double-clicking** a map hosts it if it's blue (the host settings open) and plays it alone otherwise. In the text fields, **Enter** or **Esc** confirms what you typed and leaves the field (Esc doesn't close the screen while you're in a field), and **Tab** goes to the next field. Text is selected as in Windows: **Shift** with the arrows, **Home** and **End** (and **Ctrl** for whole words), a double click selects a word, a triple click everything, **Ctrl+A** too.
 
 **Join** lists your saved servers with their ping, name and players, and adds the games hosted on
 this PC or your local network by itself (those aren't saved unless you edit their address). Select one to see what it
@@ -195,6 +213,9 @@ Catwalk writes these next to the level, and Arklite reads them:
 A sky (ONSK) with a sixth texture draws it as a floor under the box. The game's own skies have
 five, so they look as before.
 
+On wide screens the box is drawn bigger, just enough that the camera's near clip never cuts
+its corners; at 4:3 it keeps the game's size. It looks the same at any size.
+
 **Kill camera**: on a multiplayer map, a level script's `cm_detach` doesn't move anyone's camera
 at once. It marks the player that `chr_is_player` was last asked about, so the script must ask
 first, as Level 3's vat does. That player's camera then stays where it is while they're dead, and
@@ -206,6 +227,99 @@ custom level ends (its "next level") isn't handled yet.
 
 For testing, `ARKLITE_AUTOSTART=<folder>` opens Custom Game and plays that folder as if
 clicked, and `ARKLITE_SAVEPOINT=<n>` (1–9) starts it at save point n.
+
+### Dedicated server
+
+A dedicated server runs the game for the players without playing in it: Oni's window is hidden,
+nothing is drawn, the sound is off, and a console takes your commands: a console window on
+Windows, your desktop's own terminal on Linux. Start one with **Dedicate** on the Host page, or
+without the menus:
+
+The installer puts `server.bat` and `server.sh` in `Oni/AE`, next to `Oni.exe`.
+
+- Windows: `server.bat <map folder> [port]` in `Oni\AE` (or set
+  `ARKLITE_DEDICATED=<map folder>[:port]` and start `Oni.exe -noswitch`).
+- Linux (Wine): `./server.sh <map folder> [port]` from `Oni/AE` (or with `ONI_AE_DIR` set).
+  `./server.sh --terminal <map folder>` uses the terminal you run it in as the console, for an
+  admin over SSH. Oni still opens its window and OpenGL when it starts, so it needs a display:
+  your desktop, or `xvfb-run` on a machine without one.
+
+The map is a folder in `GameDataFolder/CustomLevels`. The server name, max players and the limits
+are the Host page's last ones (`[host]` in Arklite.ini). A dedicated server takes up to 4 players,
+like any host. The map needs a spawn point for each, but the server's own (unused) one counts: the
+last player starts from Konoko's placement, so a 2-spawn map takes 2 players and a 3-spawn map 3. The players' screens leave the
+server out of their lists, and the match starts when enough of them are ready (F3), as usual.
+
+To play on the server's own PC, start the server first, then Oni as usual, and join it from the
+LAN list or at `127.0.0.1`. Daodan refuses to start a second Oni ("There is already an instance of
+the game running"): it looks for a window of class and title `ONI `, hidden or not. The server
+renames its hidden window to "Oni dedicated server", so it no longer counts. A server started with
+`server.bat`, `server.sh` or `ARKLITE_DEDICATED` also skips that check itself, so it starts even
+while a game is open; its log is `Arklite-server.log`.
+
+The console prints the time, the chat, players entering and leaving, and each match's start and
+result. Anything you type that isn't a command goes to every player as a green "Server: ..." line.
+**Up**/**Down** bring back earlier lines, **Esc** clears the line (Wine's and Windows' console).
+Closing the console window or pressing **Ctrl+C** is the same as `quit`.
+
+On Linux the console opens in your default terminal, not in a Wine window: the one
+`xdg-terminal-exec` names, else `$TERMINAL`, else your desktop's (KDE's setting, Konsole, GNOME's
+Console or Terminal, and so on). The server writes `Arklite-console.sh` and `Arklite-console.key`
+to `Oni/AE` and runs the script; the terminal talks to the server over this PC only
+(127.0.0.1, TCP, the game's port number), with the key from the file. The line you type stays
+under the output (Python's line editing, with history; without Python, bash's). Closing the last
+terminal closes the server. To open another one while it runs: `sh Arklite-console.sh` in
+`Oni/AE` (`--here` for the terminal you're in). If no terminal opens within 15 seconds, Wine's
+console window comes instead; `ARKLITE_SERVER_CONSOLE=wine` asks for that from the start.
+
+| Command | What it does |
+|---|---|
+| `help` | Lists the commands |
+| `say <text>` | A server message to every player (plain text does the same) |
+| `players` | Each player's number, name, state (playing, watching, joining, left), score, ping and address |
+| `status` | Map, warm-up or match (and the time left), players, limits, port |
+| `kick <player> [reason]` | Out for 5 minutes. The player is its number from `players`, or its name. They see "Kicked for 5 min: reason" |
+| `ban <player> [reason]` | Out until the server closes |
+| `bans` | Who is kicked or banned, numbered, with the address and the time left |
+| `unban [who]` | Lets them back in: the number from `bans`, the player's name, the address, or `all`. Nothing needed when only one is out. A player still waiting in the warm-up comes in by itself |
+| `start` | Starts the match now, from the warm-up |
+| `warmup` | Ends the match and goes back to a warm-up |
+| `timelimit <minutes>`, `scorelimit <points>` | From the next match (0: none; a negative score limit is reached by suicides) |
+| `maxplayers <n>` | 2 to 4 |
+| `name <server name>` | As the server list shows it |
+| `quit` | Says goodbye to the players and closes Oni |
+
+Kicks and bans go by IP address, so a restart doesn't get around them. Players already in the
+game from the same address (one router, or a provider's shared address) stay.
+`ARKLITE_SERVER_STDIO=1` reads the commands from standard input and writes to standard output
+(a pipe or a file) instead of a console window.
+
+## Photo mode
+
+F10 in a single-player level, cutscenes included, freezes the game and frees the camera. F10 again (or Esc) leaves, and everything goes back as it was: the camera (in whatever mode it was, a cutscene's included), the field of view, the HUD, the sounds. It refuses in network games (the lobby included), with a player 2 on a multiplayer map, and while `ARKLITE_RECORD` or `ARKLITE_REPLAY` is on; `AE/logs` says `photo: not in multiplayer` when F10 was refused.
+
+| Key | Free fly | Orbit |
+| --- | --- | --- |
+| Mouse | Look | Circle the character |
+| Movement keys (WASD) | Fly along the view | Closer / farther, circle left / right |
+| Jump / Crouch | Up / down | Raise / lower the point it circles |
+| Walk key or Ctrl | Slower (a quarter) | Slower |
+| Q / E | Tilt left / right | Tilt |
+| R | Level the horizon | Level |
+| Mouse wheel | Zoom (field of view, 2.5 degrees a notch; 0.5 with Walk or Ctrl) | Zoom |
+| F | Orbit the character nearest the middle of the screen | Back to free fly |
+| Left / right click | | Next / previous character |
+| Tab | Settings panel | Settings panel |
+
+The panel (Tab, Esc or Resume close it; the game stays frozen behind it and the field of view and tilt change as you type them):
+
+- **Camera**: Free fly or Orbit (and whom it orbits), Field of view in degrees (vertical, 5 to 120; Oni's is 45), Flight speed (0.10 to 20.00 times), Tilt in degrees, Stop at walls (the camera slides along walls as a spectator's does).
+- **Picture**: Show HUD (off: no HUD, crosshair, laser sight, subtitles or speaker portraits), Hide player, Thirds grid (left out of screenshots), Cinema bars (2.39:1), Pause sounds (the music plays on).
+- **Next Frame** runs one game tick (1/60 s) with no input from you. These ticks are real game time and aren't taken back when photo mode ends.
+- **Screenshot** closes the panel and saves the picture as F12 does, without the panel or the key hints. F12 works in photo mode too; the key hints shown for 6 seconds after F10 or the panel never end up in a screenshot.
+- **Reset Camera** puts the camera back where photo mode began. **Exit Photo** leaves photo mode.
+
+A cutscene's letterbox bars are hidden in photo mode (Cinema bars draws your own). The panel's toggles and the flight speed are kept in `[photo]`; the field of view and tilt start from the game's every time.
 
 ## Player 2
 
@@ -251,13 +365,17 @@ A game with player 2 is a **multiplayer game**, and in one:
   the one they were made from.
 - **Items respawn**: a weapon or power-up placed in the level comes back at its spot 30 seconds
   after someone takes it (`item_respawn`), with a spark and a zap sound. A level made in Catwalk
-  can set the time per item (its **RespawnTime** field); 0 means it never comes back.
+  can set the time per item (its **RespawnTime** field); 0 means it never comes back. Force
+  fields and phase cloaks always take 60 seconds (unless the level says never).
 
 On a **multiplayer map** (two or more IsPlayer characters, see below), also:
 
-- **F2 picks your character**: a menu over the running game shows a picture of every character
-  you can play. Pick one with the arrow keys or the mouse and choose it with Enter or a click
-  (F2 or Esc closes the menu). In the warm-up (and alone) you change at once, wherever you are,
+- **F2 picks your character**: a menu over the running game shows a portrait of every character
+  in the game and in your mods (Hanako, Naomi, Janice, BGI Sarai, RAYMAN, Dragon Unit...; mod
+  characters have their own **Mods** section), with a big picture of the one you're on beside
+  them. Pick one with the arrow keys or the mouse and choose it with Enter or a click on its
+  portrait or on the big picture (F2 or Esc closes the menu). If they don't all fit on screen,
+  the mouse wheel or the arrows scroll the list. In the warm-up (and alone) you change at once, wherever you are,
   keeping your health, weapons and items ("Playing as:" under the name). In a match you come
   back as that character at your next respawn ("Next respawn:"); only the character you chose
   in the warm-up, or before joining a match in progress, takes over at once as the match starts.
@@ -265,12 +383,21 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
   whatever the character, so a Thug is as tough as a Muro. Your player stands still while the menu is open. The list can be changed
   with `characters` in `[multiplayer]`.
 - **Variations**: most characters have other versions of themselves (Konoko's outfits, the
-  Strikers' colors, the thug gangs). Press Q/E (or Page Up/Down), or click the `<  2 / 7  >` line
-  under a character, to see them, then choose as usual.
+  Strikers' colors, the thug gangs). Press Q/E (or Page Up/Down), click the `<` `>` on the picked
+  portrait, or turn the mouse wheel over the big picture to see them (the big picture says
+  `3 / 9`), then choose as usual.
 - **Your name**: the F2 menu shows it in a text field under its title. Press Tab or click it, type a new one
   (up to 23 letters), and press Enter to keep it (Esc puts the old one back). It's saved, so
   you keep it next time. The score shows everyone's name, and when you look straight at
   another player, their name appears over their head.
+- **Phase cloak**: a player who picks up invisibility sees their own shimmer, but everyone else
+  sees nothing of them: no body, shadow or name, not even when they're hit. Only when they land a
+  blow does their shimmer flash up for a moment and fade.
+  Spectators (/spectate) see every cloaked player as Oni shows them, the fading body and the
+  shimmer, with their name. When the cloak wears off the character is back to normal: in stock
+  Oni it never fully ended, so motion blur (the ninja's dash afterimages) never came back.
+  A force field's shell and the Daodan glow don't give a cloaked player away either: the shell
+  isn't drawn for others and the glow stops until the cloak wears off.
 - **Free for all**: players can hit, shoot and throw each other, though they're all on Konoko's
   team. AI characters keep their usual teams.
 - **Damage is x1.25**: every hit on a character does a quarter more (rounded).

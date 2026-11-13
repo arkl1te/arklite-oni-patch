@@ -90,6 +90,81 @@ static void sky_bottom_install(void)
 	log_msg("sky bottom: sixth face on");
 }
 
+/* A sky that reaches the corners of a wide screen.
+ *
+ * The box is ±5 around the camera, and the near plane is 2, but the clip that cuts the near side
+ * (0x418100, clip code 0x20) tests clip z < 0 while the projection (0x41aeb0) is OpenGL's, whose
+ * z runs from -w to w: z = 0 lies at the depth 2nf / (n + f), about 4. Whatever of the box is
+ * closer than that is cut away and shows black. Near that depth the view reaches as far as
+ * 4 * sqrt(1 + tan²(h/2) + tan²(v/2)) from the camera: 4.86 at 4:3, inside the box, but 5.24 at
+ * 16:9 and 5.87 at 21:9, so the bottom and side corners of the box went black when facing them.
+ *
+ * The draw now sizes the box to clear that depth with the camera it is about to use. A box
+ * around the camera looks the same at any size (same directions, same perspective-correct UVs),
+ * so only the cut changes. It never gets smaller than the game's 5, so at 4:3 nothing changes,
+ * and it stays inside the far plane. Fog goes by the same projected z; at 21:9 the farthest
+ * corner reaches z 0.62, below the lowest fog start any level sets (0.8). */
+#define SkyDrawEntry      0x412fc0   /* sub esp, 0x1d0; push esi; mov esi, ecx: ecx is the skybox */
+#define M3gGeomContext    (*(u8 **)0x560a28)   /* +0x58: the camera the draw transforms with */
+#define SkyCubePoints     0x7c       /* M3tSkyboxData: 8 corners, x y z each */
+#define SkySize           5.0f       /* the create method's sky_distance */
+
+static float sky_sqrt(float x) { float r; __asm__("fsqrt" : "=t"(r) : "0"(x)); return r; }
+static float sky_tan(float x) { float r; __asm__("fptan\n\tfstp %%st(0)" : "=t"(r) : "0"(x)); return r; }
+
+static void __cdecl sky_fit(u8 *sky)
+{
+	u8 *cam = M3gGeomContext ? *(u8 **)(M3gGeomContext + 0x58) : 0;
+	float size = SkySize;
+
+	if (!sky) return;
+	if (cam) {
+		float fovy = *(float *)(cam + 0x38), aspect = *(float *)(cam + 0x3c);
+		float n = *(float *)(cam + 0x40), f = *(float *)(cam + 0x44);
+		if (fovy > 0.0f && fovy < 3.1f && aspect > 0.0f && n > 0.0f && f > n) {
+			float cut = 2.0f * n * f / (n + f);   /* depth of clip z = 0 */
+			float tv = sky_tan(fovy * 0.5f), th = tv * aspect;
+			float need = cut * sky_sqrt(1.0f + th * th + tv * tv) * 1.02f;
+			float most = f * 0.9f / 1.7320508f;   /* the far corners stay inside the far plane */
+			if (need > size) size = need;
+			if (size > most && most >= SkySize) size = most;
+		}
+	}
+	for (int i = 0; i < 8 * 3; i++) {
+		float *c = (float *)(sky + SkyCubePoints) + i;
+		*c = *c < 0.0f ? -size : size;
+	}
+}
+
+__attribute__((naked)) static void sky_draw_entry(void)
+{
+	__asm__ volatile(
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"pushl %%ecx\n\t"
+		"call %c0\n\t"
+		"addl $4, %%esp\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
+		"subl $0x1d0, %%esp\n\t"   /* the instruction the jump replaced */
+		"pushl $0x412fc6\n\t"
+		"ret\n" :: "i"(sky_fit));
+}
+
+static void sky_fit_install(void)
+{
+	static const u8 entry[] = {0x81, 0xec, 0xd0, 0x01, 0x00, 0x00, 0x56, 0x8b, 0xf1};
+	u8 jump[6] = {0xe9, 0, 0, 0, 0, 0x90};
+
+	if (!code_matches(SkyDrawEntry, entry, sizeof entry)) {
+		log_msg("sky size: unexpected code at 0x412fc0, left alone");
+		return;
+	}
+	*(u32 *)(jump + 1) = (u32)sky_draw_entry - (SkyDrawEntry + 5);
+	patch_write(SkyDrawEntry, jump, sizeof jump);
+	log_msg("sky size: fits wide screens");
+}
+
 void texture_clamp_install(void)
 {
 	int s = patch_push_imm32(GLcTexture_WrapSPush, GL_CLAMP, GL_CLAMP_TO_EDGE);
@@ -99,4 +174,5 @@ void texture_clamp_install(void)
 		log_msg("texture clamp: clamp to edge (no skybox seams)");
 	texture_buffer_install();
 	sky_bottom_install();
+	sky_fit_install();
 }

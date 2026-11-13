@@ -25,13 +25,15 @@
  *     desktop's paint handler draws a partspec background with the call at 0x476f0c (to
  *     0x4698b0, alpha 0xff). We route that call through a function that sets the alpha from
  *     the setting when the partspec is InGameBackground, so the paused game shows through.
- *   - HUD scale (hud_scale.c, set in Options > More...).
+ *   - HUD scale and HUD Centering (hud_scale.c, set in Options > More...): the rings from the
+ *     corners to side by side in the middle, the multiplayer corner text with them.
  *   - Sound, Music and Voice volume (volume.c): Options > Overall Volume becomes three sliders.
  *   - No dream-lab classes in random costumes (random_class.c): AE's shared level0 put the
  *     half-size striker_dream_lab in every level's striker_easy random pool.
  *   - No skybox seams (texture_clamp.c): clamped textures use GL_CLAMP_TO_EDGE, not GL_CLAMP,
  *     whose black border lined every edge of the skybox cube. Textures can be 1024x1024: the
- *     upload's conversion buffer stopped at 256x256.
+ *     upload's conversion buffer stopped at 256x256. On wide screens the sky box grows enough
+ *     that the near clip (really at depth ~4, not 2) no longer cuts black wedges from its corners.
  *   - Levels can add particle classes (particle_table.c): stock Oni never set up any class but
  *     level 0's, and its lookups ran off the sorted table's end, so such a level crashed loading.
  *   - 255 characters, all active at once (char_limit.c): the stock 64 active slots crash the
@@ -53,7 +55,9 @@
  *   - Anonymous problem reports (report.c): a desync's, a dropped player's or a crash's log and dumps to
  *     the Arklite helper, without addresses, names, chat or absolute paths ([reports] send=0: off).
  *   - Lens flares without stalls (flare_depth.c): on NVIDIA every flare read the depth buffer on its
- *     own, waiting for the GPU each time (Muro's combo: 170 FPS to 15); now one read a frame. */
+ *     own, waiting for the GPU each time (Muro's combo: 170 FPS to 15); now one read a frame.
+ *   - Photo mode (photo.c): F10 in single player stops the game, frees the camera (free fly or
+ *     orbiting a character) and opens a settings panel on Tab; leaving puts everything back. */
 
 #include "arklite.h"
 
@@ -94,14 +98,12 @@ static void __stdcall main_menu_music_fade(float volume, float seconds)
 	SSrMusic_Fade(volume, seconds);
 }
 
-static void main_menu_stop_channels(void)
+void sound_pause_channels(int keep_music)
 {
 	u8 *pools[2] = { SSgChannels1, SSgChannels2 };
 	u32 counts[2] = { SSgChannelCount1, SSgChannelCount2 };
 
-	if (live_menu_open()) return;   /* the game goes on, and so do its sounds */
-	/* title screen, or the level's music isn't kept: as before */
-	if (!ONrLevel_GetCurrent() || pause_music_mode() != PAUSE_MUSIC_KEEP) {
+	if (!keep_music) {
 		SSrChannels_StopAll();
 		return;
 	}
@@ -116,6 +118,13 @@ static void main_menu_stop_channels(void)
 		}
 	}
 	SSrUnlock(SSgLock);
+}
+
+static void main_menu_stop_channels(void)
+{
+	if (live_menu_open()) return;   /* the game goes on, and so do its sounds */
+	/* title screen, or the level's music isn't kept: all of them, as before */
+	sound_pause_channels(ONrLevel_GetCurrent() && pause_music_mode() == PAUSE_MUSIC_KEEP);
 }
 
 static void __fastcall desktop_draw_background(void *context, void *partspec, u32 flags,
@@ -141,11 +150,12 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	if (reason != 1) return 1;   /* DLL_PROCESS_ATTACH */
 
 	{
-		/* a second Oni on this PC (ARKLITE_JOIN) can't share the first one's log */
+		/* a second Oni on this PC (ARKLITE_JOIN, a dedicated server) gets a log of its own name */
 		char log_name[MAX_PATH], v[4];
 		if (!GetEnvironmentVariableA("ARKLITE_LOG", log_name, sizeof log_name) ||
 		    str_len(log_name) >= sizeof log_name)
 			str_cpy(log_name, sizeof log_name,
+			        GetEnvironmentVariableA("ARKLITE_DEDICATED", v, sizeof v) ? "Arklite-server.log" :
 			        GetEnvironmentVariableA("ARKLITE_JOIN", v, sizeof v) ? "Arklite-join.log" : "Arklite.log");
 		log_open(log_name);
 	}
@@ -173,6 +183,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	obituary_install();
 	regen_install();
 	level0_swap_install();
+	server_install();
 	net_install();
 	mp_hud_install();
 	lockstep_install();
@@ -181,10 +192,14 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	char_menu_install();
 	mp_names_install();
 	chat_install();
+	text_install();
 	mp_board_install();
 	menu_wheel_install();
 	screenshot_install();
 	flare_depth_install();
+	invis_install();
+	motion_blur_install();
+	photo_install();
 	report_install(instance);
 	return 1;
 }

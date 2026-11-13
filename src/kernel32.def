@@ -51,4 +51,22 @@ EXPORTS
   GetThreadContext@8
   GetLocalTime@4
   TerminateProcess@8
+  AllocConsole@0
+  GetStdHandle@4
+  WriteConsoleA@20
+  WriteConsoleW@20
+  ReadConsoleInputW@16
+  GetUserDefaultUILanguage@0
+  SetConsoleTitleA@4
+  SetConsoleCtrlHandler@8
+  GetFileType@4
+  ReadConsoleInputA@16
+  SetConsoleMode@8
+  GetConsoleScreenBufferInfo@8
+  InitializeCriticalSection@4
+  EnterCriticalSection@4
+  LeaveCriticalSection@4
+  GetCurrentDirectoryA@8
+  CreateProcessA@40
+  MultiByteToWideChar@24
   HeapCreate@12

@@ -6,10 +6,11 @@
  * F2 menu saves it there, so it's kept for the next game. In a network game each PC sends its
  * own player's name to the other (net.c, a NAME packet every second and at once on a change);
  * names are only shown, never part of the game state, so they can't desync anything. A name is
- * at most 23 characters of plain ASCII (what Oni's fonts draw).
+ * at most 23 bytes: ASCII, and two for each character beyond it (text.c: Spanish, Russian,
+ * Japanese, Chinese...); Arklite.ini keeps those as \uXXXX (ini_text_write).
  *
  * Typing: while the name is being edited, Oni's window gets our window procedure in front of its
- * own (SetWindowLongA GWL_WNDPROC, installed the first time and then left in place; it passes
+ * own (SetWindowLongW GWL_WNDPROC, a Unicode one: text.c; installed the first time and then left in place; it passes
  * everything on when nothing is being typed), which takes WM_CHAR: letters, Backspace, Enter
  * (keep) and Esc (put the old name back). Key down and up still reach Oni; this PC's player gets
  * no game input while the F2 menu is up anyway.
@@ -26,7 +27,8 @@
  * cleared by 0x41aab0), so a wall the camera shows through doesn't hide a name. The name is
  * drawn over the head, and NAME_HOLD_MS after the player leaves the zone, so it doesn't flicker. The camera is Motoko's, *0x631004: +0x08
  * position, +0x14 view direction, +0x20 up, +0x38 vertical field of view (radians), +0x3c
- * aspect (0x41b4a0 and 0x41b3b0 read and set them).
+ * aspect (0x41b4a0 and 0x41b3b0 read and set them). A cloaked player (invis.c invis_hidden)
+ * gets neither the name nor what they said over the head, hit flashes included.
  *
  * Chat (chat.c): what another player said shows over their head for SAY_MS, above their name
  * (drawn then too, faced or not), wherever they are on screen within SAY_RANGE with no wall in
@@ -38,6 +40,8 @@
  * of pixels at a time with the solid one, the edge pixel of each row at the share of it the
  * circle covers, so they're smooth and no pixel is covered twice. */
 #include "arklite.h"
+
+void *memcpy(void *, const void *, unsigned);
 
 
 #define ONgGameState        (*(u8 **)0x5ece7c)
@@ -75,8 +79,8 @@
 #define WM_CHAR             0x102
 
 typedef long (WINAPI *WNDPROC)(void *, u32, u32, long);
-__declspec(dllimport) long WINAPI SetWindowLongA(void *, int, long);
-__declspec(dllimport) long WINAPI CallWindowProcA(WNDPROC, void *, u32, u32, long);
+__declspec(dllimport) long WINAPI SetWindowLongW(void *, int, long);
+__declspec(dllimport) long WINAPI CallWindowProcW(WNDPROC, void *, u32, u32, long);
 __declspec(dllimport) void * WINAPI GetForegroundWindow(void);
 __declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
 __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
@@ -102,13 +106,13 @@ static int same(const char *a, const char *b)
 	return *a == *b;
 }
 
-/* Plain ASCII, no leading or trailing spaces, at most MP_NAME_MAX - 1; fallback if empty */
+/* Printable ASCII and whole characters beyond it (text.c), no leading or trailing spaces, at most
+ * MP_NAME_MAX - 1 bytes; fallback if empty */
 static void clean(char *d, const char *s, const char *fallback)
 {
-	unsigned n = 0;
+	int n;
 	while (*s == ' ') s++;
-	for (; *s && n < MP_NAME_MAX - 1; s++)
-		if (*s >= 0x20 && *s < 0x7f) d[n++] = *s;
+	n = text_clean(d, MP_NAME_MAX, s);
 	while (n && d[n - 1] == ' ') n--;
 	d[n] = 0;
 	if (!n) str_cpy(d, MP_NAME_MAX, fallback);
@@ -142,18 +146,21 @@ const char *mp_name(int who)
 
 /* ---- Typing ------------------------------------------------------------------------------- */
 
+/* A character (Unicode: the window procedure is a W one) */
 static void edit_char(u32 c)
 {
 	unsigned n = str_len(g_edit);
+	char b[2];
+	int k;
 	if (c == 8) {
-		if (n) g_edit[n - 1] = 0;
+		if (n) g_edit[text_prev(g_edit, (int)n)] = 0;
 	} else if (c == 13) {
 		mp_name_edit_end(1);
 	} else if (c == 27) {
 		mp_name_edit_end(0);
-	} else if (c >= 0x20 && c < 0x7f && n < MP_NAME_MAX - 1 && (n || c != ' ')) {
-		g_edit[n] = (char)c;
-		g_edit[n + 1] = 0;
+	} else if (c >= 0x20 && c != 0x7f && (n || c != ' ') && (k = text_put(b, c)) && n + (unsigned)k < MP_NAME_MAX) {
+		memcpy(g_edit + n, b, (unsigned)k);
+		g_edit[n + (unsigned)k] = 0;
 	}
 }
 
@@ -163,7 +170,7 @@ static long WINAPI window_proc(void *hwnd, u32 msg, u32 wp, long lp)
 		edit_char(wp);
 		return 0;
 	}
-	return CallWindowProcA(g_old_proc, hwnd, msg, wp, lp);
+	return CallWindowProcW(g_old_proc, hwnd, msg, wp, lp);
 }
 
 int mp_name_editing(void) { return g_editing; }
@@ -177,7 +184,7 @@ void mp_name_edit_begin(void)
 		if (w) GetWindowThreadProcessId(w, &pid);
 		if (!w || pid != GetCurrentProcessId()) return;
 		g_hwnd = w;
-		g_old_proc = (WNDPROC)SetWindowLongA(w, GWL_WNDPROC, (long)window_proc);
+		g_old_proc = (WNDPROC)SetWindowLongW(w, GWL_WNDPROC, (long)window_proc);
 		if (!g_old_proc) {
 			log_msg("names: can't read the keyboard (no window procedure)");
 			return;
@@ -198,7 +205,7 @@ int mp_name_change(const char *name)
 	clean(g_name, name, before);
 	if (same(g_name, before)) return 0;
 	g_serial++;
-	WritePrivateProfileStringA("multiplayer", "name", g_name, ini_path());
+	ini_text_write("multiplayer", "name", g_name);
 	log_msg("names: this PC's player is now %s (saved in Arklite.ini)", g_name);
 	net_name_changed(before, g_name);
 	return 1;
@@ -249,6 +256,7 @@ static int norm(float *v)
 static int other_player(u8 *c, u8 *me)
 {
 	if (!c || c == me || !(CHR_FLAGS(c) & CHR_INUSE) || (CHR_FLAGS(c) & CHR_DEAD)) return -1;
+	if (invis_hidden(c)) return -1;   /* cloaked: no name, nothing said over the head */
 	for (int who = 0; who < PLAYERS_MAX; who++)
 		if (c == players_char(who)) return who;
 	return -1;
@@ -329,7 +337,7 @@ static int say_lines(const char *text, char lines[SAY_LINES][CHAT_MAX + 4], int 
 			for (;;) {
 				lines[l][m] = '.'; lines[l][m + 1] = '.'; lines[l][m + 2] = '.'; lines[l][m + 3] = 0;
 				if (!m || mp_hud_text_width(lines[l], -1) <= max_w) break;
-				m--;
+				m = text_prev(lines[l], m);
 				while (m && lines[l][m - 1] == ' ') m--;
 			}
 		}
@@ -349,7 +357,7 @@ static void draw_say(const char *text, int x, int y)
 		int lw = mp_hud_text_width(lines[l], -1);
 		if (lw > w) w = lw;
 	}
-	int step = lh + 2, pad_y = lh / 3, h = n * step - 2 + 2 * pad_y, r = h / 2;
+	int gap = mp_hud_px(2), step = lh + gap, pad_y = lh / 3, h = n * step - gap + 2 * pad_y, r = h / 2;
 	int bottom = y - lh / 2, top = bottom - h;   /* half a line between it and the name */
 	int mid_w = w + lh - 2 * r > 0 ? w + lh - 2 * r : 0;   /* the text and a little room fit between the ends' centers */
 	int left = x - mid_w / 2 - r;
@@ -427,9 +435,9 @@ void mp_names_draw(int width, int height)
 void mp_names_install(void)
 {
 	char s[64];
-	GetPrivateProfileStringA("multiplayer", "name", "Player", s, sizeof s, ini_path());
+	ini_text("multiplayer", "name", "Player", s, sizeof s);
 	clean(g_name, s, "Player");
-	GetPrivateProfileStringA("players", "p2_name", "Player 2", s, sizeof s, ini_path());
+	ini_text("players", "p2_name", "Player 2", s, sizeof s);
 	clean(g_p2_name, s, "Player 2");
 	log_msg("names: this PC's player is %s", g_name);
 }

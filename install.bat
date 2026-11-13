@@ -9,6 +9,7 @@ rem   AE\Arklite.dll    the mod
 rem   AE\realbink.dll   Arklite's loader (Daodan loads this name). The zip carries it as arklite_loader.dll,
 rem                     so extracting the zip into AE can't overwrite AE's own realbink.dll (Bink).
 rem   AE\bink_orig.dll  AE's original realbink.dll (Bink), renamed; the loader forwards to it
+rem   AE\server.bat     starts a dedicated server (server.sh: the same under Wine)
 setlocal EnableExtensions
 set "HERE=%~dp0"
 set "ONI_SHA256=363cf09684ca6b729b62f22f90701d7ebf9a33778e55b191f5040bccdcdd013d"
@@ -56,6 +57,8 @@ set "SAME="
 for %%A in ("%AE%") do for %%H in ("%HERE%.") do if /i "%%~fA"=="%%~fH" set "SAME=1"
 if not defined SAME copy /y "%HERE%Arklite.dll" "%AE%\Arklite.dll" >nul || goto denied
 copy /y "%HERE%arklite_loader.dll" "%AE%\realbink.dll" >nul || goto denied
+rem The dedicated server's scripts, next to Oni.exe where they run (zips of 0.4.1 and older have none).
+if not defined SAME for %%S in (server.bat server.sh) do if exist "%HERE%%%S" copy /y "%HERE%%%S" "%AE%\%%S" >nul || goto denied
 if not exist "%AE%\GameDataFolder\CustomLevels" mkdir "%AE%\GameDataFolder\CustomLevels"
 echo Arklite installed into "%AE%".
 echo Start Oni as usual; the newest log in AE\logs lists what was patched.

@@ -154,7 +154,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    NET_DEFAULT_PORT
-#define PROTO           19
+#define PROTO           22
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -242,9 +242,9 @@ __declspec(dllimport) int  WINAPI RemoveDirectoryA(const char *);
 __declspec(dllimport) int  WINAPI DeleteFileA(const char *);
 __declspec(dllimport) u32  WINAPI SetFilePointer(HANDLE, int, int *, u32);
 __declspec(dllimport) void WINAPI Sleep(u32);
-__declspec(dllimport) int  WINAPI PeekMessageA(void *, void *, u32, u32, u32);
+__declspec(dllimport) int  WINAPI PeekMessageW(void *, void *, u32, u32, u32);
 __declspec(dllimport) int  WINAPI TranslateMessage(const void *);
-__declspec(dllimport) int  WINAPI DispatchMessageA(const void *);
+__declspec(dllimport) int  WINAPI DispatchMessageW(const void *);
 __declspec(dllimport) void WINAPI PostQuitMessage(int);
 __declspec(dllimport) int  WINAPI setsockopt(u32, int, int, const void *, int);
 __declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(void *), void *, u32, u32 *);
@@ -265,7 +265,7 @@ enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY, PKT_NAME,
        PKT_CHAT, PKT_CHAT_ACK, PKT_END, PKT_NAMES, PKT_HIST_REQ, PKT_HIST, PKT_COOKIE,
        PKT_L0_REQ, PKT_L0_DATA };
 
-#define NPL             NET_PLAYERS_MAX
+#define NPL             NET_SLOTS
 
 /* key (protocol 19): the receiver's address proves the packet is from the PC playing there. The
  * host gives each address its cookie (cookie_of: a keyed hash of IP and port, with a secret made
@@ -313,6 +313,9 @@ typedef struct {
 	 * loads the level as every PC did (load_players, seed/local_seed), runs from run_seed with the
 	 * session's inputs (PKT_HIST) and comes in once it caught up. session, warm and slot as for go. */
 	u32 catchup, load_players, run_seed, run_local_seed, start_tick, start_hash;
+	u32 dedicated;         /* the host is a dedicated server (protocol 20): its player never plays (players.c) */
+	u32 char_rules;        /* the host's mutators, NET_CHARS_* and NET_MUT_* (protocol 21; char_menu.c, mp_rules.c) */
+	char note[64];         /* with refused NETBAD_KICKED: why, and for how long */
 } PktLobby;
 typedef struct {
 	PktHead h;
@@ -383,6 +386,12 @@ typedef struct {
 	char name[NET_SERVER_NAME_MAX];   /* the server's, Host dialog */
 	char folder[64];       /* the map's folder in CustomLevels, "" for a numbered level */
 	char map[48];          /* the map's name */
+	/* what a player downloads to join (protocol 21, the Join page's Current mods and Total download) */
+	u32 l0[2];             /* the host's level0 pair (hash_file) */
+	u32 l0_bytes;          /* a new player's level0 download (net_join_level0_bytes), or NET_INFO_MEASURING / _UNKNOWN */
+	u32 map_hash, map_bytes, map_ok;   /* a custom map's folder (hash_map), its bytes; map_ok 0: it can't be sent */
+	u32 nmods;             /* the host's installed AE mods (all of them; the first NET_INFO_MODS below) */
+	u32 mods[NET_INFO_MODS][2];   /* package number, its package's bytes on disk */
 } PktInfo;
 
 /* Joining a session in progress: the session's inputs from its first tick. The joiner asks for
@@ -583,6 +592,20 @@ static u32 g_fixing_since, g_fixing_last;   /* host: refusals the joiner may fix
 /* The match's limits: the host's from Arklite.ini [host] (the Host dialog), the joiner's from LOBBY */
 static u32 g_time_limit = 10;          /* minutes, 0: none */
 static int g_score_limit = 20;         /* 0: none */
+/* The Host dialog's character checkboxes (NET_CHARS_*): every PC applies the host's, from LOBBY,
+ * before any level of a session loads, so a choice of a character left out is the map's class on
+ * every PC alike (players.c, char_menu_class_allowed) */
+static u32 g_char_rules = NET_CHARS_ALL;
+/* host: the message of the day (Arklite.ini [host] motd, the Host page), a server line to each
+ * player who enters, after "Name entered the game"; "": none */
+static char g_motd[NET_MOTD_MAX];
+static void clean_text(char *s, u32 size);
+
+static void motd_load(void)
+{
+	ini_text("host", "motd", "", g_motd, sizeof g_motd);
+	clean_text(g_motd, sizeof g_motd);
+}
 static int g_peer_ping[NPL];           /* joiner: each player's round trip to the host, as the host said */
 /* After the match (S_OVER) */
 static u32 g_over_at;
@@ -599,6 +622,32 @@ static char g_server_name[NET_SERVER_NAME_MAX] = "New Oni multiplayer game";
 static u32 g_max_players = NET_PLAYERS_MAX;
 static u32 g_server_id;
 static int g_startup_mode;             /* set by the environment or Arklite.ini [net], not the menu */
+/* Dedicated server (server.c; "Dedicated server" below): the host's player always watches and
+ * isn't one of the players; joiners learn it from LOBBY */
+static int g_dedicated;                /* host: this is a dedicated server */
+static int g_ded_host;                 /* joiner: the host said it's one */
+static const char *g_lobby_note;       /* the next send_lobby_addr's note (a kick's) */
+static char g_kick_note[64];           /* joiner: the server removed this PC: why ("" no) */
+/* host: addresses its admin removed (kick: for some minutes, ban: until the server closes) */
+#define BANS 16
+static struct { u32 addr, until; int on; char note[64], name[MP_NAME_MAX]; } g_ban[BANS];   /* until: GetTickCount, 0: no end */
+
+static const char *ban_note(u32 addr)
+{
+	u32 now = GetTickCount();
+	for (int i = 0; i < BANS; i++) {
+		if (!g_ban[i].on || g_ban[i].addr != addr) continue;
+		if (g_ban[i].until && (int)(now - g_ban[i].until) >= 0) {
+			g_ban[i].on = 0;
+			continue;
+		}
+		return g_ban[i].note;
+	}
+	return 0;
+}
+
+const char *net_kick_note(void) { return g_kick_note; }
+u32 net_server_port(void) { return g_port; }   /* server.c's Linux console listens on it (TCP) */
 static int g_hashed, g_join_installed;
 
 /* ---- Players and links ---------------------------------------------------------------------- */
@@ -664,9 +713,10 @@ static u32 present_mask(void)
 static u32 capacity(void)
 {
 	int spawns = players_spawn_points();
-	u32 n = g_max_players;
+	u32 n = g_max_players, ded = g_dedicated && g_mode == NET_HOST;
 	if (spawns >= 2 && (u32)spawns < n) n = (u32)spawns;
-	return n < 2 ? 2 : n > NPL ? NPL : n;
+	n += ded;   /* a dedicated server's own place (its player watches); the last player uses Konoko's placement */
+	return n < 2 + ded ? 2 + ded : n > NPL ? NPL : n;
 }
 
 /* The character this PC's player drives: a joiner's lobby has only player 2 (each PC plays
@@ -888,6 +938,7 @@ const char *net_problem_text(u32 bit)
 	case NETBAD_LEVEL0:     return "GameDataFolder\\level0_Final.dat or .raw";
 	case NETBAD_MAP:        return "the map's files (its CustomLevels folder)";
 	case NETBAD_PLAYERS:    return "Arklite.ini [players] p2 (0 turns multiplayer off)";
+	case NETBAD_KICKED:     return "the server removed this player";
 	}
 	return "?";
 }
@@ -895,6 +946,21 @@ const char *net_problem_text(u32 bit)
 static const char *mode_name(void) { return g_mode == NET_HOST ? "host" : "join"; }
 
 int net_active(void) { return g_mode != NET_OFF; }
+
+/* The characters players may pick changed (whose: for the log): the F2 menu shows them again */
+static void set_char_rules(u32 rules, const char *whose)
+{
+	if (rules == g_char_rules) return;
+	g_char_rules = rules;
+	log_msg("net: %s mutators %03x: Mutant Muro %s, Shinatama and Hasegawa %s, Mini Striker %s, Daodan %s, No Weapons %s, "
+	        "Fast Screamer %s, Fast Plasma %s, Fast Ball %s, Bombs For Days %s", whose, rules,
+	        rules & NET_CHARS_MUTANT_MURO ? "on" : "off", rules & NET_CHARS_SHINATAMA ? "on" : "off",
+	        rules & NET_CHARS_MINI_STRIKER ? "on" : "off", rules & NET_MUT_DAODAN ? "on" : "off",
+	        rules & NET_MUT_NO_WEAPONS ? "on" : "off", rules & NET_MUT_FAST_SCREAMER ? "on" : "off",
+	        rules & NET_MUT_FAST_PLASMA ? "on" : "off", rules & NET_MUT_FAST_BALL ? "on" : "off",
+	        rules & NET_MUT_BOMBS ? "on" : "off");
+	char_menu_rules_changed();
+}
 
 /* report.c: the session's ID ("none" outside one) and this PC's player slot (-1 off the network) */
 const char *net_session_id(void) { return g_session[0] ? g_session : "none"; }
@@ -1621,11 +1687,15 @@ const char *net_punch(const char *address)
 
 int net_my_address(char *out) { return stun_text(out); }
 
-/* Text another PC sent (a name, a chat line): no control characters */
+/* Text another PC sent (a name, a chat line): no control characters, and only whole characters
+ * beyond ASCII (text.c: a broken one could make Oni's text drawing read past the end) */
 static void clean_text(char *s, u32 size)
 {
+	if (!size) return;
+	s[size - 1] = 0;
 	for (u32 i = 0; i < size && s[i]; i++)
 		if ((u8)s[i] < 0x20 || s[i] == 0x7f) s[i] = ' ';
+	text_clean(s, size, s);
 }
 
 /* ---- Sending and receiving ---------------------------------------------------------------- */
@@ -1711,6 +1781,7 @@ static u32 lobby_players(void)
  * doesn't have the slot yet */
 static int watches(int p)
 {
+	if (p == 0 && g_dedicated && g_mode == NET_HOST) return 1;   /* the dedicated server's own: never plays */
 	if (g_state == S_LOBBY || p >= (int)g_nplayers) return 0;
 	if (p > 0 && (g_link[p].waiting || g_link[p].rejoin)) return 0;
 	return players_spectating(p);
@@ -1771,6 +1842,9 @@ static void send_lobby_addr(const SOCKADDR_IN *to, int slot, int go, u32 refused
 	p.session = g_go_session;
 	p.warm = g_warm;
 	p.in_match = g_state != S_LOBBY && !g_warm;
+	p.dedicated = g_dedicated;
+	p.char_rules = g_char_rules;
+	if ((refused & NETBAD_KICKED) && g_lobby_note) str_cpy(p.note, sizeof p.note, g_lobby_note);
 	if (go) p.players = g_nplayers;
 	if (!go && !refused && slot > 0 && g_link[slot].joining && g_state == S_RUN) {   /* in now, as the session goes on */
 		p.catchup = 1;
@@ -1785,7 +1859,13 @@ static void send_lobby_addr(const SOCKADDR_IN *to, int slot, int go, u32 refused
 	if (slot > 0) g_link[slot].last_lobby = now;
 }
 
-static void send_lobby(int l, int go) { send_lobby_addr(&g_link[l].addr, l, go, 0); }
+/* Not to a removed player's leftover place (gone, kept until the session ends): its PC would read
+ * the lobby as "let in" between the refusals its HELLOs get, and its "Can't join" line flashed */
+static void send_lobby(int l, int go)
+{
+	if (gone(l) && ban_note(g_link[l].addr.addr)) return;
+	send_lobby_addr(&g_link[l].addr, l, go, 0);
+}
 
 static void send_lobby_all(int go)
 {
@@ -2109,11 +2189,13 @@ static void refuse(const char *who, u32 bad, const Compat *c)
 	if (bad != g_problem || !g_problem_at || now - g_problem_at > LOST_MS) {
 		if (bad == NETBAD_FULL)
 			log_msg("net: %s", g_mode == NET_HOST ? "a player can't join: the server is full" : "the server is full");
+		else if (bad == NETBAD_KICKED)
+			log_msg("net: %s", g_mode == NET_HOST ? "a removed player was turned away" : g_kick_note[0] ? g_kick_note : "the server removed this PC");
 		else
 			log_msg("net: the %s's game isn't the same as this PC's, so they can't play together:", who);
 		if (c) check_files(who, c);
 		for (u32 bit = 1; bit <= NETBAD_LAST; bit <<= 1)
-			if ((bad & bit) && bit != NETBAD_FULL) log_msg("net:   differs: %s", net_problem_text(bit));
+			if ((bad & bit) && bit != NETBAD_FULL && bit != NETBAD_KICKED) log_msg("net:   differs: %s", net_problem_text(bit));
 	}
 	g_problem = bad;
 	g_problem_at = now ? now : 1;
@@ -2283,11 +2365,15 @@ static void on_input(int l, const PktInput *p, u32 size)
  * restarts: the lobby says the map differs, as before. Windows messages are handled meanwhile,
  * so the window doesn't hang. The host serves files only from the level it's on.
  * A joiner without the map's folder at all downloads it the same way from the menu, before the
- * level starts (net_map_fetch, from Join's Play), into CustomLevels\<folder>\. */
+ * level starts (net_map_fetch, from Join's Play), into CustomLevels\<folder>\.
+ * MAP_LIST names the host's folder. Every custom map is level 31 here, so a host on another map
+ * than the one asked about (restarted on it, or another Oni at its address) would have its files
+ * put in the wrong folder: they're taken only for the folder asked about, and the joiner gets
+ * the host's map in its own folder instead (map_fetch_into) and mounts that one. */
 #define MAP_PATH        112
 #define L0_SET          0x10000u     /* MAP_LIST_REQ / MAP_REQ "level" for the host's level0 pair (see "level0 download") */
 #define L0_SIG          0x10001u     /* ...for the pair's block lists (see "level0 sync") */
-#define MAP_LIST_PAGE   12
+#define MAP_LIST_PAGE   11           /* (with the folder name the list stays under the 1500-byte MTU) */
 #define MAP_MAX_FILES   512
 #define MAP_CHUNK       1400
 #define MAP_REQ_MAX     32           /* pieces per request */
@@ -2300,7 +2386,9 @@ static void on_input(int l, const PktInput *p, u32 size)
 
 typedef struct { char path[MAP_PATH]; u32 size, hash; } MapFile;
 typedef struct { PktHead h; u32 level, first; } PktMapListReq;
-typedef struct { PktHead h; u32 level, map, total, first, count; MapFile f[MAP_LIST_PAGE]; } PktMapList;
+/* folder: the host's map folder in CustomLevels ("" for level0's lists): the joiner takes the
+ * files only for the folder it asked about (see map_download_to) */
+typedef struct { PktHead h; u32 level, map, total, first, count; char folder[64]; MapFile f[MAP_LIST_PAGE]; } PktMapList;
 typedef struct { PktHead h; u32 level, file, chunk, count; } PktMapReq;
 typedef struct { PktHead h; u32 level, file, chunk, size; } PktMapData;   /* size bytes follow */
 
@@ -2521,36 +2609,46 @@ static struct {
 	u32 size[2], hash[2];
 } g_zs;
 
+/* The block list of the file at path, read through buf (1 MB); its size in *size and, when hash
+ * isn't 0, the file's hash_file in *hash. 0 when it can't be read */
+static u8 *zs_list_file(const char *path, u32 block, u8 *buf, u32 *size, u32 *hash)
+{
+	u32 got, total, k = 0, h = 0x811c9dc5u;
+	HANDLE f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 3, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+	ZsHead *z;
+
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	total = GetFileSize(f, 0);
+	*size = sizeof(ZsHead) + (total + block - 1) / block * 8;
+	if (!(z = VirtualAlloc(0, *size, 0x3000, 4))) { CloseHandle(f); return 0; }
+	z->magic = ZS_MAGIC;
+	z->block = block;
+	z->size = total;
+	z->nblocks = (total + block - 1) / block;
+	u32 *e = (u32 *)(z + 1);
+	while (ReadFile(f, buf, 1 << 20, &got, 0) && got) {   /* (1 MB holds whole blocks) */
+		if (hash) h = hash_words(h, buf, got);           /* (hash_file reads 1 MB at a time too) */
+		for (u32 off = 0; off < got && k < z->nblocks; off += block, k++) {
+			u32 n = got - off < block ? got - off : block, a, b;
+			zs_weak(buf + off, n, &a, &b);
+			e[2 * k] = (a & 0xffff) | b << 16;
+			e[2 * k + 1] = zs_strong(buf + off, n);
+		}
+	}
+	CloseHandle(f);
+	if (k != z->nblocks) { VirtualFree(z, 0, 0x8000); return 0; }
+	if (hash) *hash = h;
+	return (u8 *)z;
+}
+
 static u32 WINAPI zs_make(void *unused)
 {
 	u8 *buf = VirtualAlloc(0, 1 << 20, 0x3000, 4);
 	int ok = buf != 0;
 	for (int i = 0; i < 2 && ok; i++) {
 		char path[160];
-		u32 got, total, block = g_zs_block[i], k = 0;
-		HANDLE f;
-		ZsHead *z;
 		fmt(path, "%s\\%s", g_zs.dir, g_l0_names[i]);
-		f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 3, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
-		if (f == INVALID_HANDLE_VALUE) { ok = 0; break; }
-		total = GetFileSize(f, 0);
-		g_zs.size[i] = sizeof(ZsHead) + (total + block - 1) / block * 8;
-		g_zs.list[i] = VirtualAlloc(0, g_zs.size[i], 0x3000, 4);
-		if (!(z = (ZsHead *)g_zs.list[i])) { CloseHandle(f); ok = 0; break; }
-		z->magic = ZS_MAGIC;
-		z->block = block;
-		z->size = total;
-		z->nblocks = (total + block - 1) / block;
-		u32 *e = (u32 *)(z + 1);
-		while (ReadFile(f, buf, 1 << 20, &got, 0) && got)   /* (1 MB holds whole blocks) */
-			for (u32 off = 0; off < got && k < z->nblocks; off += block, k++) {
-				u32 n = got - off < block ? got - off : block, a, b;
-				zs_weak(buf + off, n, &a, &b);
-				e[2 * k] = (a & 0xffff) | b << 16;
-				e[2 * k + 1] = zs_strong(buf + off, n);
-			}
-		CloseHandle(f);
-		if (k != z->nblocks) { ok = 0; break; }
+		if (!(g_zs.list[i] = zs_list_file(path, g_zs_block[i], buf, &g_zs.size[i], 0))) { ok = 0; break; }
 		g_zs.hash[i] = hash_words(0x811c9dc5u, g_zs.list[i], g_zs.size[i]);   /* = hash_file of it */
 	}
 	if (buf) VirtualFree(buf, 0, 0x8000);
@@ -2670,6 +2768,7 @@ static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 		head(&p.h, PKT_MAP_LIST);
 		p.level = g_level;
 		p.map = g_map_hash;
+		str_cpy(p.folder, sizeof p.folder, custom_game_level_folder(g_level));
 		p.total = g_nserve;
 		p.first = q->first;
 		for (u32 i = q->first; i < g_nserve && p.count < MAP_LIST_PAGE; i++) p.f[p.count++] = g_serve[i];
@@ -2901,13 +3000,13 @@ static int dl_cancelled(void)
 	u32 pid = 0;
 	void *w;
 
-	while (PeekMessageA(&m, 0, 0, 0, 1 /* PM_REMOVE */)) {
+	while (PeekMessageW(&m, 0, 0, 0, 1 /* PM_REMOVE */)) {   /* W, as Oni's own loop now (text.c) */
 		if (m.msg == 0x12 /* WM_QUIT */) {
 			g_dl_quit = (int)m.wp | 0x10000;
 			return 1;
 		}
 		TranslateMessage(&m);
-		DispatchMessageA(&m);
+		DispatchMessageW(&m);
 	}
 	if (!(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) return 0;
 	w = GetForegroundWindow();
@@ -2999,6 +3098,16 @@ static void speed_text(char *out, u32 bps)
 }
 
 static const char *g_dl_why;            /* why the last download stopped */
+static char g_dl_host_folder[64];       /* ...when it was that the host is on another map: that map's folder */
+
+/* A folder name in CustomLevels the host gave: one name, nothing that leads out of CustomLevels */
+static int folder_name_ok(const char *folder)
+{
+	if (!safe_path(folder) || str_len(folder) >= 64) return 0;
+	for (const char *c = folder; *c; c++)
+		if (*c == '\\') return 0;
+	return 1;
+}
 
 /* Downloads the host's version of level's folder into dir (absolute, ends with '\\'; it may not
  * exist yet); 1 when it's in place */
@@ -3015,6 +3124,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	int ok = 0, cur = -1;
 
 	if (!g_link[0].used) return 0;
+	g_dl_host_folder[0] = 0;
 	theirs = VirtualAlloc(0, 2 * MAP_MAX_FILES * (sizeof(MapFile) + 1), 0x3000, 4);
 	if (!theirs) return 0;
 	mine = theirs + MAP_MAX_FILES;
@@ -3047,6 +3157,18 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 			const PktMapList *p = (const PktMapList *)buf;
 			if (p->h.type != PKT_MAP_LIST || n < sizeof *p || p->level != level || p->first != ntheirs ||
 			    p->count > MAP_LIST_PAGE || p->total > MAP_MAX_FILES || p->first + p->count > p->total) continue;
+			/* Every custom map is the same level number, so the list says whose files they are: a host
+			 * that's on another map now (it restarted on one, or another Oni answers at its address)
+			 * would otherwise put that map into this one's folder, and Custom Game would list two maps
+			 * of one name (the Windows joiner, 2026-11-12: PowerPlant in CustomLevels\Condemned) */
+			if (level < L0_SET && !str_ieq_n(p->folder, folder, sizeof p->folder)) {
+				char theirs_name[64];
+				str_cpy(theirs_name, sizeof theirs_name, p->folder);
+				if (folder_name_ok(theirs_name)) str_cpy(g_dl_host_folder, sizeof g_dl_host_folder, theirs_name);
+				log_msg("net: map download: the host is on its map \"%s\" now, not %s: nothing goes into %s", theirs_name, folder, dir);
+				why = "the host is on another map now";
+				goto done;
+			}
 			total = p->total;
 			their_map = p->map;
 			for (u32 i = 0; i < p->count; i++) {
@@ -3239,13 +3361,36 @@ done:
 	return ok;
 }
 
-/* The mounted level's folder, replaced by the host's version, mounted again */
+/* The host's map into CustomLevels\<folder> (made when it isn't there). When the host turns out
+ * to be on another map, that map's folder instead (only the files that differ, nothing when this
+ * PC has it already), and folder is then that one's name. A folder this made stays only with a
+ * map in it. */
+static int map_fetch_into(u32 level, char *folder, u32 size)
+{
+	char dir[MAX_PATH];
+
+	for (int pass = 0; pass < 2; pass++) {
+		if (!custom_game_folder_path(folder, dir, sizeof dir)) { g_dl_why = "the map's folder path is too long"; return 0; }
+		if (map_download_to(level, dir, folder)) return 1;
+		RemoveDirectoryA(dir);   /* (only an empty one: one made here that nothing came into) */
+		if (pass || !g_dl_host_folder[0]) return 0;
+		log_msg("net: the host is on %s now, not %s: getting that map instead", g_dl_host_folder, folder);
+		str_cpy(folder, size, g_dl_host_folder);
+	}
+	return 0;
+}
+
+/* The mounted level's folder, replaced by the host's version, mounted again; or the host's other
+ * map, when it's on another one now, mounted in its place */
 static int map_download(u32 level)
 {
-	const char *dir = custom_game_level_dir(level), *folder = custom_game_level_folder(level);
+	const char *folder = custom_game_level_folder(level);
+	char want[64];
 
-	if (!dir || !folder || !map_download_to(level, dir, folder)) return 0;
-	if (!custom_game_remount(level)) log_msg("net: map download: couldn't mount the new files");
+	if (!custom_game_level_dir(level) || !folder) return 0;
+	str_cpy(want, sizeof want, folder);
+	if (!map_fetch_into(level, want, sizeof want)) return 0;
+	if (!custom_game_mount_folder(level, want)) log_msg("net: map download: couldn't mount the new files");
 	g_map_hash = hash_map(level);
 	log_msg("net: map download: the map's files are now %08x", g_map_hash);
 	g_problem = 0;
@@ -3258,10 +3403,63 @@ static int map_download(u32 level)
 
 typedef struct { u32 off, len; } ZsPiece;
 
+/* The list's weak sums in a hash table for zs_scan (the short last block is always downloaded);
+ * have[] all 0. 0 when there's no memory (what was made is freed with zs_table_free) */
+static int zs_table(const ZsHead *z, const u32 *e, int **headt, int **next, u8 **have, u32 *mask)
+{
+	u32 m;
+
+	for (m = 1; m < z->nblocks && m < (1u << 20); m <<= 1) {}
+	*mask = --m;
+	*headt = VirtualAlloc(0, (m + 1) * 4, 0x3000, 4);
+	*next = VirtualAlloc(0, z->nblocks * 4, 0x3000, 4);
+	*have = VirtualAlloc(0, z->nblocks, 0x3000, 4);
+	if (!*headt || !*next || !*have) return 0;
+	memset(*headt, 0xff, (m + 1) * 4);
+	for (u32 k = 0; k < z->nblocks; k++) {
+		if ((k + 1) * z->block > z->size) { (*next)[k] = -1; continue; }
+		(*next)[k] = (*headt)[e[2 * k] & m];
+		(*headt)[e[2 * k] & m] = (int)k;
+	}
+	return 1;
+}
+
+static void zs_table_free(int **headt, int **next, u8 **have)
+{
+	if (*have) VirtualFree(*have, 0, 0x8000);
+	if (*next) VirtualFree(*next, 0, 0x8000);
+	if (*headt) VirtualFree(*headt, 0, 0x8000);
+	*have = 0;
+	*next = 0;
+	*headt = 0;
+}
+
+/* The blocks not in have[] as the ranges the joiner asks for (consecutive blocks joined up to
+ * MAP_CHUNK bytes), their bytes in *need. 0 when there would be more than ZS_PIECES_MAX: the
+ * full download it is */
+static int zs_pieces(const ZsHead *z, const u8 *have, ZsPiece *piece, u32 *npiece, u32 *need)
+{
+	*npiece = *need = 0;
+	for (u32 k = 0; k < z->nblocks; k++) {
+		if (have[k]) continue;
+		u32 off = k * z->block, end = off + z->block > z->size ? z->size : off + z->block, n = *npiece;
+		if (n && piece[n - 1].off + piece[n - 1].len == off && piece[n - 1].len + (end - off) <= MAP_CHUNK)
+			piece[n - 1].len += end - off;
+		else if (n < ZS_PIECES_MAX) {
+			piece[n].off = off;
+			piece[n].len = end - off;
+			(*npiece)++;
+		} else return 0;
+		*need += end - off;
+	}
+	return 1;
+}
+
 /* Rolls over one of this PC's files, copying every block of the host's list it has (any offset)
- * into out; have[] marks them. -1: cancelled */
+ * into out (INVALID_HANDLE_VALUE: only marks them); have[] marks them. -1: cancelled (asked
+ * every ZS_SCAN bytes) */
 static int zs_scan(const char *path, const ZsHead *z, const u32 *e, int *headt, int *next, u32 mask,
-                   u8 *have, u32 *nhave, HANDLE out, u8 *buf)
+                   u8 *have, u32 *nhave, HANDLE out, u8 *buf, int (*cancelled)(void))
 {
 	u32 B = z->block, avail = 0, p = 0, a = 0, b = 0, got, done = 0, last_pump = 0;
 	int valid = 0;
@@ -3281,7 +3479,7 @@ static int zs_scan(const char *path, const ZsHead *z, const u32 *e, int *headt, 
 		if (avail < B) break;
 		if (done - last_pump >= ZS_SCAN) {
 			last_pump = done;
-			if (dl_cancelled()) { CloseHandle(f); return -1; }
+			if (cancelled()) { CloseHandle(f); return -1; }
 		}
 		while (p + B <= avail) {
 			int matched = 0;
@@ -3292,8 +3490,10 @@ static int zs_scan(const char *path, const ZsHead *z, const u32 *e, int *headt, 
 				if (have[k]) { *link = next[k]; continue; }
 				if (e[2 * k] != w || (strong ? strong : (strong = zs_strong(buf + p, B))) != e[2 * k + 1]) { link = &next[k]; continue; }
 				u32 wr;
-				SetFilePointer(out, (int)(k * B), 0, 0);
-				WriteFile(out, buf + p, B, &wr, 0);
+				if (out != INVALID_HANDLE_VALUE) {
+					SetFilePointer(out, (int)(k * B), 0, 0);
+					WriteFile(out, buf + p, B, &wr, 0);
+				}
 				have[k] = 1;
 				(*nhave)++;
 				matched = 1;
@@ -3367,19 +3567,8 @@ static int level0_sync(const char *dir)
 			log_msg("net: level0 sync: the host's block list of %s is damaged", g_l0_names[fi]);
 			goto done;
 		}
-		/* its weak sums in a hash table (the short last block is always downloaded) */
-		for (mask = 1; mask < z->nblocks && mask < (1u << 20); mask <<= 1) {}
-		mask--;
-		headt = VirtualAlloc(0, (mask + 1) * 4, 0x3000, 4);
-		next = VirtualAlloc(0, z->nblocks * 4, 0x3000, 4);
-		have = VirtualAlloc(0, z->nblocks, 0x3000, 4);
-		if (!headt || !next || !have) goto done;
-		memset(headt, 0xff, (mask + 1) * 4);
-		for (u32 k = 0; k < z->nblocks; k++) {
-			if ((k + 1) * z->block > z->size) { next[k] = -1; continue; }
-			next[k] = headt[e[2 * k] & mask];
-			headt[e[2 * k] & mask] = (int)k;
-		}
+		/* its weak sums in a hash table */
+		if (!zs_table(z, e, &headt, &next, &have, &mask)) goto done;
 
 		/* 2. what this PC has: its own file, then every version in the cache */
 		fmt(path, "%s%s", stage, g_l0_names[fi]);
@@ -3388,7 +3577,7 @@ static int level0_sync(const char *dir)
 		if (out == INVALID_HANDLE_VALUE) goto done;
 		dl_draw("Looking for the host's level0 in your files...", "", 10);
 		fmt(path, "GameDataFolder\\%s", g_l0_names[fi]);
-		if (zs_scan(path, z, e, headt, next, mask, have, &nhave, out, buf) < 0) { result = -1; goto done; }
+		if (zs_scan(path, z, e, headt, next, mask, have, &nhave, out, buf, dl_cancelled) < 0) { result = -1; goto done; }
 		{
 			WIN32_FIND_DATAA fd;
 			HANDLE fh = FindFirstFileA("cache\\*", &fd);
@@ -3398,26 +3587,15 @@ static int level0_sync(const char *dir)
 					fmt(path, "cache\\%s", fd.cFileName);
 					if (str_ieq_n(path, dir, sizeof path)) continue;
 					fmt(path, "cache\\%s\\%s", fd.cFileName, g_l0_names[fi]);
-					if (zs_scan(path, z, e, headt, next, mask, have, &nhave, out, buf) < 0) { FindClose(fh); result = -1; goto done; }
+					if (zs_scan(path, z, e, headt, next, mask, have, &nhave, out, buf, dl_cancelled) < 0) { FindClose(fh); result = -1; goto done; }
 				} while (FindNextFileA(fh, &fd));
 				FindClose(fh);
 			}
 		}
 		/* 3. the rest from the host, as ranges of at most MAP_CHUNK bytes */
-		for (u32 k = 0; k < z->nblocks; k++) {
-			if (have[k]) continue;
-			u32 off = k * z->block, end = off + z->block > z->size ? z->size : off + z->block;
-			if (npiece && piece[npiece - 1].off + piece[npiece - 1].len == off && piece[npiece - 1].len + (end - off) <= MAP_CHUNK)
-				piece[npiece - 1].len += end - off;
-			else if (npiece < ZS_PIECES_MAX) {
-				piece[npiece].off = off;
-				piece[npiece].len = end - off;
-				npiece++;
-			} else {
-				log_msg("net: level0 sync: too much of %s differs, the full download it is", g_l0_names[fi]);
-				goto done;
-			}
-			need_bytes += end - off;
+		if (!zs_pieces(z, have, piece, &npiece, &need_bytes)) {
+			log_msg("net: level0 sync: too much of %s differs, the full download it is", g_l0_names[fi]);
+			goto done;
 		}
 		log_msg("net: level0 sync: %s: %u of %u blocks of %u bytes found in this PC's files; %u bytes to download in %u pieces",
 		        g_l0_names[fi], nhave, z->nblocks, z->block, need_bytes, npiece);
@@ -3500,9 +3678,7 @@ static int level0_sync(const char *dir)
 			goto done;
 		}
 		VirtualFree(pgot, 0, 0x8000); pgot = 0;
-		VirtualFree(have, 0, 0x8000); have = 0;
-		VirtualFree(next, 0, 0x8000); next = 0;
-		VirtualFree(headt, 0, 0x8000); headt = 0;
+		zs_table_free(&headt, &next, &have);
 		VirtualFree(list, 0, 0x8000); list = 0;
 	}
 	/* 5. into the cache folder */
@@ -3523,9 +3699,7 @@ static int level0_sync(const char *dir)
 done:
 	if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
 	if (pgot) VirtualFree(pgot, 0, 0x8000);
-	if (have) VirtualFree(have, 0, 0x8000);
-	if (next) VirtualFree(next, 0, 0x8000);
-	if (headt) VirtualFree(headt, 0, 0x8000);
+	zs_table_free(&headt, &next, &have);
 	if (list) VirtualFree(list, 0, 0x8000);
 	if (buf) VirtualFree(buf, 0, 0x8000);
 	if (piece) VirtualFree(piece, 0, 0x8000);
@@ -3538,6 +3712,246 @@ done:
 	}
 	dl_lines_hide();
 	return result;
+}
+
+/* ---- A new player's download (the Host Game screen) ----------------------------------------- *
+ * What a player with no mods (AE's stock level0, no custom maps, nothing in AE\cache) downloads the
+ * first time they join this PC's game, in bytes of the files (packet headers not counted):
+ *   - a custom level: its whole folder, what map_can_serve lists (Join's Play fetches it first,
+ *     see "Map download"); an original level: nothing (it can't be sent);
+ *   - level0: nothing when this PC's pair is a stock AE one (g_l0_stock); otherwise what level0
+ *     sync would send, measured the joiner's way on a thread: this PC's block lists (sent first),
+ *     rolled over the joiner's stock level0, plus the ranges a joiner would ask for. Where a file
+ *     has more than ZS_PIECES_MAX ranges the joiner gives up and downloads the whole pair after
+ *     what it already fetched, and so does this count. The stock level0 is a stock pair in
+ *     AE\cache when there is one, else AEInstaller\vanilla (the level0 every AE install keeps),
+ *     which counts a little more: on 2026-11-09 a 197.6 MB mod measured 39.9 MB against vanilla
+ *     where the real sync from a stock AE level0 had sent 35.0 MB; on a 499 MB mod the two bases
+ *     were within 1% (zsim: 11.58 vs 11.53 MB of the .dat, 328.4 vs 325.9 MB of the .raw).
+ * The level0 part takes seconds (both pairs read), so it's kept in Arklite.ini [host] join_level0
+ * as "<GameDataFolder pair's sizes and times>|<base folder> <bytes>". */
+static const u32 g_l0_stock[][2] = {
+	{ 0xf40ec301u, 0x6091538bu },   /* AE core, XML patches in (Linux, 2026-11-01) */
+	{ 0xe19686a1u, 0xae11addfu },   /* AE core without its XML patches (an install whose XmlTools didn't run) */
+};
+
+static struct {
+	volatile int state;                 /* 0 none, 1 measuring, 2 done, -1 failed */
+	char key[160];                      /* the pair the state is for and the base (jc_key) */
+	char base[64];                      /* the stock level0 measured against */
+	u32 bytes, lists, full, hash[2];
+	int stock, reported, have_hash;
+} g_jc;
+
+static int jc_never(void) { return 0; }
+
+static u32 WINAPI jc_measure(void *unused)
+{
+	u8 *buf = VirtualAlloc(0, ZS_SCAN + 4096, 0x3000, 4), *list[2] = { 0, 0 }, *have = 0;
+	ZsPiece *piece = VirtualAlloc(0, ZS_PIECES_MAX * sizeof *piece, 0x3000, 4);
+	int *headt = 0, *next = 0, ok = buf && piece;
+	u32 lsize[2], total = 0, full = 0;
+	char path[MAX_PATH];
+
+	for (int fi = 0; fi < 2 && ok; fi++) {
+		fmt(path, "GameDataFolder\\%s", g_l0_names[fi]);
+		ok = (list[fi] = zs_list_file(path, g_zs_block[fi], buf, &lsize[fi], &g_jc.hash[fi])) != 0;
+	}
+	g_jc.stock = 0;
+	for (u32 i = 0; ok && i < sizeof g_l0_stock / sizeof g_l0_stock[0]; i++)
+		if (g_jc.hash[0] == g_l0_stock[i][0] && g_jc.hash[1] == g_l0_stock[i][1]) g_jc.stock = 1;
+	if (ok && !g_jc.stock) {
+		g_jc.lists = total = lsize[0] + lsize[1];
+		g_jc.full = full = ((const ZsHead *)list[0])->size + ((const ZsHead *)list[1])->size;
+		for (int fi = 0; fi < 2 && ok; fi++) {
+			const ZsHead *z = (const ZsHead *)list[fi];
+			const u32 *e = (const u32 *)(z + 1);
+			u32 mask, nhave = 0, npiece, need;
+			if (!(ok = zs_table(z, e, &headt, &next, &have, &mask))) break;
+			fmt(path, "%s\\%s", g_jc.base, g_l0_names[fi]);
+			zs_scan(path, z, e, headt, next, mask, have, &nhave, INVALID_HANDLE_VALUE, buf, jc_never);
+			if (!zs_pieces(z, have, piece, &npiece, &need)) {
+				total += full;   /* the whole pair after what was fetched */
+				break;
+			}
+			total += need;
+			zs_table_free(&headt, &next, &have);
+		}
+	}
+	zs_table_free(&headt, &next, &have);
+	for (int fi = 0; fi < 2; fi++)
+		if (list[fi]) VirtualFree(list[fi], 0, 0x8000);
+	if (piece) VirtualFree(piece, 0, 0x8000);
+	if (buf) VirtualFree(buf, 0, 0x8000);
+	g_jc.bytes = total;
+	g_jc.have_hash = ok;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	g_jc.state = ok ? 2 : -1;
+	return 0;
+}
+
+/* GameDataFolder's pair by sizes and times and the base it's measured against (a stock pair in
+ * the cache, else AEInstaller\\vanilla), as the Arklite.ini entry names them; 0 if one is missing */
+static int jc_key(char *key, char *base)
+{
+	u32 v[6];
+	str_cpy(base, 64, "AEInstaller\\vanilla");
+	for (u32 i = 0; i < sizeof g_l0_stock / sizeof g_l0_stock[0]; i++) {
+		char dat[96], raw[96];
+		fmt(dat, "cache\\%08x-%08x\\%s", g_l0_stock[i][0], g_l0_stock[i][1], g_l0_names[0]);
+		fmt(raw, "cache\\%08x-%08x\\%s", g_l0_stock[i][0], g_l0_stock[i][1], g_l0_names[1]);
+		if (GetFileAttributesA(dat) != INVALID_FILE_ATTRIBUTES && GetFileAttributesA(raw) != INVALID_FILE_ATTRIBUTES) {
+			fmt(base, "cache\\%08x-%08x", g_l0_stock[i][0], g_l0_stock[i][1]);
+			break;
+		}
+	}
+	for (int fi = 0; fi < 2; fi++) {
+		WIN32_FIND_DATAA fd;
+		char path[64];
+		HANDLE f;
+		fmt(path, "GameDataFolder\\%s", g_l0_names[fi]);
+		if ((f = FindFirstFileA(path, &fd)) == INVALID_HANDLE_VALUE) return 0;
+		FindClose(f);
+		v[3 * fi] = fd.nFileSizeLow;
+		v[3 * fi + 1] = fd.ftLastWriteTime[0];
+		v[3 * fi + 2] = fd.ftLastWriteTime[1];
+	}
+	fmt(key, "%08x%08x%08x-%08x%08x%08x|%s", v[0], v[1], v[2], v[3], v[4], v[5], base);
+	return 1;
+}
+
+/* The level0 part of a new player's download (see above): 1 and *bytes, 0 while it's measured
+ * (asked again every frame), -1 when it can't be */
+int net_join_level0_bytes(u32 *bytes)
+{
+	char key[sizeof g_jc.key], base[sizeof g_jc.base], saved[sizeof g_jc.key + 48];
+	u32 n;
+
+	if (g_jc.state == 1) return 0;
+	if (!jc_key(key, base)) return -1;
+	if (g_jc.state != 0 && str_ieq_n(g_jc.key, key, sizeof key)) {
+		if (g_jc.state < 0) return -1;
+		if (!g_jc.reported) {   /* just measured: logged and kept from this thread */
+			g_jc.reported = 1;
+			if (g_jc.stock) log_msg("net: a new player's download: level0 %08x %08x is a stock AE one, nothing to download",
+			                        g_jc.hash[0], g_jc.hash[1]);
+			else log_msg("net: a new player's download: level0 %08x %08x, measured against %s: %u bytes "
+			             "(block lists %u; the whole pair is %u)", g_jc.hash[0], g_jc.hash[1], g_jc.base, g_jc.bytes, g_jc.lists, g_jc.full);
+			fmt(saved, "%s %u %08x %08x", key, g_jc.bytes, g_jc.hash[0], g_jc.hash[1]);
+			WritePrivateProfileStringA("host", "join_level0", saved, ini_path());
+		}
+		*bytes = g_jc.bytes;
+		return 1;
+	}
+	str_cpy(g_jc.key, sizeof g_jc.key, key);
+	GetPrivateProfileStringA("host", "join_level0", "", saved, sizeof saved, ini_path());
+	n = str_len(key);
+	if (str_ieq_n(saved, key, n) && saved[n] == ' ' && saved[n + 1] >= '0' && saved[n + 1] <= '9') {
+		const char *s = saved + n + 1;
+		g_jc.bytes = 0;
+		for (; *s >= '0' && *s <= '9'; s++) g_jc.bytes = g_jc.bytes * 10 + (u32)(*s - '0');
+		/* the pair's hashes after it (an older Arklite saved none: measured again) */
+		g_jc.have_hash = 1;
+		for (int fi = 0; fi < 2; fi++) {
+			u32 h = 0, d = 0;
+			if (*s == ' ') s++;
+			for (; d < 8 && ((*s >= '0' && *s <= '9') || (*s >= 'a' && *s <= 'f')); s++, d++) h = h << 4 | (u32)(*s <= '9' ? *s - '0' : *s - 'a' + 10);
+			if (d != 8) g_jc.have_hash = 0;
+			g_jc.hash[fi] = h;
+		}
+		if (g_jc.have_hash) {
+			g_jc.reported = 1;
+			g_jc.state = 2;
+			*bytes = g_jc.bytes;
+			return 1;
+		}
+	}
+	str_cpy(g_jc.base, sizeof g_jc.base, base);
+	g_jc.reported = 0;
+	g_jc.state = 1;
+	if (!CreateThread(0, 0, jc_measure, 0, 0, 0)) {
+		g_jc.state = -1;
+		return -1;
+	}
+	log_msg("net: a new player's download: measuring level0 against %s", base);
+	return 0;
+}
+
+/* The map part: a custom level's folder (dir ends with '\\'), 0 for an original level. 0 returned
+ * when joiners can't download it (too many files, or a path too long) */
+int net_join_map_bytes(const char *dir, u32 *bytes)
+{
+	static MapFile *files;
+	u32 n = 0;
+	int ok;
+
+	*bytes = 0;
+	if (!dir) return 1;   /* an original level: nothing to send */
+	if (!files) files = VirtualAlloc(0, MAP_MAX_FILES * sizeof(MapFile), 0x3000, 4);
+	if (!files) return 0;
+	ok = list_tree(dir, "", 0, files, &n);
+	for (u32 i = 0; i < n; i++) *bytes = *bytes + files[i].size < *bytes ? 0xffffffffu : *bytes + files[i].size;
+	return ok;
+}
+
+/* ---- What this PC downloads to join a server (the Join page) ---- *
+ * From the server's info answer (PKT_INFO, protocol 21):
+ *   - level0: nothing when the host's pair is this PC's installed one (measured as the Host page
+ *     does, kept in [host] join_level0 with the hashes) or is already in AE\cache\<its hashes>;
+ *     else the host's own measure of a new player's download (against stock AE level0), an
+ *     estimate: the real sync starts from this PC's level0 and cache, which may hold more of it;
+ *   - the map: nothing for an original level or when CustomLevels\<folder> hashes the same as
+ *     the host's (hash_map's way); else the host's folder's bytes. */
+#define MAP_HASH_CACHE 16
+static struct { char folder[64]; u32 hash; int have; } g_mh[MAP_HASH_CACHE];
+static u32 g_nmh;
+
+void net_join_download_forget(void) { g_nmh = 0; }
+
+static int folder_hash(const char *folder, u32 *hash)
+{
+	char dir[MAX_PATH];
+	u32 i;
+
+	for (i = 0; i < g_nmh && i < MAP_HASH_CACHE; i++)
+		if (str_len(g_mh[i].folder) == str_len(folder) && str_ieq_n(g_mh[i].folder, folder, sizeof g_mh[i].folder)) {
+			*hash = g_mh[i].hash;
+			return g_mh[i].have;
+		}
+	i = g_nmh++ % MAP_HASH_CACHE;
+	str_cpy(g_mh[i].folder, sizeof g_mh[i].folder, folder);
+	g_mh[i].have = custom_game_folder_dir(folder, dir, sizeof dir);
+	g_mh[i].hash = g_mh[i].have ? hash_tree(dir, "", 0) : 0;
+	*hash = g_mh[i].hash;
+	return g_mh[i].have;
+}
+
+int net_join_download(const NetServerInfo *s, u32 *bytes)
+{
+	u32 own, total = 0, h;
+	int r, estimate = 0;
+	char dat[96], raw[96];
+
+	*bytes = 0;
+	if (!s->has_download) return NETDL_UNKNOWN;
+	if (s->folder[0]) {
+		if (!s->map_ok) return NETDL_IMPOSSIBLE;
+		if (!folder_hash(s->folder, &h) || h != s->map_hash) total = s->map_bytes;
+	}
+	r = net_join_level0_bytes(&own);   /* this PC's own pair's hashes come with it */
+	if (r == 0) return NETDL_MEASURING;
+	if (!(r > 0 && g_jc.have_hash && g_jc.hash[0] == s->l0[0] && g_jc.hash[1] == s->l0[1])) {
+		fmt(dat, "cache\\%08x-%08x\\%s", s->l0[0], s->l0[1], g_l0_names[0]);
+		fmt(raw, "cache\\%08x-%08x\\%s", s->l0[0], s->l0[1], g_l0_names[1]);
+		if (GetFileAttributesA(dat) == INVALID_FILE_ATTRIBUTES || GetFileAttributesA(raw) == INVALID_FILE_ATTRIBUTES) {
+			if (s->l0_bytes == NET_INFO_MEASURING) return NETDL_MEASURING;
+			if (s->l0_bytes == NET_INFO_UNKNOWN) return NETDL_UNKNOWN;
+			total = total + s->l0_bytes < total ? 0xffffffffu : total + s->l0_bytes;
+			estimate = s->l0_bytes != 0;
+		}
+	}
+	*bytes = total;
+	return estimate ? NETDL_ABOUT : NETDL_EXACT;
 }
 
 /* The level load's TMrLevel_Load call: the host's files first when they're wanted */
@@ -3622,47 +4036,47 @@ static int net_open(void);
 #define WMrDialog_Create        ((u16 (ONI_FC *)(u32, WMtWindow *, u32, u32, WMtWindow **))0x468830)
 #define WMrWindow_Delete        ((void (ONI_FC *)(WMtWindow *))0x474950)
 
-int net_map_fetch(const char *folder, u32 level)
+int net_map_fetch(char *folder, u32 size, u32 level)
 {
-	char rel[MAX_PATH], dir[MAX_PATH];
 	void *ui;
 	int ok;
 
 	g_dl_why = "can't reach the host";
-	/* the host names the folder: one name, nothing that leads out of CustomLevels */
-	if (!safe_path(folder) || str_len(folder) >= 64) {
+	if (!folder_name_ok(folder)) {
 		log_msg("net: the host's map folder \"%s\" isn't a folder name, not downloading it", folder);
 		g_dl_why = "the host's map folder has a bad name";
 		return 0;
 	}
-	for (const char *c = folder; *c; c++)
-		if (*c == '\\') { g_dl_why = "the host's map folder has a bad name"; return 0; }
 	if (g_mode != NET_JOIN || (g_sock == INVALID_SOCKET && !net_open())) return 0;
-	fmt(rel, "GameDataFolder\\CustomLevels\\%s\\", folder);
-	if (!GetFullPathNameA(rel, sizeof dir, dir, 0)) return 0;
-	log_msg("net: this PC doesn't have the host's map %s (level %d): downloading it to %s", folder, level, dir);
+	log_msg("net: this PC doesn't have the host's map %s (level %d): downloading it", folder, level);
 
 	if (!ONgLoadingDialog) {
 		ONgLoadingContext = ONiUI_GetContext();
 		if ((ui = ONiUI_FindContext(ONcUIContextOni))) ONiUI_SetContext(ui);
 		WMrDialog_Create(ONcLoadingDialogID, 0, ONrLoadingDialog_Proc, 0xffffffffu, &ONgLoadingDialog);
 	}
-	ok = map_download_to(level, dir, folder);
+	ok = map_fetch_into(level, folder, size);   /* (a half-made folder isn't a map: what arrived stays in CustomLevels.download) */
 	if (ONgLoadingDialog) {
 		WMrWindow_Delete(ONgLoadingDialog);
 		ONgLoadingDialog = 0;
 		ONiUI_SetContext(ONgLoadingContext);
 	}
-	if (!ok) {   /* a half-made folder isn't a map: what arrived stays in CustomLevels.download */
-		RemoveDirectoryA(dir);
-		return 0;
-	}
-	return 1;
+	return ok;
 }
 
 const char *net_map_fetch_error(void)
 {
 	return g_dl_why ? g_dl_why : "?";
+}
+
+/* What the Join list and the server list show of this game: the players (a dedicated server's own
+ * isn't one), the most it takes, and how many of them watch */
+static void info_counts(u32 *players, u32 *max, u32 *spect)
+{
+	u32 mine = g_dedicated ? ~1u : ~0u;
+	*players = g_state == S_IDLE ? !g_dedicated : bits(present_mask() & mine);
+	*max = capacity() - (g_dedicated != 0);
+	*spect = bits(players_spectators() & present_mask() & mine);   /* players watching (/spectate) */
 }
 
 static void answer_info(const u8 *buf, u32 n, const SOCKADDR_IN *to)
@@ -3685,15 +4099,27 @@ static void answer_info(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 	p.token = q->token;
 	p.sent = q->sent;
 	p.level = g_level;
-	p.players = g_state == S_IDLE ? 1 : bits(present_mask());
-	p.max_players = capacity();
-	p.spectators = bits(players_spectators() & present_mask());   /* players watching (/spectate) */
+	info_counts(&p.players, &p.max_players, &p.spectators);
 	p.in_match = g_state != S_LOBBY && !g_warm;
 	p.server_id = g_server_id;
 	str_cpy(p.name, sizeof p.name, g_server_name);
 	if (folder) str_cpy(p.folder, sizeof p.folder, folder);
 	if (map) str_cpy(p.map, sizeof p.map, map);
 	else fmt(p.map, "Level %d", g_level);
+	{
+		u32 b;
+		int r = net_join_level0_bytes(&b);   /* measured once, on a thread (the Host page's line) */
+		p.l0_bytes = r > 0 ? b : r == 0 ? NET_INFO_MEASURING : NET_INFO_UNKNOWN;
+	}
+	p.l0[0] = g_files[2];
+	p.l0[1] = g_files[3];
+	p.map_ok = 1;
+	if (folder) {
+		p.map_ok = map_can_serve() != 0;
+		p.map_hash = g_map_hash;
+		for (u32 i = 0; i < g_nserve; i++) p.map_bytes = p.map_bytes + g_serve[i].size < p.map_bytes ? 0xffffffffu : p.map_bytes + g_serve[i].size;
+	}
+	p.nmods = ui_installed_mods(p.mods, NET_INFO_MODS);
 	send_addr(&p, sizeof p, to);
 }
 
@@ -3733,9 +4159,7 @@ static void helper_frame_host(u32 now)
 	if (!helper_beat_due(g_sock, now)) return;
 	memset(&g, 0, sizeof g);
 	g.level = g_level;
-	g.players = g_state == S_IDLE ? 1 : bits(present_mask());
-	g.max_players = capacity();
-	g.spectators = bits(players_spectators() & present_mask());
+	info_counts(&g.players, &g.max_players, &g.spectators);
 	g.in_match = g_state != S_LOBBY && !g_warm;
 	g.server_id = g_server_id;
 	str_cpy(g.name, sizeof g.name, g_server_name);
@@ -3810,11 +4234,11 @@ static int fire_down(void)
 }
 
 /* host: the players still here after the match, and how many of them pressed fire */
-static u32 end_players(void) { return bits(present_mask()); }
+static u32 end_players(void) { return bits(present_mask() & (g_dedicated ? ~1u : ~0u)); }
 
 static u32 end_ready_count(void)
 {
-	u32 n = g_end_ready != 0;
+	u32 n = g_end_ready != 0 && !g_dedicated;   /* a dedicated server's own doesn't play */
 	for (int l = 1; l < NPL; l++) n += live(l) && g_link[l].end_ready;
 	return n;
 }
@@ -3906,6 +4330,8 @@ static void enter_over(u32 now)
 	}
 	log_msg("net: the match is over after %d ticks: %s; %s", g_ticks, line,
 	        w < 0 ? "a draw" : w == g_slot ? "this PC's player won" : "another player won");
+	if (g_dedicated && g_mode == NET_HOST)
+		server_print("The match is over: %s. %s%s", line[0] ? line : "nobody played", w < 0 ? "A draw" : "Winner: ", w < 0 ? "" : mp_name(w));
 }
 
 #define REC_AIM_LR(r)           (*(const float *)((r) + 0x24))
@@ -4028,7 +4454,7 @@ static u32 over_frame(u32 count, const u8 *actions, u32 now, u32 *ticks_run)
 	}
 	if (g_mode == NET_HOST) {
 		host_check_silence(now);
-		if ((g_end_ready && end_ready_count() >= end_players()) || now - g_over_at >= END_MS) {
+		if (((g_end_ready || g_dedicated) && end_ready_count() >= end_players()) || now - g_over_at >= END_MS) {
 			log_msg("net: the match's end is over: %s", now - g_over_at >= END_MS ? "time's up" : "everyone pressed fire");
 			host_go(1);
 			if (ticks_run) *ticks_run = 0;
@@ -4200,6 +4626,16 @@ static void host_hello(int l, const PktHello *p, const SOCKADDR_IN *from)
 		return;
 	}
 	if (l >= 0) g_link[l].last_recv = GetTickCount();
+	/* removed by the server's admin: it hears why, nothing else. By IP address (a new port is a
+	 * restart away), but only for someone new or the removed link itself: players already in the
+	 * game behind the same address (one router, CGNAT, this PC) stay */
+	if ((l < 0 || gone(l)) && ban_note(from->addr)) {
+		g_lobby_note = ban_note(from->addr);
+		send_lobby_addr(from, 0, 0, NETBAD_KICKED);
+		g_lobby_note = 0;
+		if (l > 0 && (g_state == S_LOBBY || g_link[l].waiting || g_link[l].joining)) remove_link(l);
+		return;
+	}
 	if (l > 0 && !p->phase && p->catchup_failed && g_link[l].joining) catchup_failed(l);
 	if (g_state == S_LOBBY || (!p->phase && (l < 0 || g_link[l].waiting || g_link[l].joining == 1))) {
 		if (p->phase) return;   /* it reloaded already; it says phase 0 again soon or waits */
@@ -4291,6 +4727,26 @@ static void joiner_lobby(const PktLobby *p)
 	int go = p->go && p->session != g_go_taken;   /* a repeat of a reload already done means nothing */
 
 	g_link[0].last_recv = GetTickCount();
+	if (p->refused & NETBAD_KICKED) {   /* the server's admin removed this PC (see "Dedicated server") */
+		memcpy(g_kick_note, p->note, sizeof g_kick_note);
+		g_kick_note[sizeof g_kick_note - 1] = 0;
+		clean_text(g_kick_note, sizeof g_kick_note);
+		if (!g_kick_note[0]) str_cpy(g_kick_note, sizeof g_kick_note, "The server removed you.");
+		if (g_state != S_LOBBY && g_state != S_IDLE) {
+			log_msg("net: removed by the server: %s", g_kick_note);
+			chat_server(g_kick_note);
+			back_to_lobby("removed by the server");
+			return;
+		}
+		refuse("host", NETBAD_KICKED, 0);
+		return;
+	}
+	if (!p->refused && (p->dedicated != 0) != g_ded_host) {   /* before any level of its sessions loads (players.c) */
+		g_ded_host = p->dedicated != 0;
+		players_set_dedicated(g_ded_host);
+		log_msg("net: the host %s a dedicated server", g_ded_host ? "is" : "isn't");
+	}
+	if (!p->refused) set_char_rules(p->char_rules & NET_MUTATORS_ALL, "the host's");
 	if (g_state == S_WAIT || p->level != g_level) return;
 	if (g_state != S_LOBBY && !go) {   /* in a synced session only the ready state and "go" count */
 		if (g_warm && !p->refused) {
@@ -4505,6 +4961,12 @@ static void receive(void)
 			if (!g_link[l].entered) {   /* its name comes right after it joined */
 				g_link[l].entered = 1;
 				server_line(mp_name(l), "entered the game");
+				if (g_motd[0] && chat_link(l)) {   /* the message of the day, to that player alone */
+					char t[CHAT_MAX];
+					log_msg("net: message of the day to player %d", l + 1);
+					fmt(t, "Server MOTD: %s", g_motd);
+					chat_queue(l, CHAT_SERVER, CHAT_ALL, t);   /* (a server line goes to l's queue only) */
+				}
 			}
 		} else if (h->type == PKT_NAMES && g_mode == NET_JOIN && (u32)n >= sizeof(PktNames)) {
 			const PktNames *p = (const PktNames *)buf;
@@ -4527,16 +4989,19 @@ static void receive(void)
 			}
 		} else if (h->type == PKT_BYE && g_state == S_RUN) {
 			log_msg("net: the host left; the other players stand still");
-			server_line(mp_name(0), "left the game");
+			if (g_ded_host) chat_server("The server closed.");
+			else server_line(mp_name(0), "left the game");
 			g_lost_left = 1;
 			g_state = S_LOST;
 		} else if (h->type == PKT_BYE && g_state == S_OVER && !g_over_lost) {
 			log_msg("net: the host left after the match");
-			server_line(mp_name(0), "left the game");
+			if (g_ded_host) chat_server("The server closed.");
+			else server_line(mp_name(0), "left the game");
 			g_over_lost = 1;
 		} else if (h->type == PKT_BYE && g_state == S_LOBBY && g_host_heard) {
 			log_msg("net: the host left the lobby");
-			server_line(mp_name(0), "left the game");
+			if (g_ded_host) chat_server("The server closed.");
+			else server_line(mp_name(0), "left the game");
 			g_host_heard = 0;
 		}
 	}
@@ -4874,8 +5339,8 @@ static void make_input(void)
 {
 	u32 *in = g_in[g_slot][g_gen % RING];
 
-	if (live_menu_open() || char_menu_open()) {
-		memset(in, 0, 0x30);                 /* a menu is up: our player stands */
+	if (live_menu_open() || char_menu_open() || g_dedicated) {
+		memset(in, 0, 0x30);                 /* a menu is up (or a dedicated server's): our player stands */
 		g_has_pending = 0;
 	} else if (g_has_pending) {
 		memcpy(in, g_pending, 0x30);
@@ -4895,7 +5360,7 @@ static void make_input(void)
 		u32 present = 1;
 		for (int p = 1; p < NPL; p++)
 			if (g_on_from[p] <= g_gen && g_gen < g_off_from[p]) present |= 1u << p;
-		in[11] |= PLAYERS_PRESENT_FLAG | present << PLAYERS_PRESENT_SHIFT;
+		in[11] |= PLAYERS_PRESENT_FLAG | (present >> 1) << PLAYERS_PRESENT_SHIFT;   /* (player 0 is always there) */
 	}
 	memcpy(g_last_local, in, 0x30);
 	g_in_at[g_slot][g_gen % RING] = g_gen + 1;
@@ -4956,6 +5421,7 @@ static void start_match(void)
 	}
 	log_msg("net: the %s starts: reloading level %d for %d players, this PC's is player %d (RNG %08x/%08x)",
 	        g_warm ? "warm-up" : "match", level, g_nplayers, g_slot + 1, g_match_seed, g_match_local_seed);
+	if (g_dedicated && g_mode == NET_HOST) server_print(g_warm ? "Warm-up (%d players)." : "The match starts (%d players).", g_nplayers - 1);
 	g_match_pending = 1;
 	g_quiet_end = 1;
 	session_end(g_warm ? "warm-up starting" : "match starting");
@@ -5057,7 +5523,8 @@ static int ready_frame(u32 now)
 		}
 		if (g_state == S_LOBBY && g_host_heard && (int)(now - g_link[0].last_recv) > LOST_MS) {
 			log_msg("net: nothing from the host for %d s", LOST_MS / 1000);
-			server_line(mp_name(0), "left the game");
+			if (g_ded_host) chat_server("The server stopped answering.");
+			else server_line(mp_name(0), "left the game");
 			g_host_heard = 0;
 		}
 		return 0;
@@ -5081,7 +5548,7 @@ static int ready_frame(u32 now)
 		host_go(0);
 		return 1;
 	}
-	if ((g_state == S_LOBBY ? players >= (solo_session() ? 1u : 2u) : newcomers()) && !g_countdown_end &&
+	if ((g_state == S_LOBBY ? (solo_session() ? lobby_players() >= 1 : players >= 2) : newcomers()) && !g_countdown_end &&
 	    now - g_last_join >= WARM_WAIT_MS) {
 		log_msg("net: %d player%s: the warm-up %s%s", players, players == 1 ? "" : "s",
 		        g_state == S_LOBBY ? "starts" : "starts again for the new player",
@@ -5165,6 +5632,7 @@ void net_hud(NetHud *h)
 	h->countdown_ms = -1;
 	if (g_mode == NET_OFF) return;
 	h->present = present_mask() | (1u << h->local_player);
+	if (g_ded_host) h->present &= ~1u;   /* the dedicated server's own player isn't one */
 	/* the host never answered: this PC's address for its /punch (see "Hole punching") */
 	if (g_mode == NET_JOIN && g_state == S_LOBBY && !g_host_heard && !g_problem && now - g_opened_at >= HINT_AFTER_MS)
 		stun_text(h->punch_me);
@@ -5570,7 +6038,8 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	if (g_mode == NET_JOIN && g_state == S_RUN && (int)(now - g_link[0].last_recv) > LOST_MS) {
 		log_msg("net: nothing from the host for %d s; the other players stand still (packets sent %d, received %d, inputs received %d)",
 		        LOST_MS / 1000, g_npackets_sent, g_npackets_recv, g_ninputs_recv);
-		server_line(mp_name(0), "left the game");
+		if (g_ded_host) chat_server("The server stopped answering.");
+		else server_line(mp_name(0), "left the game");
 		g_lost_left = 0;
 		g_state = S_LOST;
 		report_net(REPORT_DROP, g_session, net_local_slot(), g_ticks, 0, 0, 0);
@@ -5714,6 +6183,7 @@ int net_watching(void) { return !me_watching() ? -1 : flying() ? -2 : g_watch; }
 #define FLY_ACCEL               8.0f
 #define FLY_FRICTION            5.0f
 #define FLY_RADIUS              3.0f       /* the camera's sphere against the level */
+#define FLY_LOOK                (1.0f / 128.0f)   /* radians a mouse unit (see fly_frame) */
 #define FLY_SKIP                0x48800    /* quad flags a character's collision skips (call at 0x4ebddf) */
 #define FLY_BUMPS               4
 #define GS_COLLISION(gs)        (*(u8 **)(*(u8 **)((gs) + 0x150) + 0x40))
@@ -5833,6 +6303,12 @@ static void fly_slide(u8 *coll, float *c, float *vel, float dt)
 	}
 }
 
+/* photo.c's camera: walls stop and slide it as they do a watcher's */
+void net_fly_move(float *pos, float *vel, float dt)
+{
+	fly_slide(ONgGameState && *(u8 **)(ONgGameState + 0x150) ? GS_COLLISION(ONgGameState) : 0, pos, vel, dt);
+}
+
 /* Once a frame while flying: turn and move the camera, then hand its view to the renderer */
 static void fly_frame(u8 *cam)
 {
@@ -5852,7 +6328,7 @@ static void fly_frame(u8 *cam)
 		g_fly_last = now;
 		g_fly_dx = g_fly_dy = 0;
 		g_fly_vel[0] = g_fly_vel[1] = g_fly_vel[2] = 0;
-		log_msg("net: watching in free flight");
+		log_msg("net: watching in free flight (look %d/1000 radian a mouse unit)", (int)(FLY_LOOK * 1000 + 0.5f));
 	}
 	dt = (float)(long long)(now - g_fly_last) / (float)(long long)g_fly_freq;
 	g_fly_last = now;
@@ -5862,12 +6338,14 @@ static void fly_frame(u8 *cam)
 	/* look: the mouse comes once a tick (60 Hz), so each tick's movement is spread over the
 	 * following 1/60 s instead of jumping on the frames that get it; 1/60 radian a unit, as Oni's
 	 * manual camera (signs checked in game: the record's up/down is positive for the mouse going
-	 * up; Invert Look already applied by take_record) */
+	 * up; Invert Look already applied by take_record). 1/128 radian a unit: aiming a pistol
+	 * (Oni.exe 0x4f7be1: mouse * 1/64 (0x52b3b4) * the weapon's MouseSensitivity * 0.5, w1_tap's 1;
+	 * other guns are slower, bare hands 1/64); it was 1/60, too fast to watch with (user, 2026-11-12) */
 	take = dt * 60.0f;
 	if (take > 1) take = 1;
 	if (ok) {
-		g_fly_yaw -= g_fly_dx * take / 60.0f;
-		g_fly_pitch += g_fly_dy * take / 60.0f;
+		g_fly_yaw -= g_fly_dx * take * FLY_LOOK;
+		g_fly_pitch += g_fly_dy * take * FLY_LOOK;
 		if (g_fly_pitch > 1.55f) g_fly_pitch = 1.55f;
 		if (g_fly_pitch < -1.55f) g_fly_pitch = -1.55f;
 		g_fly_dx -= g_fly_dx * take;
@@ -5938,14 +6416,16 @@ static u8 *view_character(u8 *konoko)
 }
 
 /* The character draw pass's visibility test (0x4e27d0, ECX the character; called at 0x4e16a4):
- * a watching host's parked Konoko is never drawn, on any PC */
+ * a watching host's parked Konoko is never drawn, on any PC, nor the player photo mode's "Hide
+ * player" hides */
 #define ONrCharacter_OnScreen   ((u8 (ONI_FC *)(u8 *))0x4e27d0)
 #define ONcDraw_OnScreenCall    0x4e16a4
-static u8 ONI_FC character_on_screen(u8 *c) { return players_hidden(c) ? 0 : ONrCharacter_OnScreen(c); }
+static u8 ONI_FC character_on_screen(u8 *c) { return players_hidden(c) || photo_hides(c) ? 0 : ONrCharacter_OnScreen(c); }
 
 static void ONI_FC camera_update(u32 ticks, u32 edx, u32 arg)
 {
 	u8 *gs = ONgGameState, *cam = gs ? GS_CAMERA(gs) : 0;
+	if (photo_owns_camera()) return;   /* photo.c moves it itself (single player only) */
 	watch_keys();
 	if (cam && flying()) {
 		view_character(GS_PLAYER(gs));   /* (takes a click) */
@@ -6198,8 +6678,6 @@ static void view_install(void)
 	static int done;
 	if (done) return;
 	done = 1;
-	if (!patch_call(ONcDraw_OnScreenCall, (u32)ONrCharacter_OnScreen, (u32)character_on_screen))
-		log_msg("net: draw pass call 0x%x changed, a watching host's character stays drawn", ONcDraw_OnScreenCall);
 	if (patch_call(0x4fb1f4, (u32)ONrListener_PositionAlt, (u32)listener_position_alt) &&
 	    patch_call(0x4fb1fb, (u32)ONrListener_Position, (u32)listener_position) &&
 	    patch_call(0x4fb20f, (u32)ONrListener_Facing, (u32)listener_facing))
@@ -6218,6 +6696,280 @@ static void view_install(void)
 			log_msg("net: game display 0x%x changed, the HUD and crosshair show Konoko", ONcDisplay);
 		}
 	}
+}
+
+/* ---- Dedicated server ----------------------------------------------------------------------- *
+ * A host that doesn't play (the Host dialog's Dedicate, or ARKLITE_DEDICATED=<map folder>[:port]):
+ * server.c gives it a console, skips drawing, hides the game window and turns the sound off.
+ *   - Its player (Konoko, slot 0) always watches (players_spectate_want, so every record says so and
+ *     players.c parks her on every PC) and is never one of the players: not in the ready-up
+ *     (watches), the match's end (end_players), the server list's counts (info_counts) or the
+ *     joiners' lists (LOBBY dedicated -> net_hud). Its records carry nothing else (make_input).
+ *   - It keeps slot 0 (NPL is NET_PLAYERS_MAX + 1 for it), so it still takes NET_PLAYERS_MAX players;
+ *     capacity() adds its place, and players.c makes the player past the map's placements from Konoko's (players_set_dedicated, which every PC must
+ *     know before a session's level loads: LOBBY carries it, protocol 20).
+ *   - The admin's commands (server.c) come here: say (a server line, CHAT_SERVER, to everyone),
+ *     players, kick (out, then refused with NETBAD_KICKED and a note for some minutes; by IP
+ *     address), ban (the same until the server closes), start (the match now), warmup, limits,
+ *     name, max players, quit (goodbye to everyone, then Oni's own quit flag). */
+
+static void lobby_goodbye(void);
+
+#define ONgExitRequested (*(u8 *)0x630ffd)   /* the main loop ends (what Quit sets) */
+
+static void dedicated_begin(void)
+{
+	g_dedicated = 1;
+	players_spectate_want(1);
+	players_set_dedicated(1);
+	server_start();
+}
+
+int net_dedicated_host(void) { return g_dedicated && g_mode == NET_HOST; }
+int net_dedicated(void) { return net_dedicated_host() || (g_mode == NET_JOIN && g_ded_host); }
+
+static const char *state_text(void)
+{
+	return g_state == S_LOBBY ? "waiting" : g_state == S_WAIT ? "starting" : g_state == S_OVER ? "match over" :
+	       g_state == S_RUN || g_state == S_LOST ? (g_warm ? "warm-up" : "match") : "loading";
+}
+
+int net_server_players(NetPlayerRow *rows, int max)
+{
+	int n = 0;
+	for (int l = 1; l < NPL && n < max; l++) {
+		NetPlayerRow *r = &rows[n];
+		const u8 *ip = (const u8 *)&g_link[l].addr.addr;
+		if (!g_link[l].used) continue;
+		memset(r, 0, sizeof *r);
+		r->used = 1;
+		r->slot = l;
+		r->gone = gone(l);
+		r->joining = g_link[l].joining || g_link[l].waiting || g_link[l].rejoin;
+		r->watching = !r->gone && !r->joining && watches(l);
+		r->playing = !r->gone && !r->joining && !r->watching;
+		r->ping = g_link[l].ping;
+		r->score = players_score(l);
+		str_cpy(r->name, sizeof r->name, mp_name(l)[0] ? mp_name(l) : "(no name yet)");
+		fmt(r->addr, "%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ntohs(g_link[l].addr.port));
+		n++;
+	}
+	return n;
+}
+
+int net_server_say(const char *text)
+{
+	char t[CHAT_MAX + 16];
+	int any = 0;
+	fmt(t, "Server: %s", text);
+	t[CHAT_MAX - 1] = 0;
+	clean_text(t, CHAT_MAX);
+	chat_server(t);   /* the console has it through chat.c */
+	if (g_mode != NET_HOST) return 0;
+	for (int o = 1; o < NPL; o++)
+		if (chat_link(o) && !gone(o)) {
+			chat_queue(o, CHAT_SERVER, CHAT_ALL, t);
+			any = 1;
+		}
+	return any;
+}
+
+int net_server_find(const char *who)
+{
+	int found = -1, count = 0, n = str_len(who);
+	if (n == 1 && who[0] >= '2' && who[0] <= '0' + NPL) {   /* a player number, as the console lists them */
+		int l = who[0] - '1';
+		return g_link[l].used ? l : -1;
+	}
+	for (int l = 1; l < NPL; l++) {   /* the whole name, else a name that starts with it */
+		if (!g_link[l].used) continue;
+		if (str_len(mp_name(l)) == (unsigned)n && str_ieq_n(mp_name(l), who, n)) return l;
+		if (n && str_ieq_n(mp_name(l), who, n)) found = l, count++;
+	}
+	return count > 1 ? -2 : found;
+}
+
+const char *net_server_kick(int l, u32 minutes, const char *reason)
+{
+	static char out[160];
+	char name[MP_NAME_MAX], note[64];
+	int b = 0, i;
+	u32 now = GetTickCount();
+
+	if (g_mode != NET_HOST || l < 1 || l >= NPL || !g_link[l].used) return "No such player.";
+	str_cpy(name, sizeof name, mp_name(l));
+	if (minutes) fmt(note, "Kicked for %d min%s%s", minutes, reason && reason[0] ? ": " : ".", reason ? reason : "");
+	else fmt(note, "Banned from this server%s%s", reason && reason[0] ? ": " : ".", reason ? reason : "");
+	note[sizeof note - 1] = 0;
+	for (i = 0; i < BANS; i++) {   /* the same address again, else a free entry, else the oldest kick */
+		if (g_ban[i].on && g_ban[i].addr == g_link[l].addr.addr) break;
+		if (!g_ban[i].on) b = i;
+	}
+	if (i < BANS) b = i;
+	g_ban[b].on = 1;
+	g_ban[b].addr = g_link[l].addr.addr;
+	g_ban[b].until = minutes ? (now + minutes * 60000u) | 1 : 0;
+	str_cpy(g_ban[b].note, sizeof g_ban[b].note, note);
+	str_cpy(g_ban[b].name, sizeof g_ban[b].name, name);
+	/* it hears why at once (a lost packet: again with every HELLO it sends) */
+	g_lobby_note = note;
+	for (i = 0; i < 3; i++) send_lobby_addr(&g_link[l].addr, l, 0, NETBAD_KICKED);
+	g_lobby_note = 0;
+	if (g_state == S_LOBBY || g_state == S_IDLE || g_link[l].waiting || g_link[l].joining) remove_link(l);
+	else mark_gone(l, 1, minutes ? "was kicked" : "was banned", 0);
+	server_line(name, minutes ? "was kicked" : "was banned");
+	log_msg("net: %s (player %d) removed: %s", name, l + 1, note);
+	fmt(out, "%s: %s", name, note);
+	return out;
+}
+
+/* The removed players still out, in g_ban order: what 'bans' numbers 1, 2, ... */
+static int bans_active(int *idx)
+{
+	int n = 0;
+	for (int i = 0; i < BANS; i++)
+		if (g_ban[i].on && ban_note(g_ban[i].addr)) idx[n++] = i;
+	return n;
+}
+
+/* "unban [who]": who is the number 'bans' gives, the name the player had, its address, or all;
+ * nothing when only one is out. Its PC, still asking to join, comes in at its next HELLO. */
+const char *net_server_unban(const char *who)
+{
+	static char out[160];
+	int idx[BANS], n = bans_active(idx), pick = -1, count = 0;
+	u32 len = str_len(who);
+
+	if (!n) return "Nobody is kicked or banned.";
+	if (!len) {
+		if (n > 1) return "More than one is out: unban <number from 'bans', name, address or all>.";
+		pick = 0;
+	} else if (str_ieq_n(who, "all", 4)) {
+		for (int k = 0; k < n; k++) g_ban[idx[k]].on = 0;
+		log_msg("net: unbanned everyone (%d)", n);
+		fmt(out, "%d player%s can come back.", n, n == 1 ? "" : "s");
+		return out;
+	} else if (len <= 2 && who[0] >= '1' && who[0] <= '9' && (len == 1 || (who[1] >= '0' && who[1] <= '9'))) {
+		int k = len == 1 ? who[0] - '1' : (who[0] - '0') * 10 + who[1] - '1';
+		if (k >= n) return "No such number: 'bans' lists them.";
+		pick = k;
+	} else {
+		for (int k = 0; k < n && pick < 0; k++) {   /* the address, else the whole name, else a name it starts */
+			const u8 *ip = (const u8 *)&g_ban[idx[k]].addr;
+			char a[20];
+			fmt(a, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+			if (str_len(a) == len && str_ieq_n(a, who, len)) pick = k;
+			else if (str_len(g_ban[idx[k]].name) == len && str_ieq_n(g_ban[idx[k]].name, who, len)) pick = k;
+		}
+		if (pick < 0)
+			for (int k = 0; k < n; k++)
+				if (str_ieq_n(g_ban[idx[k]].name, who, len)) pick = k, count++;
+		if (count > 1) return "More than one removed name starts with that: give more of it, or the number from 'bans'.";
+		if (pick < 0) return "Nobody removed matches that ('bans' lists them).";
+	}
+	{
+		int i = idx[pick];
+		const u8 *ip = (const u8 *)&g_ban[i].addr;
+		g_ban[i].on = 0;
+		fmt(out, "%s (%d.%d.%d.%d) can come back.", g_ban[i].name[0] ? g_ban[i].name : "The player", ip[0], ip[1], ip[2], ip[3]);
+		log_msg("net: unbanned %s", out);
+	}
+	return out;
+}
+
+const char *net_server_bans(char *out, u32 size)
+{
+	int idx[BANS], n = bans_active(idx);
+	u32 now = GetTickCount(), used = 0;
+	out[0] = 0;
+	for (int k = 0; k < n; k++) {
+		int i = idx[k];
+		const u8 *ip = (const u8 *)&g_ban[i].addr;
+		char one[200], left[32];
+		if (g_ban[i].until) fmt(left, "%d min left", (int)(g_ban[i].until - now) / 60000 + 1);
+		else str_cpy(left, sizeof left, "until the server closes");
+		fmt(one, "%s%d. %s, %d.%d.%d.%d (%s): %s", used ? "\n" : "", k + 1, g_ban[i].name[0] ? g_ban[i].name : "?",
+		    ip[0], ip[1], ip[2], ip[3], left, g_ban[i].note);
+		if (used + str_len(one) + 1 >= size) break;
+		str_cpy(out + used, size - used, one);
+		used += str_len(one);
+	}
+	return out[0] ? out : "Nobody is kicked or banned.";
+}
+
+const char *net_server_start(void)
+{
+	if (g_mode != NET_HOST) return "Not hosting.";
+	if (g_state != S_RUN || !g_warm) return "Only from the warm-up.";
+	if (!ready_players()) return "Nobody is playing.";
+	server_print("Starting the match.");
+	host_go(0);
+	return 0;
+}
+
+const char *net_server_warmup(void)
+{
+	if (g_mode != NET_HOST) return "Not hosting.";
+	if (g_state == S_RUN && g_warm) return "The warm-up is on already.";
+	if (g_state != S_RUN && g_state != S_OVER && g_state != S_LOST) return "Not now: no match is on.";
+	server_print("Back to a warm-up.");
+	host_go(1);
+	return 0;
+}
+
+const char *net_server_status(char *out, u32 size)
+{
+	const char *map = custom_game_level_name(g_level), *folder = custom_game_level_folder(g_level);
+	char limits[64], tl[24];
+	u32 players, max, spect;
+	int left = g_state == S_RUN && !g_warm ? players_time_left() : -1;
+
+	info_counts(&players, &max, &spect);
+	fmt(limits, "time limit %d min, score limit %d", g_time_limit, g_score_limit);
+	if (left >= 0) fmt(tl, ", %d:%02d left", left / 3600, left / 60 % 60);
+	else tl[0] = 0;
+	fmt(out, "\"%s\" on UDP port %d: %s (%s), %s%s; %d of %d players, %d watching; %s",
+	    g_server_name, g_port, map ? map : "no map", folder ? folder : "-", state_text(), tl, players, max, spect, limits);
+	out[size - 1] = 0;
+	return out;
+}
+
+void net_server_set_limits(int minutes, int score, int have_minutes, int have_score)
+{
+	char v[16];
+	if (have_minutes) {
+		g_time_limit = (u32)minutes;
+		fmt(v, "%d", minutes);
+		WritePrivateProfileStringA("host", "time_limit", v, ini_path());
+	}
+	if (have_score) {
+		g_score_limit = score;
+		fmt(v, "%d", score);
+		WritePrivateProfileStringA("host", "score_limit", v, ini_path());
+	}
+	if (g_mode == NET_HOST && g_state != S_IDLE) send_lobby_all(0);   /* the joiners' screens say them */
+}
+
+void net_server_set_name(const char *name)
+{
+	str_cpy(g_server_name, sizeof g_server_name, name);
+	ini_text_write("host", "name", g_server_name);
+}
+
+void net_server_set_max_players(u32 n)
+{
+	char v[16];
+	g_max_players = n;
+	fmt(v, "%d", n);
+	WritePrivateProfileStringA("host", "max_players", v, ini_path());
+}
+
+void net_server_quit(void)
+{
+	log_msg("net: the dedicated server closes");
+	lobby_goodbye();
+	session_end("the server closed");
+	ONgExitRequested = 1;
 }
 
 /* ---- Install ------------------------------------------------------------------------------ */
@@ -6364,6 +7116,9 @@ static void net_leave(void)
 	 * this PC to catch up with it was taken for a late repeat and ignored (the rejoin never got in) */
 	g_go_taken = g_cu_failed = 0;
 	players_spectate_want(0);   /* a new game starts playing */
+	g_ded_host = 0;
+	g_kick_note[0] = 0;
+	players_set_dedicated(g_dedicated && g_mode == NET_HOST);   /* (a dedicated server never leaves: quit closes Oni) */
 	g_mode = NET_OFF;
 }
 
@@ -6378,7 +7133,24 @@ void net_menu_local(void)
 	log_msg("net: off, playing alone");
 }
 
-void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit)
+u32 net_char_rules(void) { return g_mode == NET_OFF ? NET_CHARS_ALL : g_char_rules & NET_CHARS_ALL; }
+int net_mutator(u32 bit) { return g_mode != NET_OFF && (g_char_rules & bit); }
+int net_mutator_daodan(void) { return net_mutator(NET_MUT_DAODAN); }
+
+u32 net_host_char_rules_saved(void)
+{
+	return (GetPrivateProfileIntA("host", "mutant_muro", 0, ini_path()) ? NET_CHARS_MUTANT_MURO : 0) |
+	       (GetPrivateProfileIntA("host", "shinatama_hasegawa", 0, ini_path()) ? NET_CHARS_SHINATAMA : 0) |
+	       (GetPrivateProfileIntA("host", "mini_striker", 0, ini_path()) ? NET_CHARS_MINI_STRIKER : 0) |
+	       (GetPrivateProfileIntA("host", "daodan", 0, ini_path()) ? NET_MUT_DAODAN : 0) |
+	       (GetPrivateProfileIntA("host", "no_weapons", 0, ini_path()) ? NET_MUT_NO_WEAPONS : 0) |
+	       (GetPrivateProfileIntA("host", "fast_screamer", 0, ini_path()) ? NET_MUT_FAST_SCREAMER : 0) |
+	       (GetPrivateProfileIntA("host", "fast_plasma", 0, ini_path()) ? NET_MUT_FAST_PLASMA : 0) |
+	       (GetPrivateProfileIntA("host", "bombs", 0, ini_path()) ? NET_MUT_BOMBS : 0) |
+	       (GetPrivateProfileIntA("host", "fast_ball", 0, ini_path()) ? NET_MUT_FAST_BALL : 0);
+}
+
+void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules)
 {
 	net_leave();
 	g_startup_mode = 0;
@@ -6389,10 +7161,19 @@ void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, 
 	g_max_players = max_players >= 2 && max_players <= NET_PLAYERS_MAX ? max_players : NET_PLAYERS_MAX;
 	g_time_limit = time_limit;
 	g_score_limit = score_limit;
+	set_char_rules(char_rules & NET_MUTATORS_ALL, "the Host dialog's");
+	motd_load();
 	g_server_id = GetTickCount() * 2654435761u ^ (u32)GetCurrentProcessId();
 	net_prepare();
-	log_msg("net: hosting \"%s\" on UDP port %d, %d players, %d min, %d points", g_server_name, g_port,
-	        g_max_players, g_time_limit, g_score_limit);
+	log_msg("net: hosting \"%s\" on UDP port %d, %d players, %d min, %d points; mutators %02x", g_server_name, g_port,
+	        g_max_players, g_time_limit, g_score_limit, g_char_rules);
+}
+
+/* The Host dialog's Dedicate: hosting as a dedicated server, which stays one until Oni closes */
+void net_menu_dedicated(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules)
+{
+	net_menu_host(port, name, max_players, time_limit, score_limit, char_rules);
+	dedicated_begin();
 }
 
 void net_menu_join(const char *address)
@@ -6400,6 +7181,7 @@ void net_menu_join(const char *address)
 	net_leave();
 	g_startup_mode = 0;
 	g_mode = NET_JOIN;
+	set_char_rules(NET_CHARS_ALL, "joining: until the host's come,");
 	if (g_qsock != INVALID_SOCKET) {   /* the game goes on with it (see "Hole punching") */
 		g_adopt = g_qsock;
 		g_qsock = INVALID_SOCKET;
@@ -6554,6 +7336,16 @@ int net_query_poll(NetServerInfo *out)
 			memcpy(out->folder, p->folder, sizeof out->folder);
 			memcpy(out->map, p->map, sizeof out->map);
 			out->name[sizeof out->name - 1] = out->folder[sizeof out->folder - 1] = out->map[sizeof out->map - 1] = 0;
+			clean_text(out->name, sizeof out->name);
+			out->has_download = 1;
+			out->l0[0] = p->l0[0];
+			out->l0[1] = p->l0[1];
+			out->l0_bytes = p->l0_bytes;
+			out->map_hash = p->map_hash;
+			out->map_bytes = p->map_bytes;
+			out->map_ok = p->map_ok;
+			out->nmods = p->nmods;
+			memcpy(out->mods, p->mods, sizeof out->mods);
 		}
 		return 1;
 	}
@@ -6585,7 +7377,7 @@ void net_query_close(void)
 
 void net_install(void)
 {
-	char host_env[32];
+	char host_env[32], ded_env[96] = "";
 	u32 port;
 
 	/* Always on: the kill camera (players_killcam) is every PC's and a local game's too; the rest
@@ -6593,15 +7385,20 @@ void net_install(void)
 	if (patch_call(0x4fb141, (u32)ONrCamera_Update, (u32)camera_update) &&
 	    patch_call(0x4fb170, (u32)ONrCamera_Update, (u32)camera_update))
 		log_msg("net: the camera follows this PC's player");
+	/* also always on: photo mode hides the player with it */
+	if (!patch_call(ONcDraw_OnScreenCall, (u32)ONrCharacter_OnScreen, (u32)character_on_screen))
+		log_msg("net: draw pass call 0x%x changed, a watching host's character stays drawn", ONcDraw_OnScreenCall);
 
 	helper_set_proto(PROTO);   /* the server list shows only games of this protocol */
 
 	/* The server's description, as the Host dialog saved it */
-	GetPrivateProfileStringA("host", "name", g_server_name, g_server_name, sizeof g_server_name, ini_path());
+	ini_text("host", "name", g_server_name, g_server_name, sizeof g_server_name);
 	g_max_players = GetPrivateProfileIntA("host", "max_players", NET_PLAYERS_MAX, ini_path());
 	if (g_max_players < 2 || g_max_players > NET_PLAYERS_MAX) g_max_players = NET_PLAYERS_MAX;   /* (an older Arklite allowed 64) */
 	g_time_limit = GetPrivateProfileIntA("host", "time_limit", 10, ini_path());
 	g_score_limit = (int)GetPrivateProfileIntA("host", "score_limit", 20, ini_path());
+	g_char_rules = net_host_char_rules_saved();   /* a host started from the ini or ARKLITE_DEDICATED (a joiner's come from LOBBY) */
+	motd_load();
 	if (g_time_limit > NET_TIME_LIMIT_MAX) g_time_limit = 10;   /* (a negative one reads as huge) */
 	port = GetPrivateProfileIntA("net", "port", DEFAULT_PORT, ini_path());
 	g_delay = GetPrivateProfileIntA("net", "delay", 0, ini_path());   /* 0: rollback, no input delay */
@@ -6610,7 +7407,13 @@ void net_install(void)
 	if (port < 1 || port > 65535) port = DEFAULT_PORT;
 	g_port = (u16)port;
 
-	if (GetEnvironmentVariableA("ARKLITE_HOST", host_env, sizeof host_env)) g_mode = NET_HOST;
+	if (GetEnvironmentVariableA("ARKLITE_DEDICATED", ded_env, sizeof ded_env)) {   /* <map folder>[:port] */
+		const char *colon = ded_env;
+		while (*colon && *colon != ':') colon++;
+		g_mode = NET_HOST;
+		host_env[0] = 0;
+		if (*colon) str_cpy(host_env, sizeof host_env, colon + 1);   /* the port, read as ARKLITE_HOST's below */
+	} else if (GetEnvironmentVariableA("ARKLITE_HOST", host_env, sizeof host_env)) g_mode = NET_HOST;
 	else if (GetEnvironmentVariableA("ARKLITE_JOIN", g_join, sizeof g_join)) g_mode = NET_JOIN;
 	else {   /* Arklite.ini [net] host=1 or join=<ip>[:port], for Windows shortcuts */
 		host_env[0] = 0;
@@ -6635,6 +7438,7 @@ void net_install(void)
 	net_prepare();
 	if (g_mode == NET_JOIN) join_install();
 	else view_install();   /* a watching host's view */
+	if (g_mode == NET_HOST && ded_env[0]) dedicated_begin();
 	/* a second Oni on the same PC, for testing: skip "There is already an instance". Daodan
 	 * replaces Oni's platform setup (0x50f670) with DD_ONrPlatform_Initialize, which checks
 	 * the same way (FindWindowA for class "ONI ", call eax; sub esp,8; test eax,eax; je at

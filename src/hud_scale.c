@@ -6,6 +6,16 @@
  * bottom-right, and the rings have fixed radii (40..64 px). So it gets smaller as the resolution
  * goes up.
  *
+ * HUD Centering (Options > More...) slides each side toward the middle of the screen after the
+ * scale: at 0% the rings stay in their corners, at 100% their boxes (10 px in from the corner plus
+ * the ring's background, both scaled) end 10 px (scaled) apart in the middle, as far apart as
+ * each was from its edge. Everything nearest a left corner moves with the left ring, the rest
+ * with the right, by whole pixels. Arklite's own corner text (mp_hud.c, chat.c, obituary.c) goes
+ * the same way through hud_center_shift. The default, 4:3, is no percentage: each side moves in
+ * by half of what the screen has beyond a 4:3 picture of its height ((width - height * 4/3) / 2),
+ * so the rings sit where a 4:3 screen has them, at any resolution (none on 4:3 or narrower; at
+ * most as far as 100%). The Options slider shows it on the step nearest that (hud_center_43_step).
+ *
  * Everything the HUD draws goes through two Motoko primitives, called with the screen points
  * in ECX and the texture coordinates in EDX (points are {x, y, z, 1/w}, 16 bytes):
  *   - 0x41a5c0 textured triangle, 3 points: every ring arc (built by 0x5007d0, drawn by
@@ -134,15 +144,99 @@ static void scale_about(const float *in, float *out, int n, float s, float ax, f
 	}
 }
 
-/* Copies n points into out, scaled by s toward the screen corner nearest their center. */
-static void scale_points(const float *in, float *out, int n, float s)
+/* HUD Centering at 4:3: what each side moves in for a 4:3 picture of the screen's height */
+static float shift_43(int width)
+{
+	return (width - M3rScreen_Height() * (4.0f / 3.0f)) * 0.5f;
+}
+
+/* HUD Centering moves anything this frame */
+static int centering_on(void)
+{
+	if (hud_center_43()) return shift_43(M3rScreen_Width()) >= 0.5f;
+	return hud_center() > 0.0f;
+}
+
+int hud_center_shift(int width, int left, int extent, int halfGap)
+{
+	float room = width * 0.5f - halfGap - extent, dx;
+
+	if (room <= 0.0f) return 0;
+	if (hud_center_43()) {
+		dx = shift_43(width);
+		if (dx > room) dx = room;
+		if (dx <= 0.0f) return 0;
+		dx = round_px(dx);
+	} else {
+		if (hud_center() <= 0.0f) return 0;
+		dx = round_px(room * hud_center());
+	}
+	return left ? (int)dx : -(int)dx;
+}
+
+/* A ring's box: 10 px in from its corner plus its background, scaled; the half gap between them */
+static void ring_box(int left, int *extent, int *halfGap)
+{
+	float s = hud_scale();
+	const u8 *bg = left ? ONgLeftRingBackground : ONgRightRingBackground;
+	int bw = bg ? *(const u16 *)(bg + 0x84) : 128;
+
+	if (bw <= 0 || bw > 512) bw = 128;
+	*extent = (int)round_px((10 + bw) * s);
+	*halfGap = (int)round_px(5 * s);
+}
+
+/* How far the ring of the corner at x = ax (0 or the screen's width) moves toward the middle */
+static float ring_shift(float ax)
+{
+	float w = (float)M3rScreen_Width();
+	int left = ax < w * 0.5f, extent, halfGap;
+
+	ring_box(left, &extent, &halfGap);
+	return (float)hud_center_shift((int)w, left, extent, halfGap);
+}
+
+/* The Options slider's step (of 100 / step percent) nearest to where 4:3 puts the left ring */
+int hud_center_43_step(int step)
+{
+	int w = M3rScreen_Width(), extent, halfGap, k;
+	float room, dx;
+
+	ring_box(1, &extent, &halfGap);
+	room = w * 0.5f - halfGap - extent;
+	dx = shift_43(w);
+	if (room <= 0.0f || dx <= 0.0f || step <= 0) return 0;
+	k = (int)round_px(dx / room * 100.0f / step);
+	return k < 100 / step ? k : 100 / step;
+}
+
+int hud_ring_shift(int left)
+{
+	return (int)ring_shift(left ? 0.0f : (float)M3rScreen_Width());
+}
+
+/* Copies n points into out, scaled by s toward the corner ax, ay, then moved toward the middle
+ * with that corner's ring */
+static void place_about(const float *in, float *out, int n, float s, float ax, float ay)
+{
+	float dx = ring_shift(ax);
+
+	scale_about(in, out, n, s, ax, ay);
+	for (int i = 0; i < n; i++) out[i * 4] += dx;
+}
+
+/* The same toward the screen corner nearest their center */
+static void place_points(const float *in, float *out, int n, float s)
 {
 	float cx = 0.0f, cy = 0.0f, ax, ay;
 
 	for (int i = 0; i < n; i++) { cx += in[i * 4]; cy += in[i * 4 + 1]; }
 	nearest_corner(cx / n, cy / n, &ax, &ay);
-	scale_about(in, out, n, s, ax, ay);
+	place_about(in, out, n, s, ax, ay);
 }
+
+/* The HUD is drawn as Oni lays it out: at 100% and in the corners */
+static int hud_as_is(void) { return hud_scale() == 1.0f && !centering_on(); }
 
 /* Sets a texture's magnification filter the way the driver binds a texture on unit 0
  * (0x40d767), so its record of what is bound stays true */
@@ -200,36 +294,42 @@ static u32 draw_picture(u32 (ONI_FC *draw)(const float *, const void *), float *
 	return result;
 }
 
+/* At 100% the picture only moves, by whole pixels: Oni's own texture as it is */
+static u32 hud_draw(u32 (ONI_FC *draw)(const float *, const void *), float *points, int n, const void *uvs, float s)
+{
+	return s == 1.0f ? draw(points, uvs) : draw_picture(draw, points, n, uvs, s);
+}
+
 static u32 ONI_FC hud_triangle(const float *points, const void *uvs)
 {
-	float scaled[3 * 4];
+	float placed[3 * 4];
 	float s = hud_scale();
 
-	if (!g_inHud || s == 1.0f) return M3rDraw_Triangle(points, uvs);
-	scale_points(points, scaled, 3, s);
-	return draw_picture(M3rDraw_Triangle, scaled, 3, uvs, s);
+	if (!g_inHud || hud_as_is()) return M3rDraw_Triangle(points, uvs);
+	place_points(points, placed, 3, s);
+	return hud_draw(M3rDraw_Triangle, placed, 3, uvs, s);
 }
 
 static u32 ONI_FC hud_sprite(const float *points, const void *uvs)
 {
-	float scaled[2 * 4];
+	float placed[2 * 4];
 	float s = hud_scale();
 
-	if (!g_inHud || s == 1.0f) return M3rDraw_Sprite(points, uvs);
-	scale_points(points, scaled, 2, s);
-	return draw_picture(M3rDraw_Sprite, scaled, 2, uvs, s);
+	if (!g_inHud || hud_as_is()) return M3rDraw_Sprite(points, uvs);
+	place_points(points, placed, 2, s);
+	return hud_draw(M3rDraw_Sprite, placed, 2, uvs, s);
 }
 
-/* A sprite scaled toward the corner of the ring centered at ring */
+/* A sprite placed with the ring centered at ring */
 static u32 ring_sprite(const float *ring, const float *points, const void *uvs)
 {
-	float scaled[2 * 4], ax, ay;
+	float placed[2 * 4], ax, ay;
 	float s = hud_scale();
 
-	if (!g_inHud || s == 1.0f) return M3rDraw_Sprite(points, uvs);
+	if (!g_inHud || hud_as_is()) return M3rDraw_Sprite(points, uvs);
 	nearest_corner(ring[0], ring[1], &ax, &ay);
-	scale_about(points, scaled, 2, s, ax, ay);
-	return draw_picture(M3rDraw_Sprite, scaled, 2, uvs, s);
+	place_about(points, placed, 2, s, ax, ay);
+	return hud_draw(M3rDraw_Sprite, placed, 2, uvs, s);
 }
 
 static u32 ONI_FC help_left_sprite(const float *points, const void *uvs)
@@ -303,12 +403,13 @@ void ONI_FC hud_timer_display(void *center)
 	float s = hud_scale(), at[2], ax, ay;
 	u32 size;
 
-	if (!g_inHud || s == 1.0f || !context) { ONrTimer_Display(center); return; }
+	if (!g_inHud || hud_as_is() || !context) { ONrTimer_Display(center); return; }
 	nearest_corner(c[0], c[1], &ax, &ay);
-	at[0] = round_px(ax + (c[0] - ax) * s);
+	at[0] = round_px(ax + (c[0] - ax) * s) + ring_shift(ax);
 	at[1] = round_px(ay + (c[1] - ay) * s);
 	size = *(u16 *)(context + 0x10);
-	g_textScale = pick_font(context, s, &g_textSharp);
+	g_textSharp = 0;
+	g_textScale = s == 1.0f ? 1.0f : pick_font(context, s, &g_textSharp);
 	g_textX = at[0];
 	g_textY = at[1];
 	g_textOn = 1;
@@ -326,15 +427,19 @@ static u16 ONI_FC help_layout(u8 *context, const u8 *item, void *bounds, short *
 	const float *ring = index < *(const u32 *)(help + 0x2c) ? ONgLeftRing : ONgRightRing;
 	float s = hud_scale(), ax, ay;
 
-	if (!g_inHud || s == 1.0f || !context) return TSrContext_Layout(context, item, bounds, point, out);
+	if (!g_inHud || hud_as_is() || !context) return TSrContext_Layout(context, item, bounds, point, out);
+	nearest_corner(ring[0], ring[1], &ax, &ay);
+	if (s == 1.0f) {   /* only moved: Oni's font as it is */
+		point[0] = (short)(point[0] + ring_shift(ax));
+		return TSrContext_Layout(context, item, bounds, point, out);
+	}
 	if (g_helpContext != context) {
 		if (g_helpContext) TSrContext_SetFontSize(g_helpContext, g_helpSize);
 		g_helpContext = context;
 		g_helpSize = *(u16 *)(context + 0x10);
 		g_helpScale = pick_font(context, s, &g_helpSharp);
 	}
-	nearest_corner(ring[0], ring[1], &ax, &ay);
-	point[0] = (short)round_px(ax + (point[0] - ax) * s);
+	point[0] = (short)(round_px(ax + (point[0] - ax) * s) + ring_shift(ax));
 	point[1] = (short)round_px(ay + (point[1] - ay) * s);
 	g_textScale = g_helpScale;
 	g_textSharp = g_helpSharp;
@@ -354,15 +459,16 @@ static int ring_height(void)
 	return h;
 }
 
-/* Gives a text area the room the rings scaled by s leave it; its bounds go to saved */
+/* Gives a text area the room the rings, scaled by s and moved toward the middle, leave it; its
+ * bounds go to saved */
 static void subtitle_bounds(u8 *area, short *saved, float s)
 {
 	short *r = (short *)(area + 0x12);
 	int w = M3rScreen_Width(), h = M3rScreen_Height(), left, right, bottom, dy;
 
 	for (int i = 0; i < 4; i++) saved[i] = r[i];
-	left = (int)round_px(r[0] * s);
-	right = w - (int)round_px((w - r[2]) * s);
+	left = (int)round_px(r[0] * s + ring_shift(0.0f));
+	right = w - (int)round_px((w - r[2]) * s) + (int)ring_shift((float)w);
 	if (right - left >= w * cSubtitleMinWidth) {
 		r[0] = (short)left;
 		r[2] = (short)right;
@@ -381,7 +487,9 @@ static void subtitles_display(void)
 	u8 *areas[2] = { ONgSubtitleArea, ONgMessageArea };
 	short saved[2][4];
 	float s = hud_scale();
-	int scaled = g_hudDrawn && s > 1.0f;
+	int scaled = g_hudDrawn && (s > 1.0f || centering_on());
+
+	if (photo_hides_hud()) return;   /* photo mode, without Show HUD (photo.c) */
 
 	g_hudDrawn = 0;
 	if (!scaled) { ONrSubtitles_Display(); return; }

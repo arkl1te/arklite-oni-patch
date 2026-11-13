@@ -296,12 +296,20 @@ static int WINAPI swap_buffers(void *dc)
 		if (sound) SSrImpulse_Play(sound, 0, 0, 0, 0);
 		else if (!warned++) log_msg("screenshot: impulse autosave not found, no sound");
 	}
+	/* photo mode's key hints and grid were drawn before F12 came: the next frame, which leaves
+	 * them out (photo.c sees screenshot_pending) */
+	if (photo_overlay_take() && g_request) return (*(SwapBuffersFn *)ONcSwapBuffersImport)(dc);
 	if (g_request) {
 		g_request = 0;
 		if (!g_busy && gl_ready()) capture(dc);
 	}
 	return (*(SwapBuffersFn *)ONcSwapBuffersImport)(dc);
 }
+
+/* photo.c's Screenshot button, and whether a frame is about to be saved (it leaves its hints and
+ * grid out) */
+void screenshot_request(void) { g_request = 1; }
+int  screenshot_pending(void) { return g_request; }
 
 void screenshot_install(void)
 {

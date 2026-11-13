@@ -327,9 +327,11 @@ static void main_loop_sound(void)
 	if (multiplayer_active()) *gs_field(GS_PAUSED) = 0;
 	char_menu_frame();
 	chat_frame();
+	text_frame();
 	vertex_light_frame();
 	spin_particle_frame();
 	bench_frame();
+	if (net_dedicated_host()) g_pending = g_console.pending = 0;   /* a dedicated server shows no dialog: nobody would close it */
 	if (g_pending) {
 		g_pending = 0;
 		g_menu_level = ONrLevel_GetCurrent();

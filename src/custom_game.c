@@ -22,6 +22,7 @@ __declspec(dllimport) u32  WINAPI SetFilePointer(HANDLE, int, int *, u32);
 __declspec(dllimport) int  WINAPI CloseHandle(HANDLE);
 __declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
 __declspec(dllimport) int  WINAPI VirtualFree(void *, u32, u32);
+__declspec(dllimport) int  WINAPI CreateDirectoryA(const char *, void *);
 void *memset(void *, int, unsigned);
 
 /* ---- Custom level discovery ------------------------------------------------------------ */
@@ -60,7 +61,8 @@ static char g_mountedDir[MAX_PATH];           /* its folder, ends with '\' */
 static char g_mountedFolder[64];              /* its folder's name in CustomLevels */
 static char g_mountedName[96];                /* its name (level.ini) */
 static int  g_forceSlot = -1;                 /* joining: the host's slot, so both load the same level number */
-/* Debug: ARKLITE_AUTOSTART=<folder> opens Custom Game and plays that folder, as if clicked. */
+/* Debug: ARKLITE_AUTOSTART=<folder> opens Custom Game and plays that folder, as if clicked.
+ * ARKLITE_DEDICATED=<folder>[:port] does the same for a dedicated server (net.c, server.c). */
 static char g_autostart[64];
 static int  g_autostartPending;
 /* ARKLITE_SAVEPOINT=<n> (with AUTOSTART): start that level at save point n. */
@@ -112,6 +114,19 @@ static int parse_level_file(const char *leaf, u32 *level, u32 *hash)
 	return 1;
 }
 
+/* GameDataFolder\CustomLevels, made when it's missing, maps in it or not, so players see where
+ * maps go. Only inside a GameDataFolder that is there. */
+static void make_custom_levels_folder(void)
+{
+	char path[MAX_PATH];
+
+	if (!g_dataDir[0]) return;
+	fmt(path, "%sCustomLevels", g_dataDir);
+	if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+	if (CreateDirectoryA(path, 0)) log_msg("made %s", path);
+	else log_msg("couldn't make %s", path);
+}
+
 static void scan_custom_levels(void)
 {
 	char pattern[MAX_PATH], path[MAX_PATH];
@@ -119,6 +134,7 @@ static void scan_custom_levels(void)
 	HANDLE hd, hf;
 
 	g_ncustom = 0;
+	make_custom_levels_folder();
 	fmt(pattern, "%sCustomLevels\\*", g_dataDir);
 	hd = FindFirstFileA(pattern, &fd);
 	if (hd == INVALID_HANDLE_VALUE) {
@@ -399,19 +415,42 @@ int custom_game_has_folder(const char *folder)
 	return find_folder(folder) >= 0;
 }
 
-/* The mounted level's folder changed on disk (net.c downloaded the host's version): its files
- * are listed again and mounted in the same slot, before the engine opens them */
-int custom_game_remount(u32 level)
+int custom_game_folder_dir(const char *folder, char *out, u32 size)
 {
-	char folder[64];
+	int i;
+	scan_custom_levels();
+	if ((i = find_folder(folder)) < 0 || str_len(g_dataDir) + str_len(g_custom[i].folder) + 16 > size) return 0;
+	fmt(out, "%sCustomLevels\\%s\\", g_dataDir, g_custom[i].folder);
+	return 1;
+}
+
+/* CustomLevels\<folder>\, there or not yet (net.c downloads a host's map into it) */
+int custom_game_folder_path(const char *folder, char *out, u32 size)
+{
+	if (str_len(g_dataDir) + str_len(folder) + 16 > size) return 0;
+	fmt(out, "%sCustomLevels\\%s\\", g_dataDir, folder);
+	return 1;
+}
+
+/* CustomLevels\<folder> mounted in the custom level's slot, before the engine opens it: the
+ * mounted folder again when its files changed on disk (net.c downloaded the host's version), or
+ * the host's other map when the host turned out to be on that one */
+int custom_game_mount_folder(u32 level, const char *folder)
+{
+	char want[64];
+	int i;
 
 	if (!custom_game_level_ini(level)) return 0;
-	str_cpy(folder, sizeof folder, g_mountedFolder);
+	str_cpy(want, sizeof want, folder);   /* (folder may be g_mountedFolder, which the mount writes) */
 	scan_custom_levels();
-	for (int i = 0; i < g_ncustom; i++)
-		if (str_ieq_n(g_custom[i].folder, folder, sizeof folder)) return mount_custom_level(&g_custom[i]);
-	log_msg("remount: CustomLevels\\%s has no level files any more", folder);
+	if ((i = find_folder(want)) >= 0) return mount_custom_level(&g_custom[i]);
+	log_msg("remount: CustomLevels\\%s has no level files", want);
 	return 0;
+}
+
+int custom_game_remount(u32 level)
+{
+	return custom_game_mount_folder(level, g_mountedFolder);
 }
 
 /* ---- Player spawns ------------------------------------------------------------------------ */
@@ -553,6 +592,27 @@ static void show_selection(void)
 	ui_set_text_fit(g_status, text);
 }
 
+static u32 row_data(int row)
+{
+	return WMrMessage_Send(g_lb, LBcMessage_GetItemData, 0, (u32)row) & 0xffff;
+}
+
+/* The Host dialog's maps: rows that can be hosted */
+static int g_hostRow[MAX_ROWS], g_nhostMaps;
+static const char *g_hostName[MAX_ROWS];
+
+/* Map i's folder, what a joiner downloads (the Host dialog says how much); 0: an original level */
+static int host_map_dir(int i, char *out, u32 size)
+{
+	u32 data;
+
+	if (i < 0 || i >= g_nhostMaps) return 0;
+	data = row_data(g_hostRow[i]);
+	if (data < ITEM_CUSTOM || data - ITEM_CUSTOM >= (u32)g_ncustom || size < MAX_PATH) return 0;
+	fmt(out, "%sCustomLevels\\%s\\", g_dataDir, g_custom[data - ITEM_CUSTOM].folder);
+	return 1;
+}
+
 static void list_frame(void)
 {
 	ui_frame_hook_call(g_listHookOld);
@@ -564,7 +624,7 @@ static void fill_level_list(WMtWindow *dialog)
 	WMtWindow *play = WMrDialog_GetItemByID(dialog, ID_PLAY);
 	WMtWindow *back = WMrDialog_GetItemByID(dialog, ID_BACK);
 	u8 listed[127] = { 0 };
-	char label[128];
+	char label[192];   /* (a name, 96, and its folder, 64) */
 
 	g_lb = WMrDialog_GetItemByID(dialog, ID_LIST);
 	g_status = g_host = 0;
@@ -587,8 +647,15 @@ static void fill_level_list(WMtWindow *dialog)
 	g_host = ui_add(dialog, play, back, 0, ~0u, "Host", ID_HOST, 265, WIN_Y(play), WIN_W(play), WIN_H(play));
 
 	scan_custom_levels();
-	for (int i = 0; i < g_ncustom; i++)
-		add_row(g_custom[i].name, ITEM_CUSTOM + i, custom_spawns(&g_custom[i]));
+	for (int i = 0; i < g_ncustom; i++) {
+		/* Two maps of one name (a copied folder, an old download) say which folder each is */
+		int twin = 0;
+		for (int j = 0; j < g_ncustom && !twin; j++)
+			twin = j != i && str_ieq_n(g_custom[j].name, g_custom[i].name, sizeof g_custom[i].name);
+		if (twin) fmt(label, "%s (%s)", g_custom[i].name, g_custom[i].folder);
+		else str_cpy(label, sizeof label, g_custom[i].name);
+		add_row(label, ITEM_CUSTOM + i, custom_spawns(&g_custom[i]));
+	}
 
 	/* Non-original levels installed the classic way (numbered files in GameDataFolder). */
 	u16 nld = TMrInstance_GetTagCount(TMcTag_ONLD);
@@ -612,12 +679,18 @@ static void fill_level_list(WMtWindow *dialog)
 	show_selection();
 
 	if (g_autostart[0]) {
-		for (int i = 0; i < g_ncustom; i++)
+		int found = 0;
+		for (int i = 0; i < g_ncustom && !found; i++)
 			if (str_ieq_n(g_custom[i].folder, g_autostart, sizeof g_autostart)) {
 				log_msg("autostart: %s (save point %d)", g_custom[i].folder, (int)g_autostartSavePoint);
 				g_startSavePoint = g_autostartSavePoint;
 				WMrDialog_ModalEnd(dialog, ITEM_CUSTOM + i);
+				found = 1;
 			}
+		if (!found) {
+			log_msg("autostart: no level in CustomLevels\\%s", g_autostart);
+			if (net_dedicated_host()) server_print("There's no map in CustomLevels\\%s. Pick one in Custom Game, or close Oni and give the folder's name.", g_autostart);
+		}
 		g_autostart[0] = 0;
 	}
 }
@@ -639,6 +712,8 @@ static u8 ONI_FC custom_game_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	if ((id == ID_PLAY && code == WMcNotify_Click) || (id == ID_LIST && code == WMcNotify_DoubleClick) ||
 	    (id == ID_HOST && code == WMcNotify_Click)) {
 		int row = selected_row();
+		/* a double click on a multiplayer map (blue) hosts it; on any other, plays it */
+		if (id == ID_LIST && row >= 0 && g_rowSpawns[row] >= 2) id = ID_HOST;
 		u32 data = row >= 0 ? WMrMessage_Send(g_lb, LBcMessage_GetItemData, 0, (u32)row) & 0xffff : 0xffff;
 		log_msg("custom game: %s item data 0x%x", id == ID_HOST ? "host" : "play", data);
 		if (data == 0 || data == 0xffff) return 1;
@@ -647,8 +722,18 @@ static u8 ONI_FC custom_game_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 		} else if (g_rowSpawns[row] < 2) {
 			g_shownRow = -2;   /* say why again */
 			show_selection();
-		} else if (mp_menu_host(g_rowName[row])) {
-			WMrDialog_ModalEnd(dialog, data | SEL_HOST);
+		} else {
+			/* the Host dialog's Map dropdown: every map that can be hosted, this one first shown */
+			int start = 0, chosen;
+			g_nhostMaps = 0;
+			for (int r = 0; r < g_nrows; r++)
+				if (g_rowSpawns[r] >= 2) {
+					if (r == row) start = g_nhostMaps;
+					g_hostRow[g_nhostMaps] = r;
+					g_hostName[g_nhostMaps++] = g_rowName[r];
+				}
+			chosen = mp_menu_host(g_hostName, g_nhostMaps, start, host_map_dir);
+			if (chosen >= 0) WMrDialog_ModalEnd(dialog, row_data(g_hostRow[chosen]) | SEL_HOST);
 		}
 	} else if (id == ID_BACK && code == WMcNotify_Click) {
 		WMrDialog_ModalEnd(dialog, 0);
@@ -787,7 +872,7 @@ static u32 custom_game_menu(void)
 		int i = find_folder(folder);
 		if (i < 0) {   /* the host's map isn't here: from the host first */
 			const char *why;
-			if (net_map_fetch(folder, level)) {
+			if (net_map_fetch(folder, sizeof folder, level)) {   /* (folder: the host's map now) */
 				scan_custom_levels();
 				i = find_folder(folder);
 				why = "it came without a level*.dat";
@@ -843,9 +928,15 @@ void custom_game_install(void)
 {
 	if (!GetFullPathNameA("GameDataFolder\\", sizeof g_dataDir, g_dataDir, 0)) g_dataDir[0] = 0;
 	log_msg("custom game: data folder %s", g_dataDir);
+	make_custom_levels_folder();
 	if (GetEnvironmentVariableA("ARKLITE_AUTOSTART", g_autostart, sizeof g_autostart) - 1 < sizeof g_autostart - 1)
 		g_autostartPending = 1;
-	else
+	else if (GetEnvironmentVariableA("ARKLITE_DEDICATED", g_autostart, sizeof g_autostart) - 1 < sizeof g_autostart - 1) {
+		/* a dedicated server (net.c): its map, without the port after a colon */
+		for (char *c = g_autostart; *c; c++)
+			if (*c == ':') *c = 0;
+		g_autostartPending = 1;
+	} else
 		g_autostart[0] = 0;
 	{
 		char sp[8];

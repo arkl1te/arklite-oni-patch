@@ -391,6 +391,7 @@ int helper_packet(u32 sock, const u8 *p, u32 n, const void *from_)
 			o->name[sizeof o->name - 1] = o->folder[sizeof o->folder - 1] = o->map[sizeof o->map - 1] = 0;
 			for (char *s = o->name; *s; s++)
 				if ((u8)*s < 0x20 || *s == 0x7f) *s = ' ';
+			text_clean(o->name, sizeof o->name, o->name);   /* whole characters beyond ASCII only (text.c) */
 		}
 		if (!l->page && (int)l->total != c->list_logged) {
 			log_msg("helper: the server list has %d game%s of this version", l->total, l->total == 1 ? "" : "s");

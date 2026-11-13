@@ -16,8 +16,11 @@
  *
  * The field edits like Arklite's menu fields (mp_menu.c): Left/Right, Home/End, Ctrl for words,
  * Shift to select, Ctrl+A, Backspace/Delete (Ctrl: a word); typing replaces the selection. The
- * text scrolls sideways when it's wider than the field. At most CHAT_MAX - 1 characters of plain
- * ASCII (what Oni's fonts draw).
+ * text scrolls sideways when it's wider than the field. At most CHAT_MAX - 1 bytes: ASCII, and
+ * every other character in two (text.c: Spanish, Russian, Japanese, Chinese...); the cursor, the
+ * selection and the wrapping move a character at a time, and lines without spaces (Chinese,
+ * Japanese) wrap between any two characters. While an IME composes, what it has so far shows at
+ * the cursor, underlined (text_composition), and its candidate list opens under the field.
  *
  * The chat draws in the plain style (the HUD's text is bold): only players' names are bold, and
  * the headings of /help and /movelist (Message.bold_a/bold_b, up to BOLD_MAX spans a message).
@@ -26,8 +29,8 @@
  * names in them by their wording ("... entered the game", "... is now known as ...").
  *
  * Keys come from Oni's window messages: chat.c puts its window procedure in front of Oni's (as
- * mp_names.c does), takes Enter's WM_KEYDOWN to open, and while open eats every WM_KEYDOWN and
- * WM_CHAR (key ups still reach Oni). While the chat is open the game gets no keyboard but keeps
+ * mp_names.c does; a Unicode one, so WM_CHAR is the real character: text.c), takes Enter's
+ * WM_KEYDOWN to open, and while open eats every WM_KEYDOWN and WM_CHAR (key ups still reach Oni). While the chat is open the game gets no keyboard but keeps
  * the mouse: the player still turns, aims and attacks. Oni (no DirectInput on NT, so under Wine
  * too) polls the keys in its input read 0x403220: GetAsyncKeyState for the mouse buttons 1, 2
  * and 0x10 (Shift, read as mouse button 3 / fire3) through ESI, loaded at 0x4032ee, and for every
@@ -74,8 +77,8 @@ __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
 __declspec(dllimport) u32  WINAPI GetTickCount(void);
 
 typedef long (WINAPI *WNDPROC)(void *, u32, u32, long);
-__declspec(dllimport) long WINAPI SetWindowLongA(void *, int, long);
-__declspec(dllimport) long WINAPI CallWindowProcA(WNDPROC, void *, u32, u32, long);
+__declspec(dllimport) long WINAPI SetWindowLongW(void *, int, long);
+__declspec(dllimport) long WINAPI CallWindowProcW(WNDPROC, void *, u32, u32, long);
 
 #define ONgGameState            (*(u8 **)0x5ece7c)
 #define ONrLevel_GetCurrent     ((u16 (ONI_FC *)(void))0x5054c0)
@@ -115,7 +118,7 @@ __declspec(dllimport) long WINAPI CallWindowProcA(WNDPROC, void *, u32, u32, lon
 #define CHAT_SHADE      51        /* 20% black */
 #define WRAP_MAX        16
 #define BOLD_MAX        4
-#define PAD             6
+#define PAD             mp_hud_px(6)   /* px at 1050 tall, as all the chat's spacing (mp_hud.c) */
 #define FADE_OUT_MS     1000
 #define WHITE           0xffffffffu
 #define YELLOW          0xffffe040u   /* this PC's player, as in the score */
@@ -215,6 +218,7 @@ static void add(int who, int self, const char *text)
 	bold(m, 0, m->name_len - 1);
 	m->self = self;
 	log_msg("chat: %s", m->line);
+	server_chat_line(m->line);
 }
 
 /* An answer to a command: only on this screen. A tab in it starts the column (tab_ref: how wide
@@ -233,13 +237,12 @@ static Message *info(const char *text, const char *tab_ref, u32 color)
 	return m;
 }
 
-/* Plain ASCII, no spaces at either end */
+/* Printable ASCII and whole characters beyond it (text.c), no spaces at either end */
 static void clean(char *d, const char *s)
 {
-	int n = 0;
+	int n;
 	while (*s == ' ') s++;
-	for (; *s && n < CHAT_MAX - 1; s++)
-		if (*s >= 0x20 && *s < 0x7f) d[n++] = *s;
+	n = text_clean(d, CHAT_MAX, s);
 	while (n && d[n - 1] == ' ') n--;
 	d[n] = 0;
 }
@@ -300,8 +303,15 @@ void chat_server(const char *text)
 		bold(m, 0, i);
 	} else if ((i = find(m->line, " left the game")) > 0 && i + 14 == len) {
 		bold(m, 0, i);
+	} else if (find(m->line, "Server: ") == 0) {   /* the dedicated server's admin (net_server_say) */
+		bold(m, 0, 7);
+		if (!server_running()) mp_sound("autosave");
+	} else if (find(m->line, "Server MOTD: ") == 0) {   /* the host's message of the day (net.c) */
+		bold(m, 0, 12);
+		if (!server_running()) mp_sound("autosave");
 	}
 	log_msg("chat: (server) %s", m->line);
+	server_chat_line(m->line);
 }
 
 void chat_whisper_receive(int who, const char *text)
@@ -317,6 +327,7 @@ void chat_whisper_receive(int who, const char *text)
 	bold(m, 0, m->name_len - 9);
 	m->color = PINK;
 	log_msg("chat: %s", m->line);
+	server_chat_line(m->line);
 	mp_sound("autosave");
 }
 
@@ -586,7 +597,7 @@ static int whisper_target(const char *args, const char **rest)
 	int best = -1, best_len = 0, found = -1, count = 0, n = 0;
 
 	net_hud(&h);
-	for (int w = 0; w < NET_PLAYERS_MAX; w++) {
+	for (int w = 0; w < NET_SLOTS; w++) {
 		const char *nm = mp_name(w);
 		int k = str_len(nm);
 		if (w == h.local_player || !(h.present >> w & 1) || !k) continue;
@@ -601,7 +612,7 @@ static int whisper_target(const char *args, const char **rest)
 	while (args[n] && args[n] != ' ') n++;
 	*rest = args + n;
 	for (int pass = 0; pass < 2 && !count; pass++)
-		for (int w = 0; w < NET_PLAYERS_MAX; w++) {
+		for (int w = 0; w < NET_SLOTS; w++) {
 			const char *nm = mp_name(w);
 			if (w == h.local_player || !(h.present >> w & 1) || !*nm) continue;
 			if (pass ? str_contains_i(nm, word) : starts_i(nm, word)) found = w, count++;
@@ -819,6 +830,8 @@ static int show_hint(void)
 
 int chat_blocking(void) { return g_open || g_hold; }
 
+int chat_typing(void) { return g_open; }
+
 /* Oni's key reads (0x403220): only the mouse buttons while the chat has the keyboard */
 static short WINAPI key_poll(int vk)
 {
@@ -828,10 +841,12 @@ static short WINAPI key_poll(int vk)
 
 /* ---- Editing (as mp_menu.c's fields) -------------------------------------------------------- */
 
-/* Spaces, letters and digits (a word), and the rest (each a word of its own kind) */
+/* Spaces, letters and digits (a word, with every character beyond ASCII: both its bytes count, so
+ * a run of them never ends inside one), and the rest (each a word of its own kind) */
 static int char_class(char c)
 {
 	if (c == ' ') return 0;
+	if ((u8)c >= 0x80) return 1;
 	if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') return 1;
 	return 2;
 }
@@ -907,17 +922,17 @@ static void key(u32 vk, int lines_page)
 		break;
 	}
 	case VK_ESCAPE: close_chat(1); break;
-	case VK_LEFT: move(ctrl ? word_left(cursor) : sel && !shift ? lo : cursor > 0 ? cursor - 1 : 0, shift); break;
-	case VK_RIGHT: move(ctrl ? word_right(len, cursor) : sel && !shift ? hi : cursor < len ? cursor + 1 : len, shift); break;
+	case VK_LEFT: move(ctrl ? word_left(cursor) : sel && !shift ? lo : text_prev(g_in, cursor), shift); break;
+	case VK_RIGHT: move(ctrl ? word_right(len, cursor) : sel && !shift ? hi : cursor < len ? text_next(g_in, cursor) : len, shift); break;
 	case VK_HOME: move(0, shift); break;
 	case VK_END: move(len, shift); break;
 	case VK_BACK:
 		if (sel) replace(lo, hi, "");
-		else if (cursor > 0) replace(ctrl ? word_left(cursor) : cursor - 1, cursor, "");
+		else if (cursor > 0) replace(ctrl ? word_left(cursor) : text_prev(g_in, cursor), cursor, "");
 		break;
 	case VK_DELETE:
 		if (sel) replace(lo, hi, "");
-		else if (cursor < len) replace(cursor, ctrl ? word_right(len, cursor) : cursor + 1, "");
+		else if (cursor < len) replace(cursor, ctrl ? word_right(len, cursor) : text_next(g_in, cursor), "");
 		break;
 	case VK_UP: g_scroll++; break;
 	case VK_DOWN: if (g_scroll) g_scroll--; break;
@@ -932,12 +947,14 @@ static void key(u32 vk, int lines_page)
 	}
 }
 
+/* A character (Unicode: the window procedure is a W one) */
 static void typed(u32 c)
 {
-	char ins[2] = { (char)c, 0 };
+	char ins[3] = { 0 };
 	int lo, hi;
 
-	if (c < 0x20 || c >= 0x7f) return;   /* Enter, Esc, Backspace, Ctrl+letters: their key downs did it */
+	if (c < 0x20 || c == 0x7f) return;   /* Enter, Esc, Backspace, Ctrl+letters: their key downs did it */
+	if (!text_put(ins, c)) return;       /* none of Arklite's characters (text.c): emoji, Korean... */
 	if (down(VK_CONTROL) && !down(VK_MENU)) return;   /* (AltGr is Ctrl+Alt: its characters count) */
 	if (selection(&lo, &hi)) replace(lo, hi, ins);
 	else replace(g_cur, g_cur, ins);
@@ -961,7 +978,7 @@ static long WINAPI window_proc(void *hwnd, u32 msg, u32 wp, long lp)
 		g_scroll = notches > 0 ? g_scroll + 3 * notches : g_scroll + 3 * notches < 0 ? 0 : g_scroll + 3 * notches;
 		return 0;
 	}
-	return CallWindowProcA(g_old_proc, hwnd, msg, wp, lp);
+	return CallWindowProcW(g_old_proc, hwnd, msg, wp, lp);
 }
 
 /* Every frame, after the update (live_menu.c's main loop hook) */
@@ -972,7 +989,7 @@ void chat_frame(void)
 		void *w = GetForegroundWindow();
 		if (w) GetWindowThreadProcessId(w, &pid);
 		if (w && pid == GetCurrentProcessId()) {
-			g_old_proc = (WNDPROC)SetWindowLongA(w, GWL_WNDPROC, (long)window_proc);
+			g_old_proc = (WNDPROC)SetWindowLongW(w, GWL_WNDPROC, (long)window_proc);
 			if (!g_old_proc) log_msg("chat: can't read the keyboard (no window procedure)");
 		}
 	}
@@ -990,12 +1007,12 @@ int chat_wrap(const char *s, int width, int *starts, int max)
 	while (i < len && n < max) {
 		int e = i, space = -1;
 		starts[n++] = i;
-		while (e < len && mp_hud_text_width(s + i, e + 1 - i) <= width) {
+		while (e < len && mp_hud_text_width(s + i, text_next(s, e) - i) <= width) {
 			if (s[e] == ' ') space = e;
-			e++;
+			e = text_next(s, e);
 		}
 		if (e >= len) break;
-		i = space > i ? space + 1 : e > i ? e : i + 1;   /* at the last space, or mid-word if it has none */
+		i = space > i ? space + 1 : e > i ? e : text_next(s, i);   /* at the last space, or mid-word if it has none */
 	}
 	return n;
 }
@@ -1003,8 +1020,9 @@ int chat_wrap(const char *s, int width, int *starts, int max)
 /* s[a, b) at x */
 static void piece(const char *s, int a, int b, int x, int y, u32 color)
 {
-	char t[MP_NAME_MAX + 16 + CHAT_MAX];
+	char t[MP_NAME_MAX + 16 + 2 * CHAT_MAX];   /* a line, or the field with an IME composition in it */
 	if (b <= a) return;
+	if (b - a >= (int)sizeof t) b = a + (int)sizeof t - 1;
 	memcpy(t, s + a, b - a);
 	t[b - a] = 0;
 	mp_hud_text(t, x, y, MP_LEFT, color);
@@ -1051,12 +1069,12 @@ static int wrap_message(Message *m, int from, int width)
 	while (i < len && n < WRAP_MAX) {
 		int e = i, space = -1;
 		m->starts[n++] = i;
-		while (e < len && span_w(m, i, e + 1) <= width) {
+		while (e < len && span_w(m, i, text_next(m->line, e)) <= width) {
 			if (m->line[e] == ' ') space = e;
-			e++;
+			e = text_next(m->line, e);
 		}
 		if (e >= len) break;
-		i = space > i ? space + 1 : e > i ? e : i + 1;
+		i = space > i ? space + 1 : e > i ? e : text_next(m->line, i);
 	}
 	return n;
 }
@@ -1087,32 +1105,45 @@ static void draw_line(const Message *m, int l, int x, int y, u32 alpha)
 	}
 }
 
-static void draw_input(int x, int y, int w, int lh)
+/* The field: g_in, with the IME's composition (text_composition) at the cursor, underlined */
+static void draw_input(int x, int y, int w, int lh, int screen_w, int screen_h)
 {
-	int len = str_len(g_in), avail = w - 2 * PAD, lo, hi, e;
-	int sel = selection(&lo, &hi);
+	const char *comp = text_composition();
+	char shown[CHAT_MAX * 2];
+	int len, avail = w - 2 * PAD, lo, hi, e, cur, clen = str_len(comp);
+	int sel = !*comp && selection(&lo, &hi);
 
-	g_cur = clamp(g_cur, 0, len);
+	g_cur = clamp(g_cur, 0, str_len(g_in));
+	cur = g_cur;
+	memcpy(shown, g_in, cur);
+	memcpy(shown + cur, comp, clen);
+	str_cpy(shown + cur + clen, sizeof shown - cur - clen, g_in + cur);
+	len = str_len(shown);
+	if (clen) cur += clen;   /* the caret after the composition (the IME's own caret is inside it) */
 	/* keep the cursor in view */
 	if (g_view > g_cur) g_view = g_cur;
-	while (g_view < g_cur && mp_hud_text_width(g_in + g_view, g_cur - g_view) > avail) g_view++;
-	for (e = g_view; e < len && mp_hud_text_width(g_in + g_view, e + 1 - g_view) <= avail; e++);
+	while (g_view < cur && mp_hud_text_width(shown + g_view, cur - g_view) > avail) g_view = text_next(shown, g_view);
+	for (e = g_view; e < len && mp_hud_text_width(shown + g_view, text_next(shown, e) - g_view) <= avail; e = text_next(shown, e));
 	x += PAD;
 	if (sel) {
 		int a = clamp(lo, g_view, e), b = clamp(hi, g_view, e);
-		int xa = x + mp_hud_text_width(g_in + g_view, a - g_view), xb = x + mp_hud_text_width(g_in + g_view, b - g_view);
+		int xa = x + mp_hud_text_width(shown + g_view, a - g_view), xb = x + mp_hud_text_width(shown + g_view, b - g_view);
 		hud_rect(g_blue, xa, y, xb - xa, lh, 220);
 	}
-	piece(g_in, g_view, e, x, y, WHITE);
-	if ((GetTickCount() - g_blink_from) % 1000 < 500) {
-		int xc = x + mp_hud_text_width(g_in + g_view, g_cur - g_view);
-		hud_rect(g_white, xc, y + 1, 2, lh - 2, 255);
+	piece(shown, g_view, e, x, y, WHITE);
+	if (clen) {   /* the composition: underlined */
+		int a = clamp(g_cur, g_view, e), b = clamp(g_cur + clen, g_view, e);
+		int xa = x + mp_hud_text_width(shown + g_view, a - g_view), xb = x + mp_hud_text_width(shown + g_view, b - g_view);
+		if (xb > xa) hud_rect(g_white, xa, y + lh - mp_hud_px(2), xb - xa, mp_hud_px(1) > 0 ? mp_hud_px(1) : 1, 255);
 	}
+	int xc = x + mp_hud_text_width(shown + g_view, (cur > g_view ? cur : g_view) - g_view);
+	if ((GetTickCount() - g_blink_from) % 1000 < 500) hud_rect(g_white, xc, y + 1, mp_hud_px(2), lh - 2, 255);
+	text_ime_spot(xc, y, lh, screen_w, screen_h);   /* the IME's candidate list under the field */
 }
 
 void chat_draw(int width, int height)
 {
-	int lh = mp_hud_line_height(), step, x = 16, w, bottom, top, n, lines, total = 0;
+	int lh = mp_hud_line_height(), step, x = mp_hud_px(16), w, bottom, top, n, lines, total = 0;
 	u32 now = GetTickCount();
 	float scale = hud_scale();
 
@@ -1125,7 +1156,7 @@ void chat_draw(int width, int height)
 		g_blue = hud_solid(0x8000 | 6 << 10 | 12 << 5 | 24, "arklite_chat_select");
 	}
 	if (lh <= 0) return;
-	step = lh + 2;
+	step = lh + mp_hud_px(2);
 
 	/* above the left ring and the subtitles */
 	int ring = ONgLeftRingBackground ? *(u16 *)(ONgLeftRingBackground + 0x86) : 128;
@@ -1137,16 +1168,21 @@ void chat_draw(int width, int height)
 		if (t > height / 2 && t - 10 < bottom) bottom = t - 10;
 	}
 	int hint_y = bottom - lh;   /* the hint's row under the field: the box is a row higher for it */
-	bottom -= lh + 4;
-	if (hint) mp_hud_text_plain("Press ENTER to chat", x + PAD, hint_y, MP_LEFT, GRAY);
-	else if (g_open) mp_hud_text_plain("ESC: close | ENTER: send", x + PAD, hint_y, MP_LEFT, GRAY);
+	bottom -= lh + mp_hud_px(4);
 	top = height * 3 / 10;
 	w = width * 2 / 5;
-	if (w < 280) w = width - 2 * x < 280 ? width - 2 * x : 280;
+	if (w < mp_hud_px(280)) w = width - 2 * x < mp_hud_px(280) ? width - 2 * x : mp_hud_px(280);
+	{   /* HUD Centering: with the left ring it sits above, but on screen */
+		int dx = hud_ring_shift(1);
+		if (x + dx + w > width - x) dx = width - x - w - x;
+		if (dx > 0) x += dx;
+	}
+	if (hint) mp_hud_text_plain("Press ENTER to chat", x + PAD, hint_y, MP_LEFT, GRAY);
+	else if (g_open) mp_hud_text_plain("ESC: close | ENTER: send", x + PAD, hint_y, MP_LEFT, GRAY);
 
 	/* the field under the history */
-	int field_h = lh + 6, field_y = bottom - field_h;
-	int hist_bottom = field_y - 6;
+	int field_h = lh + mp_hud_px(6), field_y = bottom - field_h;
+	int hist_bottom = field_y - mp_hud_px(6);
 	lines = (hist_bottom - top) / step;
 	if (lines > (g_open ? CHAT_LINES : CHAT_LINES_IDLE)) lines = g_open ? CHAT_LINES : CHAT_LINES_IDLE;
 	if (lines < 1) return;
@@ -1174,9 +1210,9 @@ void chat_draw(int width, int height)
 	}
 	if (g_open) {
 		g_scroll = clamp(g_scroll, 0, total > lines ? total - lines : 0);
-		hud_rect(g_black, x, hist_bottom - lines * step - 4, w, lines * step + 4, CHAT_SHADE);
+		hud_rect(g_black, x, hist_bottom - lines * step - mp_hud_px(4), w, lines * step + mp_hud_px(4), CHAT_SHADE);
 		hud_rect(g_black, x, field_y, w, field_h, CHAT_SHADE);
-		draw_input(x, field_y + 3, w, lh);
+		draw_input(x, field_y + mp_hud_px(3), w, lh, width, height);
 	}
 
 	/* from the newest line up, skipping the scrolled ones */

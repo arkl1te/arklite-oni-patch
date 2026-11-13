@@ -503,9 +503,9 @@ static Job *job_new(u32 reason)
 	j->local_slot = -1;
 	for (int i = 0; i < NAMES && i < PLAYERS_MAX; i++) {
 		const char *n = mp_name(i);
-		if (n) str_cpy(j->names[i], sizeof j->names[i], n);
+		if (n) text_to_utf8(j->names[i], sizeof j->names[i], n);   /* as the log has them (common.c log_msg) */
 	}
-	if (mp_name_local()) str_cpy(j->local, sizeof j->local, mp_name_local());
+	if (mp_name_local()) text_to_utf8(j->local, sizeof j->local, mp_name_local());
 	return j;
 }
 

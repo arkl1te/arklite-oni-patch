@@ -61,6 +61,16 @@
  *     60 fps). Every tick now runs that update for its own time, inside the tick (so it draws
  *     from the tick's RNG streams); the per-frame call then finds its time reached and does
  *     nothing.
+ *   - Decorative particles whose effects only look (no damage, explosion, glass, class change or
+ *     impact, and none of that in what they emit or leave behind) draw from this PC's own
+ *     effects stream even inside a tick: whether one exists, and how many children it emits,
+ *     isn't the same on every PC (particle quality disables classes and halves decal limits,
+ *     particle memory fills differently, a glow follows a body part another PC may not have
+ *     animated), and each draw it made from the tick's stream moved every later draw on that
+ *     PC. Matches with Quasi (v0.4.0, 2026-11-10) desynced three times right as player 1's
+ *     Daodan glow started (super particles: decorative, created and started in the character
+ *     update), with every character identical and only the tick's effects seed apart. See
+ *     "Decorative particles" below.
  *
  * While recording or replaying, both RNGs keep their callers: each tick stores the return
  * addresses of the calls since the last tick (bit 31: outside a tick, bit 30: tick local
@@ -171,6 +181,7 @@ static int g_logged_diffs;        /* desyncs logged in detail, at most DIFFS_LOG
 /* RNG callers since the last tick, and per-tick state */
 static u32 g_calls[MAX_CALLS], g_ncalls;
 static int g_in_tick;
+static int g_decor;   /* drawing for a decorative particle that only looks: this PC's stream (see below) */
 static int g_trace;                       /* recording or replaying: keep RNG callers */
 static u32 g_tick_local_seed TICK_STATE = 0xfded;   /* UUrLocalRandom inside ticks */
 static u32 g_fpu_cw;                      /* at the start of this tick */
@@ -197,7 +208,7 @@ __attribute__((no_caller_saved_registers)) static u32 game_random(void)
 
 __attribute__((no_caller_saved_registers)) static u32 local_random(void)
 {
-	if (!g_in_tick) {   /* drawing: the original stream, which it reseeds */
+	if (!g_in_tick || g_decor) {   /* drawing, or a decorative particle: the original stream */
 		UUgLocalRandomSeed = UUgLocalRandomSeed * 0x19660d + 0x3c6ef35f;
 		return UUgLocalRandomSeed >> 16;
 	}
@@ -814,6 +825,263 @@ static void col_install(void)
 		log_msg("collision: move step sort 0x%x changed, move steps not logged", PHcStep_SortCall);
 }
 
+/* ---- Decorative particles -------------------------------------------------------------- *
+ * Bungie's particle classes with flag 1 (definition +4) are decorative: "not necessary for
+ * gameplay". Whether one exists isn't the same on every PC: a class whose quality level is above
+ * this PC's particle quality can't be made at all (P3rLevelBegin sets class +0x40 bit 0x40),
+ * lower quality halves or quarters the decal limits, particle memory runs out differently, and
+ * the character code checks its glows still exist before sending them events (Oni_Character.c:
+ * self_ref against the reference it kept). What such a particle draws from the effects RNG
+ * inside a tick goes to this PC's own stream, so the tick's stream (in the state hash) only
+ * moves for what every PC runs. Not for every decorative class: some hurt characters
+ * (env_fire4_p01, pistol_shot, w9_scr_f01...), and their random values (damage bell curves,
+ * where they fly) must be the same everywhere. A class draws from this PC's stream when it is
+ * decorative and none of its actions is ChangeClass (16), DamageChar (26), DamageBlast (27),
+ * Explode (28), DamageEnvironment (29), GlassCharge (30), SuperballTrigger (77) or ImpactEffect
+ * (60), and every class it can make (its emitters' classes, +0x300, 0x1bc each, class at +0x40;
+ * CollisionEffect (55) and CreateDecal (58) classes, action +4) passes too. Stock level0: 627
+ * of 733 decorative classes, the Daodan glows (super*, murosuper*) among them.
+ *
+ * Where the particle code draws for a class, it runs inside one of these, wrapped at every call
+ * (Oni.exe; the class decides, and a nested call for another class decides again):
+ *   0x455e40 P3rCreateParticle (ECX class, EDX time), 13 calls
+ *   0x456030 P3rCreateEffect (ECX spec: +0 the class, EDX data), 10 calls
+ *   0x45b2c0 P3rSendEvent (ECX class, EDX particle, event, time), 21 calls
+ *   0x45b170 P3iPerformActionList (ECX class, EDX particle, event, list, t, dt, collision): every
+ *            event's actions, a particle's death list (0x456ce0) included, 17 calls
+ *   0x45d610 P3iEmitParticle (ECX parent class, EDX parent, emitter, index, time): decided by
+ *            the emitted class, whose draws (chance, burst, place, speed) come first, 2 calls
+ *   0x45cc70 P3iUpdateParticleClass (ECX class, EDX time), the update loop's 2 calls
+ * and the texture frame draws Oni's own code makes right after making a particle (class flag
+ * 0x40000), with the class or its definition in a register: 0x453a98 (ECX definition), 0x4cd76c
+ * (EDX definition), 0x5184a4 (ECX definition), 0x50a30e (ESI class). */
+#define P3cClasses            0x65c520
+#define P3cClassSize          0x98
+#define P3cMaxClasses         0x800
+#define P3_DEF(c)             (*(u8 **)((c) + 0x48))
+#define P3_DEF_DECORATIVE(d)  (*(u32 *)((d) + 4) & 1)
+#define P3_NUM_ACTIONS(d)     (*(u16 *)((d) + 0x12))
+#define P3_NUM_EMITTERS(d)    (*(u16 *)((d) + 0x14))
+#define P3_ACTIONS(d)         (*(u8 **)((d) + 0x2fc))
+#define P3_EMITTERS(d)        (*(u8 **)((d) + 0x300))
+#define P3cActionSize         0x1a8
+#define P3cEmitterSize        0x1bc
+#define P3cActionDisabled     0x100
+#define P3rCreateParticle_    0x455e40
+#define P3rCreateEffect_      0x456030
+#define P3rSendEvent_         0x45b2c0
+#define P3iPerformActionList_ 0x45b170
+#define P3iEmitParticle_      0x45d610
+#define P3iUpdateParticleClass_ 0x45cc70
+
+static const u32 g_create_calls[] = { 0x4538cd, 0x453f6b, 0x4542bf, 0x45479a, 0x454e05, 0x455208, 0x4557a5,
+	0x456088, 0x45e24f, 0x465044, 0x4cd635, 0x50a0b2, 0x518377 };
+static const u32 g_effect_calls[] = { 0x453d17, 0x453f33, 0x454285, 0x454762, 0x454dae, 0x455769, 0x465a9d,
+	0x4e9772, 0x4fe7ad, 0x509771 };
+static const u32 g_event_calls[] = { 0x453918, 0x453fc1, 0x454312, 0x4547e1, 0x454e4c, 0x455258, 0x4557ee,
+	0x4cd546, 0x4cd80a, 0x4cd817, 0x4df853, 0x4dfa6e, 0x4dfae4, 0x4e85ec, 0x4eaf24, 0x50a380, 0x50a6b2, 0x50aa4b,
+	0x50aba0, 0x518546, 0x51a0eb };
+static const u32 g_actions_calls[] = { 0x456ba0, 0x456cfa, 0x45ac86, 0x45b2f7, 0x45d29f, 0x45d312, 0x45d447,
+	0x45e909, 0x462840, 0x465398, 0x465502, 0x4663b2, 0x4663d2, 0x467532, 0x46778c, 0x467f4e, 0x46800b };
+static const u32 g_emit_calls[] = { 0x45d3a5, 0x464f69 };
+static const u32 g_update_calls[] = { 0x45ca5f, 0x45cc48 };
+
+/* per class index: the definition it was worked out for, and 1 looks only, 2 not, 3 working on it */
+static u8 *g_decor_def[P3cMaxClasses];
+static u8 g_decor_kind[P3cMaxClasses];
+static u32 g_decor_classes, g_decor_looks;
+
+static int decor_looks_only(const u8 *cls, int depth);
+
+static int decor_makes_ok(const u8 *cls, int depth)
+{
+	return !cls || decor_looks_only(cls, depth + 1);
+}
+
+/* 1: a decorative class whose particles only look, and so does everything they make */
+static int decor_looks_only(const u8 *cls, int depth)
+{
+	u32 i;
+	u8 *d;
+	int ok;
+
+	if (!cls || (u32)cls < P3cClasses || (u32)cls >= P3cClasses + P3cMaxClasses * P3cClassSize ||
+	    ((u32)cls - P3cClasses) % P3cClassSize || !(d = P3_DEF(cls)))
+		return 0;
+	i = ((u32)cls - P3cClasses) / P3cClassSize;
+	if (g_decor_def[i] == d && g_decor_kind[i] != 3) return g_decor_kind[i] == 1;
+	if (g_decor_def[i] == d) return 0;   /* makes itself again higher up: counted as not only looking */
+	if (depth > 16 || !P3_DEF_DECORATIVE(d)) {
+		g_decor_def[i] = d;
+		g_decor_kind[i] = 2;
+		return 0;
+	}
+	g_decor_def[i] = d;
+	g_decor_kind[i] = 3;
+	ok = 1;
+	for (u32 k = 0; ok && P3_ACTIONS(d) && k < P3_NUM_ACTIONS(d); k++) {
+		const u8 *a = P3_ACTIONS(d) + k * P3cActionSize;
+		u32 type = *(const u32 *)a;
+		if (type & P3cActionDisabled) continue;
+		switch (type) {
+		case 16: case 26: case 27: case 28: case 29: case 30: case 60: case 77:
+			ok = 0;
+			break;
+		case 55: case 58:   /* CollisionEffect, CreateDecal: the class they make */
+			ok = decor_makes_ok(*(u8 *const *)(a + 4), depth);
+			break;
+		}
+	}
+	for (u32 k = 0; ok && P3_EMITTERS(d) && k < P3_NUM_EMITTERS(d); k++)
+		ok = decor_makes_ok(*(u8 *const *)(P3_EMITTERS(d) + k * P3cEmitterSize + 0x40), depth);
+	g_decor_kind[i] = ok ? 1 : 2;
+	g_decor_classes++;
+	g_decor_looks += ok;
+	return ok;
+}
+
+/* The wrappers: the class decides while the call runs, then the caller's choice again */
+#define DECOR_CALL(cls, call) do { int was_ = g_decor; g_decor = decor_looks_only((cls), 0); call; g_decor = was_; } while (0)
+
+static u8 *ONI_FC decor_create_particle(u8 *cls, u32 time)
+{
+	u8 *r;
+	DECOR_CALL(cls, r = ((u8 *(ONI_FC *)(u8 *, u32))P3rCreateParticle_)(cls, time));
+	return r;
+}
+
+static u8 *ONI_FC decor_create_effect(u8 **spec, void *data)
+{
+	u8 *r;
+	DECOR_CALL(spec ? spec[0] : 0, r = ((u8 *(ONI_FC *)(u8 **, void *))P3rCreateEffect_)(spec, data));
+	return r;
+}
+
+static u32 ONI_FC decor_send_event(u8 *cls, u8 *particle, u32 event, u32 time)
+{
+	u32 r;
+	DECOR_CALL(cls, r = ((u32 (ONI_FC *)(u8 *, u8 *, u32, u32))P3rSendEvent_)(cls, particle, event, time));
+	return r;
+}
+
+static u32 ONI_FC decor_actions(u8 *cls, u8 *particle, u32 event, u32 list, u32 t, u32 dt, u32 collision)
+{
+	u32 r;
+	DECOR_CALL(cls, r = ((u32 (ONI_FC *)(u8 *, u8 *, u32, u32, u32, u32, u32))P3iPerformActionList_)(
+		cls, particle, event, list, t, dt, collision));
+	return r;
+}
+
+static u32 ONI_FC decor_emit(u8 *cls, u8 *particle, u8 *emitter, u32 index, u32 time)
+{
+	u32 r;
+	u8 *child = emitter ? *(u8 **)(emitter + 0x40) : 0;
+	DECOR_CALL(child ? child : cls, r = ((u32 (ONI_FC *)(u8 *, u8 *, u8 *, u32, u32))P3iEmitParticle_)(
+		cls, particle, emitter, index, time));
+	return r;
+}
+
+static void ONI_FC decor_update_class(u8 *cls, u32 time)
+{
+	DECOR_CALL(cls, ((void (ONI_FC *)(u8 *, u32))P3iUpdateParticleClass_)(cls, time));
+}
+
+/* For Arklite's own calls (items.c, mutators.c): the same choice */
+u8 *ONI_FC lockstep_p3_create_particle(u8 *cls, u32 time) { return decor_create_particle(cls, time); }
+u8 *ONI_FC lockstep_p3_create_effect(void *spec, void *data) { return decor_create_effect((u8 **)spec, data); }
+u8 ONI_FC lockstep_p3_send_event(u8 *cls, u8 *particle, u32 event, float time)
+{
+	union { float f; u32 u; } t = { time };
+	return (u8)decor_send_event(cls, particle, event, t.u);
+}
+
+/* The texture frame draws after a particle is made: the class or its definition in a register */
+__attribute__((no_caller_saved_registers, used)) u32 lockstep_local_random_def(const u8 *def)
+{
+	int was = g_decor, looks = 0;
+	for (u32 i = 0; i < P3cMaxClasses; i++)   /* the class whose definition it is */
+		if (g_decor_def[i] == def) { looks = g_decor_kind[i] == 1; break; }
+	g_decor = looks;
+	u32 r = local_random();
+	g_decor = was;
+	return r;
+}
+
+__attribute__((no_caller_saved_registers, used)) u32 lockstep_local_random_class(const u8 *cls)
+{
+	int was = g_decor;
+	g_decor = decor_looks_only(cls, 0);
+	u32 r = local_random();
+	g_decor = was;
+	return r;
+}
+
+__attribute__((naked)) static void decor_random_ecx_def(void)
+{
+	__asm__ volatile("pushl %ecx\n\tcall _lockstep_local_random_def\n\taddl $4, %esp\n\tret");
+}
+
+__attribute__((naked)) static void decor_random_edx_def(void)
+{
+	__asm__ volatile("pushl %edx\n\tcall _lockstep_local_random_def\n\taddl $4, %esp\n\tret");
+}
+
+__attribute__((naked)) static void decor_random_esi_class(void)
+{
+	__asm__ volatile("pushl %esi\n\tcall _lockstep_local_random_class\n\taddl $4, %esp\n\tret");
+}
+
+static u32 decor_patch(const u32 *sites, u32 n, u32 target, void *with)
+{
+	u32 done = 0;
+	for (u32 i = 0; i < n; i++) {
+		const u8 *p = (const u8 *)sites[i];
+		if (p[0] != 0xe8 || sites[i] + 5 + *(const u32 *)(p + 1) != target) return 0;   /* checked before any patch */
+	}
+	for (u32 i = 0; i < n; i++) done += patch_call(sites[i], target, (u32)with);
+	return done;
+}
+
+static void decor_install(void)
+{
+#define N(a) (sizeof a / sizeof a[0])
+	static const u32 def_ecx[] = { 0x453a98, 0x5184a4 }, def_edx[] = { 0x4cd76c }, cls_esi[] = { 0x50a30e };
+	u32 want = N(g_create_calls) + N(g_effect_calls) + N(g_event_calls) + N(g_actions_calls) + N(g_emit_calls) +
+	           N(g_update_calls) + 4, got = 0;
+	const u32 *all[] = { g_create_calls, g_effect_calls, g_event_calls, g_actions_calls, g_emit_calls, g_update_calls,
+	                     def_ecx, def_edx, cls_esi };
+	const u32 counts[] = { N(g_create_calls), N(g_effect_calls), N(g_event_calls), N(g_actions_calls), N(g_emit_calls),
+	                       N(g_update_calls), N(def_ecx), N(def_edx), N(cls_esi) };
+	const u32 targets[] = { P3rCreateParticle_, P3rCreateEffect_, P3rSendEvent_, P3iPerformActionList_, P3iEmitParticle_,
+	                        P3iUpdateParticleClass_, UUrLocalRandom, UUrLocalRandom, UUrLocalRandom };
+	char v[8];
+	if (GetEnvironmentVariableA("ARKLITE_DECOR_FIX", v, sizeof v) && v[0] == '0') {
+		log_msg("decorative particles: left as Oni draws them (ARKLITE_DECOR_FIX=0)");
+		return;
+	}
+	void *const with[] = { (void *)decor_create_particle, (void *)decor_create_effect, (void *)decor_send_event,
+	                       (void *)decor_actions, (void *)decor_emit, (void *)decor_update_class,
+	                       (void *)decor_random_ecx_def, (void *)decor_random_edx_def, (void *)decor_random_esi_class };
+	for (u32 k = 0; k < N(all); k++) {   /* all or nothing: half of them would split a class's draws */
+		for (u32 i = 0; i < counts[k]; i++) {
+			const u8 *p = (const u8 *)all[k][i];
+			if (p[0] != 0xe8 || all[k][i] + 5 + *(const u32 *)(p + 1) != targets[k]) {
+				log_msg("decorative particles: call 0x%x changed, left as they were (they draw from the tick's stream)", all[k][i]);
+				return;
+			}
+		}
+	}
+	for (u32 k = 0; k < N(all); k++) got += decor_patch(all[k], counts[k], targets[k], with[k]);
+	log_msg("decorative particles: those that only look draw from this PC's effects stream (%u of %u calls)", got, want);
+#undef N
+}
+
+/* Logged once a level: how many classes were worked out so far, and how many only look */
+void lockstep_decor_level_log(void)
+{
+	if (g_decor_classes) log_msg("decorative particles: %u classes used so far, %u of them only look", g_decor_classes, g_decor_looks);
+}
+
 static void local_rng_install(void)
 {
 	static const u8 entry[] = { 0xa1, 0xd8, 0x26, 0x53, 0x00 };   /* mov eax, [0x5326d8] */
@@ -1390,6 +1658,7 @@ static void tick_body(void *action)
 	g_tick_sound_seed = tick_sound_seed();
 	played_tick_begin(GS_TICK(ONgGameState));
 	ONrGameState_Tick(action);
+	mutators_tick();   /* bombs going off: the scorch, the body (mutators.c) */
 	if (g_frame_particles) P3rUpdate(GS_TICK(ONgGameState) + 1, 0);   /* as the tick's own (0x4fa9bd) */
 }
 
@@ -1409,6 +1678,8 @@ static void ONI_FC tick_hook(void *action)
 	g_tick_in_frame++;
 }
 
+int lockstep_recording(void) { return g_mode != MODE_OFF; }
+
 static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 {
 	u8 *gs = ONgGameState;
@@ -1418,6 +1689,7 @@ static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 
 	rollback_frame();
 	char_menu_tag(count, actions);   /* this PC's F2 choice, in every record (a replay uses its own) */
+	if (photo_update(count, actions, ticks_run, &err)) return err;   /* single player only */
 	if (net_active()) return net_update(count, actions, ticks_run);
 	if (g_mode != MODE_OFF) {
 		if (g_session == SESSION_RUN && (level != g_level || GS_TICK(gs) < g_last_tick))
@@ -1500,6 +1772,7 @@ void lockstep_install(void)
 	if (tick_ok) {
 		patch_call(ONcGameState_TickCall, (u32)ONrGameState_Tick, (u32)tick_hook);
 		local_rng_install();
+		decor_install();
 		frame_particles_install();
 	} else {
 		log_msg("local RNG: game tick call changed, skipped");

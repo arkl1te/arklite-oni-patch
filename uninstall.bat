@@ -37,6 +37,9 @@ if exist "%AE%\bink_orig.dll" del /f "%AE%\bink_orig.dll"
 :bink_done
 
 if exist "%AE%\Arklite.dll" del /f "%AE%\Arklite.dll" || goto denied
+rem The dedicated server's scripts (only Arklite's own), and the console files a server writes.
+for %%S in (server.bat server.sh) do if exist "%AE%\%%S" findstr /c:"Arklite dedicated server" "%AE%\%%S" >nul && del /f "%AE%\%%S"
+del /f "%AE%\Arklite-console.sh" "%AE%\Arklite-console.key" 2>nul
 rmdir "%AE%\GameDataFolder\CustomLevels" 2>nul
 if defined PURGE del /f "%AE%\Arklite.ini" "%AE%\Arklite.log" 2>nul
 if defined PURGE del /f /q "%AE%\logs\Arklite*" 2>nul

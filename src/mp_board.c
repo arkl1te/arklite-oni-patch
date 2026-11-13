@@ -402,8 +402,10 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 		DCrSetFont(WIN_FONTINFO(area));
 		DCrSetTextAlign(1);
 		g_ascent = (int)(DCrFont_Ascent() & 0xffff);
+		text_multibyte_begin();   /* names beyond ASCII (text.c) */
 		if (g_board) draw_board();
 		else draw_goal();
+		text_multibyte_end();
 		return r;
 	}
 	return g_stock(dialog, msg, p1, p2);

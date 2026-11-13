@@ -99,9 +99,15 @@ static const u32 g_movieVolumeCalls[] = {
  * global point packed x << 16 | y and the button flags). A press on the thumb starts a
  * drag; a press on the track pages by a tenth of the range, so 0..100 sliders could only
  * be clicked in steps of 10. We turn a press on the track of our sliders into a drag with
- * the thumb centred under the cursor. */
+ * the thumb centred under the cursor.
+ * While the button is held, the slider's timer (every 10 ticks) sends a press at the cursor
+ * again, to repeat a page step. That press also comes during a drag, and the page parts reach a
+ * pixel into the thumb, whose place is rounded down to whole pixels: dragged slowly, the cursor
+ * sits on its edge and the value jumps a tenth of the range away and back. On every slider, the
+ * timer's press does nothing during a drag. */
 #define WMrSlider_Mouse       ((void (ONI_FC *)(WMtWindow *, u32, u32, u32))0x472db0)
 #define WMcSlider_MouseCall   0x472b45
+#define WMcSlider_TimerCall   0x472b94
 #define WMcMessage_MouseMove  0x1e
 #define WMcMessage_MouseDown  0x1f
 /* min, max, value, flags (bit 0 = pressed), dragging, grab x - thumb x, thumb x, thumb y, thumb width */
@@ -369,6 +375,14 @@ static void ONI_FC slider_mouse(WMtWindow *w, u32 msg, u32 p1, u32 p2)
 	WMrSlider_Mouse(w, WMcMessage_MouseMove, p1, 1);
 }
 
+static void ONI_FC slider_timer_press(WMtWindow *w, u32 msg, u32 p1, u32 p2)
+{
+	WMtSlider *s = WMrWindow_GetData(w, 0);
+
+	if (s && s->dragging) return;
+	WMrSlider_Mouse(w, msg, p1, p2);
+}
+
 /* The label to the left of a control on the same row */
 static WMtWindow *row_label(WMtWindow *dialog, WMtWindow *control)
 {
@@ -478,6 +492,7 @@ void volume_install(void)
 	n += patch_push_imm32(SLcAmbientStartPushAddr, (u32)SLrSound_AmbientStart, (u32)sound_ambient_start);
 	n += patch_push_imm32(ONcOptions_ProcPushAddr, ONcOptions_Proc, (u32)options_proc);
 	n += patch_call(WMcSlider_MouseCall, (u32)WMrSlider_Mouse, (u32)slider_mouse);
-	total += 9;
+	n += patch_call(WMcSlider_TimerCall, (u32)WMrSlider_Mouse, (u32)slider_timer_press);
+	total += 10;
 	log_msg("volume: %d of %d patches applied (settings in %s)", n, total, ini_path());
 }

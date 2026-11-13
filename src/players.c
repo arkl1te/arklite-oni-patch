@@ -538,12 +538,43 @@ static void emote_tick(int who, u32 word)
 
 static void spectate_tick(int who, u32 word);
 
+/* The Daodan mutator (mp_rules.c): when a player's super amount (+0x1668) passes Muro's shield
+ * threshold (0.5) either way. Logging only, at most once a tick per player. */
+static void daodan_log(int who)
+{
+	static u8 on[PL];
+	static u32 at[PL];
+	u8 *c = player_char(who);
+	u32 tick = ONgGameState ? GS_TICK(ONgGameState) : 0;
+	if (!c || !net_mutator_daodan() || at[who] == tick) return;
+	at[who] = tick;
+	float super = *(float *)(c + 0x1668);
+	if ((super > 0.5f) != on[who]) {
+		on[who] = super > 0.5f;
+		log_msg("players: player %d's Daodan shield %s (health %d of %d, tick %u)", who + 1, on[who] ? "on" : "off",
+		        *(int *)(c + 0x38), *(int *)(c + 0x3c), tick);
+	}
+}
+
 static void note_choice(int who, const u32 *rec)
 {
 	if ((rec[11] & PLAYERS_CHOICE_MASK) != PLAYERS_CHOICE_TAG) return;
 	if (who == 0) spectate_tick(0, rec[11]);   /* the others' in set_input: they may have no character */
 	g_class[who] = (int)(rec[11] & PLAYERS_CLASS_MASK) - 1;
+	/* a character the host's rules leave out (net_char_rules, the same on every PC): the map's */
+	if (!char_menu_class_allowed(g_class[who])) {
+		static int said[PL] = { -1, -1, -1, -1 };   /* (logging only: once per pick, not every tick) */
+		if (said[who] != g_class[who]) {
+			u8 *p = 0;
+			said[who] = g_class[who];
+			TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, (u32)g_class[who], (void **)&p);
+			log_msg("players: player %d picked %s, which the host's mutators leave out: the map's character instead",
+			        who + 1, p ? TMrInstance_GetInstanceName(p) : "?");
+		}
+		g_class[who] = -1;
+	}
 	g_noted[who] = 1;
+	daodan_log(who);
 	emote_tick(who, rec[11]);
 }
 
@@ -554,7 +585,7 @@ void players_tick_record(const u32 *rec)
 	if (!g_enabled || !rec) return;
 	note_choice(0, rec);
 	if ((rec[11] & PLAYERS_CHOICE_MASK) == PLAYERS_CHOICE_TAG && (rec[11] & PLAYERS_PRESENT_FLAG) && ONgGameState)
-		present_tick((rec[11] >> PLAYERS_PRESENT_SHIFT) & 0xf);
+		present_tick(((rec[11] >> PLAYERS_PRESENT_SHIFT) & 0xf) << 1);   /* players 1..4 (0 is always there) */
 }
 
 /* Slot s's tick input, as the tick builds Konoko's (tick: this tick's index in the frame) */
@@ -871,9 +902,10 @@ static int wants_respawn(u8 *c, const u32 *input)
 
 /* Makes player who's character again from its placement at spawn point `point`, as the class
  * chosen with F2. Returns the character's index, or -1. The old character must be gone already. */
+static int placement_of(int who);
 static int make_player(int who, int point)
 {
-	u8 *obj = g_spawn[who], *oncc = 0, *c;
+	u8 *obj = g_spawn[placement_of(who)], *oncc = 0, *c;
 	const char *cls = 0;
 	char saved[64];
 	u32 flags = OBJ_FLAGS(obj), index;
@@ -966,7 +998,18 @@ static void change_class(int who, u8 *c)
  * class choice and hits of whoever had the slot before wiped; one whose bit goes off loses its
  * character (a dead one leaves its corpse). Konoko (player 1, the host) never changes. */
 
-int players_can_join(int who) { return who > 0 && who < PL && multiplayer_map() && who < g_nspawn; }
+/* On a dedicated server (net.c tells every PC, before any level of its sessions loads) Konoko
+ * only watches, so one more player than the map has placements fits: that one is made from
+ * Konoko's placement (placement_of), its character named apart like any extra player's */
+static int g_dedicated;
+void players_set_dedicated(int on)
+{
+	if (g_dedicated != (on != 0)) log_msg("players: %s", on ? "dedicated server: the last player is made from Konoko's placement" : "no dedicated server");
+	g_dedicated = on != 0;
+}
+static int placement_of(int who) { return who < g_nspawn ? who : 0; }
+
+int players_can_join(int who) { return who > 0 && who < PL && multiplayer_map() && who < g_nspawn + g_dedicated; }
 
 static void join_player(int who)
 {
@@ -1062,7 +1105,28 @@ u32  players_spectate_word(void) { return g_spect_want ? PLAYERS_SPECTATE_FLAG :
 int  players_spectating(int who) { return who >= 0 && who < PL && (g_spect >> who & 1); }
 u32  players_spectators(void) { return g_spect; }
 
-int players_hidden(u8 *c) { return (g_spect & 1) && c && c == player_char(0); }
+int players_hidden(u8 *c) { return ((g_spect & 1) && c && c == player_char(0)) || mutators_body_gone(c); }
+
+/* No Weapons (mutators.c): the spawn placements' weapons (CHAR OSD weapon_class_name, object
+ * +0x90) blanked for the level, so no player spawns with one, and put back at its end */
+#define OBJ_WEAPON(o)           ((char *)(o) + 0x90)
+static struct { u8 *obj; char name[64]; } g_weapon_saved[MAX_SPAWN];
+static int g_nweapon_saved;
+
+void players_spawn_weapons(int blank)
+{
+	if (!blank) {
+		for (int i = 0; i < g_nweapon_saved; i++) memcpy(OBJ_WEAPON(g_weapon_saved[i].obj), g_weapon_saved[i].name, 64);
+		g_nweapon_saved = 0;
+		return;
+	}
+	for (int i = 0; i < g_nspawn && g_nweapon_saved < MAX_SPAWN; i++) {
+		g_weapon_saved[g_nweapon_saved].obj = g_spawn[i];
+		memcpy(g_weapon_saved[g_nweapon_saved].name, OBJ_WEAPON(g_spawn[i]), 64);
+		g_nweapon_saved++;
+		OBJ_WEAPON(g_spawn[i])[0] = 0;
+	}
+}
 
 static void forget_player(int who)
 {

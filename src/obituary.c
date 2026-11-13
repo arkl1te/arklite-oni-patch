@@ -210,13 +210,44 @@ static void icon_draw(const u8 *texture, int x, int y, int size, u32 alpha)
 
 #define WHITE   0x00ffffffu
 #define YELLOW  0x00ffe040u
-#define GAP     8   /* between a name and the icon */
+#define GAP     mp_hud_px(8)   /* between a name and the icon (px at 1050 tall, mp_hud.c) */
+
+/* The age of a line on screen now, or -1 when it isn't */
+static int obit_age(const Obit *o, u32 now)
+{
+	if (!o->tick || now + 1 < o->tick) return -1;   /* none, or from before a level restart */
+	return now + 1 - o->tick < OBIT_TICKS ? (int)(now + 1 - o->tick) : -1;
+}
+
+/* The feed's widest line, for HUD Centering (mp_hud.c), with the HUD's text font. It only grows
+ * while lines show, so the feed doesn't move as they come and go. */
+int obit_width(void)
+{
+	static int widest;
+	int line = mp_hud_line_height(), now_widest = 0, any = 0;
+	u32 now;
+
+	if (!ONgGameState || !line) return widest;
+	now = GS_TICK(ONgGameState);
+	for (int i = 0; i < OBIT_MAX; i++) {
+		const Obit *o = &g_obit[i];
+		int w = line * 2 + GAP + mp_hud_text_width(mp_name(o->victim), -1);
+
+		if (obit_age(o, now) < 0) continue;
+		any = 1;
+		if (o->killer >= 0) w += mp_hud_text_width(mp_name(o->killer), -1) + GAP;
+		if (w > now_widest) now_widest = w;
+	}
+	if (!any) widest = 0;
+	else if (now_widest > widest) widest = now_widest;
+	return widest;
+}
 
 /* From the HUD (mp_hud.c), with its text font: lines from y down, left-aligned to x */
 void obit_draw(int x, int y, int local)
 {
 	u32 now;
-	int line = mp_hud_line_height(), size = line * 2, row = size + 2;
+	int line = mp_hud_line_height(), size = line * 2, row = size + mp_hud_px(2);
 
 	if (!ONgGameState || !line) return;
 	if (!g_icons_tried && !net_synced()) obit_textures_prepare();   /* a game on one PC: no rollback */
@@ -227,9 +258,8 @@ void obit_draw(int x, int y, int local)
 		u32 age, alpha;
 		int left = x, ty = y + (size - line) / 2;
 
-		if (!o->tick || now + 1 < o->tick) continue;   /* none, or from before a level restart */
-		age = now + 1 - o->tick;
-		if (age >= OBIT_TICKS) continue;
+		if (obit_age(o, now) < 0) continue;
+		age = (u32)obit_age(o, now);
 		alpha = age + OBIT_FADE <= OBIT_TICKS ? 255 : (OBIT_TICKS - age) * 255 / OBIT_FADE;
 		icon = o->kind == OBIT_WEAPON && o->weapon ? ONWC_ICON(o->weapon) : g_icon[g_kind_icon[o->kind]];
 

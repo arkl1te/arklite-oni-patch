@@ -18,10 +18,35 @@
  *             as their click's Command. On the F1 screen's other windows too, not only on them.
  * Popup menus are left alone, closed or open: a stray notch mustn't change the resolution.
  * Nothing happens while a slider or scroll bar is being dragged (they hold WMgMouseFocus).
- * Wheel turns in gameplay aren't counted, or a pause menu would start scrolled. */
+ * Wheel turns in gameplay aren't counted, or a pause menu would start scrolled; photo mode
+ * (photo.c) takes them for its zoom while it's on.
+ *
+ * A list's own scroll bar arrows and track (SBcNotify_LineUp/Down, PageUp/Down) step the scroll
+ * position too, so on a short list an arrow click often moved nothing (the Host page's Mutators:
+ * 9 rows, 8 showing, a row every 5 clicks). Their message (0x58, WMiListBox_HandleVerticalScroll
+ * 0x46d2c0, called only at 0x46cd3e) comes here first and becomes the thumb position of the
+ * first row one row (arrows) or one page (track) away, as the wheel's. Dragging the thumb is
+ * left as it was.
+ *
+ * Holding an arrow repeats: the scroll bar's timer (every 10 frames from the bar's making, not
+ * from the press: WMcScrollbar_TimerFrequency) sends the press again while the button is down
+ * (WMiScrollbar_HandleTimer, its call at 0x471d55), so a plain click stepped twice about half the
+ * time. Its repeats now start once the button has been down SB_REPEAT_DELAY_MS (the press itself
+ * goes through 0x471cb5).
+ *
+ * F12 (Arklite's screenshot key, screenshot.c) is kept from list boxes: a key a list doesn't
+ * know goes to its type-ahead search (WMiListBox_HandleKeyEvent 0x46d0c0, called at 0x46cb76),
+ * which moved the selection, so a screenshot of a menu changed the menu.
+ *
+ * The same window procedure keeps F10 from Windows: it's the system menu key, and DefWindowProc
+ * would go into menu mode on it (WM_SYSKEYDOWN, then SC_KEYMENU), which can swallow the next key.
+ * Oni has no menu, and F10 is photo mode's key; Oni reads its own keys without these messages. */
 #include "arklite.h"
 
 #define WM_MOUSEWHEEL   0x20a
+#define WM_SYSKEYDOWN   0x104
+#define WM_SYSKEYUP     0x105
+#define VK_F10          0x79
 #define WHEEL_DELTA     120
 #define GWL_WNDPROC     (-4)
 #define WHEEL_ROWS      3
@@ -31,8 +56,9 @@ typedef long (WINAPI *WNDPROC)(void *, u32, u32, long);
 __declspec(dllimport) void *WINAPI GetForegroundWindow(void);
 __declspec(dllimport) u32 WINAPI GetWindowThreadProcessId(void *, u32 *);
 __declspec(dllimport) u32 WINAPI GetCurrentProcessId(void);
-__declspec(dllimport) long WINAPI SetWindowLongA(void *, int, long);
-__declspec(dllimport) long WINAPI CallWindowProcA(WNDPROC, void *, u32, u32, long);
+__declspec(dllimport) u32 WINAPI GetTickCount(void);
+__declspec(dllimport) long WINAPI SetWindowLongW(void *, int, long);
+__declspec(dllimport) long WINAPI CallWindowProcW(WNDPROC, void *, u32, u32, long);
 
 #define WMcModal_UpdateCall     0x468ad4
 #define WMrUpdate               ((void (ONI_FC *)(void))0x477070)
@@ -70,10 +96,40 @@ typedef struct { int min, max, value; } Slider;
 static WNDPROC g_old_proc;
 static int g_wheel;      /* in 120ths of a notch, up is positive */
 
+static void install_proc(void);
+static int g_hud_wheel;  /* the same, while the F2 menu (char_menu.c) is up: it takes them itself */
+static int g_photo_wheel;   /* the same, while photo mode is on */
+
 static long WINAPI window_proc(void *hwnd, u32 msg, u32 wp, long lp)
 {
-	if (msg == WM_MOUSEWHEEL && LIrMode_Get() != LIcMode_Game) g_wheel += (short)(wp >> 16);
-	return CallWindowProcA(g_old_proc, hwnd, msg, wp, lp);
+	if ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wp == VK_F10) return 0;
+	if (msg == WM_MOUSEWHEEL) {
+		if (char_menu_open()) g_hud_wheel += (short)(wp >> 16);
+		else if (photo_active() && LIrMode_Get() == LIcMode_Game) g_photo_wheel += (short)(wp >> 16);
+		else if (LIrMode_Get() != LIcMode_Game) g_wheel += (short)(wp >> 16);
+	}
+	return CallWindowProcW(g_old_proc, hwnd, msg, wp, lp);
+}
+
+/* Whole notches turned since the last call while the F2 menu was up (up is positive). Also puts
+ * the window procedure in place if no menu has yet (a game started from ARKLITE_AUTOSTART or
+ * Arklite.ini [net] join skips them) */
+int menu_wheel_hud_take(void)
+{
+	if (!g_old_proc) install_proc();
+	int notches = g_hud_wheel / WHEEL_DELTA;
+	g_hud_wheel -= notches * WHEEL_DELTA;
+	if (!char_menu_open()) g_hud_wheel = 0;
+	return notches;
+}
+
+int menu_wheel_photo_take(void)
+{
+	if (!g_old_proc) install_proc();
+	int notches = g_photo_wheel / WHEEL_DELTA;
+	g_photo_wheel -= notches * WHEEL_DELTA;
+	if (!photo_active()) g_photo_wheel = 0;
+	return notches;
 }
 
 static void install_proc(void)
@@ -83,8 +139,16 @@ static void install_proc(void)
 
 	if (w) GetWindowThreadProcessId(w, &pid);
 	if (!w || pid != GetCurrentProcessId()) return;   /* Oni isn't in front: at a later frame */
-	g_old_proc = (WNDPROC)SetWindowLongA(w, GWL_WNDPROC, (long)window_proc);
+	g_old_proc = (WNDPROC)SetWindowLongW(w, GWL_WNDPROC, (long)window_proc);
 	if (!g_old_proc) log_msg("menu wheel: can't read the mouse wheel (no window procedure)");
+	else log_msg("menu wheel: reading the wheel in window %p", w);
+}
+
+/* The thumb position that shows first as a list's first row (the list's own conversion,
+ * first = position * ratio, undone and rounded) */
+static u32 list_thumb_for(u8 *p, int first)
+{
+	return (u32)(int)((float)first / LB_RATIO(p) + 0.5f);
 }
 
 static void wheel_list(WMtWindow *list, int notches)
@@ -100,7 +164,62 @@ static void wheel_list(WMtWindow *list, int notches)
 	if (first < 0) first = 0;
 	if (first > last) first = last;
 	if (first != LB_START(p))
-		WMrMessage_Send(list, LBcMessage_Scroll, LBcNotify_Thumb, (u32)(int)((float)first / LB_RATIO(p) + 0.5f));
+		WMrMessage_Send(list, LBcMessage_Scroll, LBcNotify_Thumb, list_thumb_for(p, first));
+}
+
+#define WMiListBox_VScroll      ((void (ONI_FC *)(WMtWindow *, u32, u32))0x46d2c0)
+#define WMcListBox_VScrollCall  0x46cd3e
+#define WMiListBox_Key          ((void (ONI_FC *)(WMtWindow *, u32, u32, u32))0x46d0c0)
+#define WMcListBox_KeyCall      0x46cb76
+#define SBcNotify_PageDown      3
+#define LIcKeyCode_F12          0x8c
+
+static void ONI_FC list_vscroll(WMtWindow *list, u32 p1, u32 p2)
+{
+	u8 *p = WMrWindow_GetBytes(list, 0);
+	u32 code = p1 >> 16;
+	if (p && code <= SBcNotify_PageDown) {
+		int rows = (int)WMrMessage_Send(list, LBcMessage_GetNumLines, 0, 0);
+		int last = rows - LB_VISIBLE(p), step = code >= 2 ? LB_VISIBLE(p) : 1;
+		int first = LB_START(p) + (code & 1 ? step : -step);   /* odd: down */
+		if (last <= 0 || LB_RATIO(p) <= 0.0f || step <= 0) return;   /* all of it shows */
+		if (first < 0) first = 0;
+		if (first > last) first = last;
+		if (first == LB_START(p)) return;
+		p1 = LBcNotify_Thumb | (p1 & 0xffff);
+		p2 = list_thumb_for(p, first);
+	}
+	WMiListBox_VScroll(list, p1, p2);
+}
+
+#define WMiScrollbar_Mouse      ((void (ONI_FC *)(WMtWindow *, u32, u32, u32))0x471de0)
+#define WMcScrollbar_MouseCall  0x471cb5
+#define WMcScrollbar_TimerCall  0x471d55
+#define WMcMessage_LMouseDown   0x1f
+#define SB_REPEAT_DELAY_MS      400
+
+static WMtWindow *g_sb_pressed;
+static u32 g_sb_press_ms;
+
+static void ONI_FC scrollbar_mouse(WMtWindow *sb, u32 msg, u32 p1, u32 p2)
+{
+	if (msg == WMcMessage_LMouseDown) {
+		g_sb_pressed = sb;
+		g_sb_press_ms = GetTickCount();
+	}
+	WMiScrollbar_Mouse(sb, msg, p1, p2);
+}
+
+static void ONI_FC scrollbar_timer_press(WMtWindow *sb, u32 msg, u32 p1, u32 p2)
+{
+	if (sb == g_sb_pressed && GetTickCount() - g_sb_press_ms < SB_REPEAT_DELAY_MS) return;
+	WMiScrollbar_Mouse(sb, msg, p1, p2);
+}
+
+static void ONI_FC list_key(WMtWindow *list, u32 msg, u32 key, u32 p2)
+{
+	if (key == LIcKeyCode_F12) return;
+	WMiListBox_Key(list, msg, key, p2);
 }
 
 static void wheel_slider(WMtWindow *slider, int notches)
@@ -170,4 +289,8 @@ void menu_wheel_install(void)
 {
 	if (patch_call(WMcModal_UpdateCall, (u32)WMrUpdate, (u32)modal_update))
 		log_msg("menu wheel: patched");
+	if (patch_call(WMcListBox_VScrollCall, 0x46d2c0, (u32)list_vscroll) && patch_call(WMcListBox_KeyCall, 0x46d0c0, (u32)list_key) &&
+	    patch_call(WMcScrollbar_MouseCall, 0x471de0, (u32)scrollbar_mouse) &&
+	    patch_call(WMcScrollbar_TimerCall, 0x471de0, (u32)scrollbar_timer_press))
+		log_msg("menu wheel: list arrows a row a click (held: repeats after %d ms), F12 kept from lists", SB_REPEAT_DELAY_MS);
 }

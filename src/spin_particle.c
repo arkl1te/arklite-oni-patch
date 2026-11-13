@@ -69,6 +69,10 @@ typedef struct {
 static Spin *g_spins;
 static u32   g_count;
 static u32   g_level;
+/* Every custom map plays as the same level number (Custom Game's slot), so the folder says which
+ * map the records are for: going from one custom map to another kept the first one's records
+ * (none, for a map without spinning groups) and nothing turned. */
+static char  g_dir[MAX_PATH];
 
 static void drop(void)
 {
@@ -86,6 +90,7 @@ static void load(u32 level)
 
 	drop();
 	g_level = level;
+	str_cpy(g_dir, sizeof g_dir, dir ? dir : "");
 	if (!dir) return;
 	fmt(path, "%sspinparticles.bin", dir);
 	f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 1, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
@@ -143,6 +148,22 @@ static float angle(float seconds, u32 tick)
 	return seconds < 0.0f ? -a : a;
 }
 
+static int same_dir(const char *dir)
+{
+	const char *a = dir ? dir : "", *b = g_dir;
+	while (*a && *a == *b) a++, b++;
+	return *a == *b;
+}
+
+/* The level is going away, even to load again (the warm-up's reload): the next frame in a level
+ * reads its file again and takes the particles' placed matrices from the new level's env particles */
+void spin_particle_level_end(void)
+{
+	drop();
+	g_level = 0;
+	g_dir[0] = 0;
+}
+
 /* Every frame, after the update (live_menu.c's main loop hook) */
 void spin_particle_frame(void)
 {
@@ -153,7 +174,7 @@ void spin_particle_frame(void)
 		g_level = 0;
 		return;
 	}
-	if (level != g_level) load(level);
+	if (level != g_level || !same_dir(custom_game_level_dir(level))) load(level);
 	if (!g_count) return;
 	tick = *(u32 *)(ONgGameState + GS_TICK);
 	for (u8 *ep = EPgHead; ep; ep = *(u8 **)(ep + EP_NEXT)) {

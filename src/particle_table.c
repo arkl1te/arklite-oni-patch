@@ -120,6 +120,8 @@ static u32 ONI_FC level_begin_hook(u32 ecx, u32 edx)
 static u32 ONI_FC level_end_hook(u32 ecx, u32 edx)
 {
 	vertex_light_level_end();
+	spin_particle_level_end();
+	mp_rules_level_end();   /* the level's classes are still there */
 	u32 result = P3rLevelEnd(ecx, edx);
 	u32 level0 = P3gClassesInTable;
 

@@ -457,6 +457,145 @@ static void aim_clip_install(void)
 #define TMrInstance_GetDataPtr  ((u16 (ONI_FC *)(u32, const char *, void *))0x4232e0)
 #define TAG_ONCC                0x4f4e4343
 #define ONCC_LEFT_HANDED(c)     (*(u8 *)((c) + 0xc8c))
+/* The Daodan mutator: the class flags behind Konoko's and Muro's overhealing powers, set on every
+ * class. superHypo (+0xc8d, read at 0x4dd882, 0x4df890, 0x4e7bec): health over the maximum turns
+ * into the super amount (OniFoxed Oni_Character.c ~4504: the glow, and melee hits stronger with
+ * the overhealth, ~9738 overhypo damage). superShield (+0xc8e, read at 0x4e6225, 0x4e64d0
+ * HasSuperShield, 0x4e7846, 0x4ef71a): over 0.5 of super amount the character has the Daodan
+ * shield (its look and damage absorption). Overhealing itself (hypos past the maximum, up to the
+ * boosted health) is already everyone's. Set at a level's load, before any character is made and
+ * outside the ticks, from the host's mutators (the same on every PC: LOBBY brings them before any
+ * session loads), and put back at the level's unload while its own classes are still loaded. */
+#define ONCC_SUPER_HYPO(c)      (*(u8 *)((c) + 0xc8d))
+#define ONCC_SUPER_SHIELD(c)    (*(u8 *)((c) + 0xc8e))
+/* Its look: particles, not the force field. A class's particle list (ONCP, ONCC +0x430: +0x10
+ * classes found, +0x14 count, +0x18 entries of 0x58 bytes: +0 name, +0x10 particle class name,
+ * +0x50 body part, +0x54 the class, resolved) gives the super particles, its entries named
+ * "super..." (0x4df994: SuperParticle_Create, while the super amount is over 0; the body part must
+ * be under 19). Only Konoko's classes and Muro's have them: every other class gets a copy of its
+ * list with Konoko's three added (superglow_e01 on the pelvis, super_e01 on each fist) for women,
+ * Muro's (murosuperglow_e01, murosuper_e01) for men (char_menu.c), its own list pointer put back at
+ * the unload. The Daodan shield's own look, the DAODAN_SHIELD texture over the body (the draw at
+ * 0x4e1f72: active +0x2801 set -> mov edx,0x550e88 at 0x4e1f7c, the texture's name), goes: that
+ * name is read from a buffer of Arklite's, which holds a name no texture has while the mutator is
+ * on, and the draw skips a texture it can't find (0x4e1fac). A force field picked up and the boss
+ * shield keep theirs (the other branch). */
+#define ONCC_PARTICLES(c)       (*(u8 **)((c) + 0x430))
+#define ONCP_FOUND(a)           (*(u8 *)((a) + 0x10))
+#define ONCP_COUNT(a)           (*(u32 *)((a) + 0x14))
+#define ONCP_ENTRY(a, i)        ((a) + 0x18 + (i) * 0x58)
+#define ONCP_ENTRY_SIZE         0x58
+#define ONCP_CLASS(e)           (*(u8 **)((e) + 0x54))
+#define P3rGetParticleClass     ((u8 *(ONI_FC *)(const char *))0x45a030)
+#define ONcDraw_DaodanShieldName 0x4e1f7c   /* mov edx,0x550e88 ("DAODAN_SHIELD") */
+#define DAODAN_MAX              1024
+#define SUPER_MAX               4           /* super particles copied from Konoko's or Muro's list */
+static struct { u8 *oncc, *particles; u8 hypo, shield; } g_daodan[DAODAN_MAX];
+static u32 g_ndaodan;
+static u8 *g_lists;                         /* the copies, one block a level */
+static char g_shield_name[16] = "DAODAN_SHIELD";
+__declspec(dllimport) void * WINAPI VirtualAlloc(void *, u32, u32, u32);
+__declspec(dllimport) int    WINAPI VirtualFree(void *, u32, u32);
+
+void mp_rules_level_end(void)
+{
+	lockstep_decor_level_log();
+	mutators_level_end();
+	for (u32 i = 0; i < g_ndaodan; i++) {
+		ONCC_SUPER_HYPO(g_daodan[i].oncc) = g_daodan[i].hypo;
+		ONCC_SUPER_SHIELD(g_daodan[i].oncc) = g_daodan[i].shield;
+		ONCC_PARTICLES(g_daodan[i].oncc) = g_daodan[i].particles;
+	}
+	if (g_ndaodan) log_msg("mp rules: Daodan mutator off: %d classes as they were", g_ndaodan);
+	g_ndaodan = 0;
+	str_cpy(g_shield_name, sizeof g_shield_name, "DAODAN_SHIELD");
+	if (g_lists) VirtualFree(g_lists, 0, 0x8000);
+	g_lists = 0;
+}
+
+static int is_super(const u8 *entry) { return str_ieq_n((const char *)entry, "super", 5); }
+
+/* The class's super particle entries (Konoko's or Muro's), resolved; their count */
+static u32 super_entries(const char *cls, u8 (*out)[ONCP_ENTRY_SIZE])
+{
+	u8 *oncc = 0, *list;
+	u32 n = 0;
+	if (TMrInstance_GetDataPtr(TAG_ONCC, cls, &oncc) || !oncc || !(list = ONCC_PARTICLES(oncc))) return 0;
+	for (u32 i = 0; i < ONCP_COUNT(list) && n < SUPER_MAX; i++)
+		if (is_super(ONCP_ENTRY(list, i))) {
+			memcpy(out[n], ONCP_ENTRY(list, i), ONCP_ENTRY_SIZE);
+			if (!ONCP_CLASS(out[n])) ONCP_CLASS(out[n]) = P3rGetParticleClass((const char *)out[n] + 0x10);
+			if (ONCP_CLASS(out[n])) n++;
+		}
+	return n;
+}
+
+static void daodan_level(void)
+{
+	static u8 sets[2][SUPER_MAX][ONCP_ENTRY_SIZE];
+	u32 n, nset[2], size = 0, used = 0, women = 0, men = 0;
+
+	mp_rules_level_end();   /* (a level end that never came) */
+	if (!multiplayer_map() || !net_mutator_daodan()) return;
+	nset[0] = super_entries("muro_generic", sets[0]);     /* men */
+	nset[1] = super_entries("konoko_generic", sets[1]);   /* women */
+	n = TMrInstance_GetTagCount(TAG_ONCC);
+	for (u32 k = 0; k < n; k++) {   /* room for every class's copy */
+		u8 *p = 0, *l;
+		if (TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, k, (void **)&p) || !p) continue;
+		l = ONCC_PARTICLES(p);
+		size += 0x18 + ((l ? ONCP_COUNT(l) : 0) + SUPER_MAX) * ONCP_ENTRY_SIZE;
+	}
+	g_lists = size ? VirtualAlloc(0, size, 0x3000, 4) : 0;
+	for (u32 k = 0; k < n && g_ndaodan < DAODAN_MAX; k++) {
+		u8 *p = 0, *l, *copy;
+		int has_super = 0, woman;
+		if (TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, k, (void **)&p) || !p) continue;
+		g_daodan[g_ndaodan].oncc = p;
+		g_daodan[g_ndaodan].hypo = ONCC_SUPER_HYPO(p);
+		g_daodan[g_ndaodan].shield = ONCC_SUPER_SHIELD(p);
+		g_daodan[g_ndaodan].particles = l = ONCC_PARTICLES(p);
+		g_ndaodan++;
+		ONCC_SUPER_HYPO(p) = 1;
+		ONCC_SUPER_SHIELD(p) = 1;
+		for (u32 i = 0; l && i < ONCP_COUNT(l) && !has_super; i++) has_super = is_super(ONCP_ENTRY(l, i));
+		woman = char_menu_class_female(TMrInstance_GetInstanceName(p));
+		if (has_super || !g_lists || !nset[woman]) continue;
+		/* its own list (each class resolved, as Oni would) and the set */
+		copy = g_lists + used;
+		memset(copy, 0, 0x18);
+		if (l) memcpy(copy, l, 0x18);
+		ONCP_COUNT(copy) = 0;
+		for (u32 i = 0; l && i < ONCP_COUNT(l); i++) {
+			u8 *e = ONCP_ENTRY(copy, ONCP_COUNT(copy));
+			memcpy(e, ONCP_ENTRY(l, i), ONCP_ENTRY_SIZE);
+			if (!ONCP_CLASS(e)) ONCP_CLASS(e) = P3rGetParticleClass((const char *)e + 0x10);
+			ONCP_COUNT(copy)++;
+		}
+		for (u32 i = 0; i < nset[woman]; i++) memcpy(ONCP_ENTRY(copy, ONCP_COUNT(copy)++), sets[woman][i], ONCP_ENTRY_SIZE);
+		ONCP_FOUND(copy) = 1;
+		used += 0x18 + ONCP_COUNT(copy) * ONCP_ENTRY_SIZE;
+		ONCC_PARTICLES(p) = copy;
+		if (woman) women++; else men++;
+	}
+	str_cpy(g_shield_name, sizeof g_shield_name, "arklite_none");   /* no texture: particles only */
+	log_msg("mp rules: Daodan mutator: %d classes overheal into Konoko's power and Muro's shield; particles added to %d "
+	        "(Konoko's to %d women, Muro's to %d men; %d and %d super particles found), no shield texture",
+	        g_ndaodan, women + men, women, men, nset[1], nset[0]);
+}
+
+static void daodan_install(void)
+{
+	static const u8 stock[5] = { 0xba, 0x88, 0x0e, 0x55, 0x00 };   /* mov edx,0x550e88 */
+	u8 code[5] = { 0xba };
+	u32 name = (u32)g_shield_name;
+	if (!code_matches(ONcDraw_DaodanShieldName, stock, sizeof stock)) {
+		log_msg("mp rules: 0x%x changed, the Daodan mutator keeps the shield texture", ONcDraw_DaodanShieldName);
+		return;
+	}
+	memcpy(code + 1, &name, 4);
+	patch_write(ONcDraw_DaodanShieldName, code, sizeof code);
+}
 
 void mp_rules_level(void)
 {
@@ -465,6 +604,8 @@ void mp_rules_level(void)
 	u8 *p = 0;
 
 	mp_rules_owners_reset();   /* a new level's particles start their references over */
+	daodan_level();
+	mutators_level();
 	if (TMrInstance_GetDataPtr(TAG_ONCC, "ninjabot", &p) || !p) return;
 	if (p != oncc) {   /* first time, or another level0 */
 		oncc = p;
@@ -512,4 +653,5 @@ void mp_rules_install(void)
 	} else {
 		log_msg("mp rules: 0x%x changed, overhealing drain not changed", ONcHypoTick_Drain);
 	}
+	daodan_install();
 }

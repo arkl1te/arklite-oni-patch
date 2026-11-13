@@ -91,6 +91,11 @@ void log_msg(const char *f, ...)
 	va_start(ap, f);
 	int n = wvsprintfA(buf, f, ap);
 	va_end(ap);
+	if (text_has_wide(buf)) {   /* names and chat beyond ASCII: UTF-8 in the file */
+		char utf8[1100];
+		n = text_to_utf8(utf8, sizeof utf8 - 2, buf);
+		memcpy(buf, utf8, (unsigned)n);
+	}
 	buf[n++] = '\r';
 	buf[n++] = '\n';
 	WriteFile(g_log, buf, n, &written, 0);
@@ -197,10 +202,21 @@ unsigned str_len(const char *s)
 
 int str_cpy(char *d, unsigned size, const char *s)
 {
-	unsigned i = 0;
+	unsigned i = 0, at = 0;
 	for (; s[i] && i + 1 < size; i++) d[i] = s[i];
-	d[i] = 0;
-	return s[i] == 0;
+	if (!s[i]) {
+		d[i] = 0;
+		return 1;
+	}
+	/* cut short: never in the middle of a two-byte character (text.c), whose lead byte alone
+	 * before the NUL would make Oni's text drawing read past it */
+	while (at < i) {
+		unsigned next = (u8)d[at] >= 0x80 && (u8)d[at] != 0xff ? at + 2 : at + 1;
+		if (next > i) break;
+		at = next;
+	}
+	d[at] = 0;
+	return 0;
 }
 
 char to_upper(char c) { return (c >= 'a' && c <= 'z') ? c - 32 : c; }

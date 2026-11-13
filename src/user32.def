@@ -8,9 +8,16 @@ EXPORTS
   ScreenToClient@8
   GetClientRect@8
   SetWindowLongA@12
+  SetWindowLongW@12
+  CallWindowProcW@20
+  PeekMessageW@20
+  DispatchMessageW@4
+  SendMessageW@16
   CallWindowProcA@20
   PeekMessageA@20
   TranslateMessage@4
   DispatchMessageA@4
   PostQuitMessage@4
   WindowFromDC@4
+  ShowWindow@8
+  SetWindowTextA@8

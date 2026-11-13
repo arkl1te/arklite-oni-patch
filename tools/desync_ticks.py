@@ -18,11 +18,17 @@ IMG = CHR_SIZE + ACTIVE_SIZE
 RENDER = {0x163C, 0x1640, 0x1660, 0x166C, 0x15F4}
 RENDER |= {CHR_SIZE + o for o in (0x2218, 0x221C, 0x2220, 0x2224, 0x27E8, 0x27FC)}
 RENDER |= {CHR_SIZE + 0x1CA8 + 16 * i + 4 for i in range(16)}
+# each PC's own addresses (ONtCharacterParticleInstance: +0 definition, +4 reference, +8 the
+# particle, +0xc body part): the animation's particles at active +0x1ca8, its TRtParticle list
+# at +0x1da8, the super particles at +0x1db0. A Windows joiner's heap reached 0x3e000000, where
+# addresses look like floats (0.2), so the pointer test below can't tell them apart.
+RENDER |= {CHR_SIZE + 0x1CA8 + 16 * i + 8 for i in range(16)} | {CHR_SIZE + 0x1DA8}
+RENDER |= {CHR_SIZE + 0x1DB0 + 16 * i + k for i in range(16) for k in (4, 8)}
 MASKS = {4: ~0x4000 & 0xFFFFFFFF, 0x1604: 0xFF, 0x161C: 0xFF}
 
 
 def pointer(v):
-    if v == 0 or (0x00100000 <= v < 0x20000000 and not v & 3):
+    if v == 0 or (0x00100000 <= v < 0x30000000 and not v & 3):
         return True
     return 0x80 <= v >> 24 <= 0x87
 

@@ -22,7 +22,9 @@
  * The respawn time is per item: level.ini [respawn] (written by Catwalk from each item's
  * RespawnTime) lists count=N and itemK=<WEAP|PWRU> <x> <y> <z> <seconds>, matched by type and
  * position; 0 seconds means never. Items not listed take Arklite.ini [multiplayer] item_respawn
- * (30 seconds).
+ * (30 seconds). Force fields and phase cloaks (PWRU type 3 ShieldBelt and 4 Invisibility, the type at
+ * object +0x2c as 0x51b080 reads it: 3 gets a 100-point charge, 4 1800 ticks of cloak) come back
+ * after SPECIAL_RESPAWN_S whatever the level or the setting says, unless the level says never.
  *
  * A respawn shows: the particle item_e01 at the item's spot, its +Y (the way its sparks fly) up,
  * and a zap there, zap09 and zap15 in turn. Those two are only permutations of the group
@@ -64,6 +66,10 @@ typedef u8 (ONI_FC *ObjectCallback)(u8 *obj, u32 param);
 #define POWERUP_POS(p)      ((float *)((p) + 8))
 
 #define MAX_ITEMS   256
+#define OBJ_PWRU_TYPE(o)    (*(u32 *)((o) + 0x2c))
+#define PWRU_SHIELD         3      /* force field */
+#define PWRU_INVISIBILITY   4      /* phase cloak */
+#define SPECIAL_RESPAWN_S   60     /* their respawn time (user, 2026-11-12) */
 #define NOT_READ    0xffffffffu
 
 typedef struct {
@@ -99,6 +105,7 @@ static Item *item_for(u8 *obj, u32 type)
 
 static u8 ONI_FC weapon_from_object(u8 *obj, u32 param)
 {
+	if (net_mutator(NET_MUT_NO_WEAPONS)) return 1;   /* the No Weapons mutator: none made, none respawned (the item never "is there") */
 	u32 born[WP_WEAPON_SLOTS];
 	u8 used[WP_WEAPON_SLOTS];
 	Item *it = item_for(obj, OBJcType_WEAP);
@@ -158,6 +165,13 @@ static int near(const float *a, const float *b)
 	return 1;
 }
 
+/* A force field or a phase cloak */
+static int special(const Item *it)
+{
+	return it->type == OBJcType_PWRU && it->obj &&
+	       (OBJ_PWRU_TYPE(it->obj) == PWRU_SHIELD || OBJ_PWRU_TYPE(it->obj) == PWRU_INVISIBILITY);
+}
+
 static void read_delays(void)
 {
 	const char *ini = custom_game_level_ini(ONrLevel_GetCurrent());
@@ -189,8 +203,14 @@ static void read_delays(void)
 				listed++;
 			}
 	}
-	log_msg("items: %d placed items, %d with their own respawn time, the others %u s",
-	        g_nitems, listed, g_default_ticks / 60);
+	int specials = 0;
+	for (int i = 0; i < g_nitems; i++)
+		if (special(&g_items[i]) && g_items[i].delay) {
+			g_items[i].delay = SPECIAL_RESPAWN_S * 60;
+			specials++;
+		}
+	log_msg("items: %d placed items, %d with their own respawn time, the others %u s; %d force fields and cloaks %d s",
+	        g_nitems, listed, g_default_ticks / 60, specials, SPECIAL_RESPAWN_S);
 }
 
 /* ---- What a respawn looks and sounds like ------------------------------------------------ */
@@ -198,8 +218,8 @@ static void read_delays(void)
 /* What the game's particle command does (around 0x50a0a5, in the stock source
  * ONiParticle3_CreateParticle), with its own orientation: the command's can't point straight up */
 #define P3rGetParticleClass     ((u8 *(ONI_FC *)(const char *))0x45a030)
-#define P3rCreateParticle       ((u8 *(ONI_FC *)(u8 *, u32))0x455e40)
-#define P3rSendEvent            ((u8 (ONI_FC *)(u8 *, u8 *, u32, float))0x45b2c0)
+#define P3rCreateParticle       lockstep_p3_create_particle   /* 0x455e40, choosing the effects stream (lockstep.c) */
+#define P3rSendEvent            lockstep_p3_send_event        /* 0x45b2c0, the same */
 #define P3rGetPositionPtr       ((float *(ONI_FC *)(u8 *, u8 *, u8 *))0x45abc0)
 #define ONrGameState_GetGameTime ((u32 (ONI_FC *)(void))0x4fc880)
 #define UUrLocalRandom          ((u32 (ONI_FC *)(void))0x426e30)
@@ -399,7 +419,7 @@ void items_tick(void)
 	player_fx_tick(tick);
 	for (int i = 0; i < g_nitems; i++) {
 		Item *it = &g_items[i];
-		if (it->delay == NOT_READ) it->delay = g_default_ticks;   /* made after the level start */
+		if (it->delay == NOT_READ) it->delay = special(it) ? SPECIAL_RESPAWN_S * 60 : g_default_ticks;   /* made after the level start */
 		if (!it->delay) continue;
 		if (!it->due) {
 			if (!present(it)) it->due = tick + it->delay;
@@ -408,6 +428,12 @@ void items_tick(void)
 			else powerup_from_object(it->obj, 0);
 			if (!it->made) it->due = tick + it->delay;   /* couldn't: try again later */
 			else {
+				static u32 said_tick[MAX_ITEMS];   /* (logging only: rollback re-runs the tick) */
+				if (special(it) && said_tick[i] < tick) {
+					said_tick[i] = tick;
+					log_msg("items: %s back at %d %d %d (tick %u)", OBJ_PWRU_TYPE(it->obj) == PWRU_SHIELD ? "force field" : "phase cloak",
+					        (int)OBJ_POS(it->obj)[0], (int)OBJ_POS(it->obj)[1], (int)OBJ_POS(it->obj)[2], tick);
+				}
 				respawn_particle(RESPAWN_PARTICLE, OBJ_POS(it->obj));
 				respawn_sound(OBJ_POS(it->obj));
 			}

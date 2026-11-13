@@ -14,6 +14,7 @@
 #                                   AE's own realbink.dll (Bink).
 #   AE/bink_orig.dll                AE's original realbink.dll (Bink), renamed; the loader forwards to it
 #   AE/GameDataFolder/CustomLevels  where Custom Game looks for levels
+#   AE/server.sh, AE/server.bat     start a dedicated server (./server.sh <map folder> [port])
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MARKER="Arklite.dll not found"   # a string only Arklite's loader contains
@@ -92,11 +93,21 @@ if [ $MODE = copy ]; then
 	fi
 	rm -f "$AE/realbink.dll"
 	cp "$SRC/arklite_loader.dll" "$AE/realbink.dll"
+	# The dedicated server's scripts, next to Oni.exe where they run (zips of 0.4.1 and older have none).
+	for s in server.sh server.bat; do
+		if [ -f "$SRC/$s" ] && [ ! "$SRC/$s" -ef "$AE/$s" ]; then
+			rm -f "$AE/$s"; cp "$SRC/$s" "$AE/"
+		fi
+	done
+	[ ! -f "$AE/server.sh" ] || chmod +x "$AE/server.sh"
 	[ -L "$AE/GameDataFolder/CustomLevels" ] || mkdir -p "$AE/GameDataFolder/CustomLevels"
 else
 	ln -sfn "$SRC/Arklite.dll"  "$AE/Arklite.dll"
 	ln -sfn "$SRC/realbink.dll" "$AE/realbink.dll"
+	ln -sfn "$HERE/server.sh"   "$AE/server.sh"
+	ln -sfn "$HERE/server.bat"  "$AE/server.bat"
 	# Development levels, if this repository sits next to them.
+	mkdir -p "$AE/GameDataFolder"
 	if [ -d "$HERE/../custom-game/CustomLevels" ] && [ ! -e "$AE/GameDataFolder/CustomLevels" -o -L "$AE/GameDataFolder/CustomLevels" ]; then
 		ln -sfn "$(cd "$HERE/../custom-game/CustomLevels" && pwd)" "$AE/GameDataFolder/CustomLevels"
 	else

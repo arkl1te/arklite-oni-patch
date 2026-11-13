@@ -102,12 +102,43 @@ static void enumerate(void)
 	}
 }
 
-static u32 hash_page(const u32 *p)
+/* A page's hash, 0 if it went away while being read: VirtualQuery's "committed, writable" in
+ * hash_all can be out of date by the read, another thread (Oni's heap, the sound thread) can
+ * free the page in between. The Windows joiner crashed so in a rollback check as it came into
+ * the warm-up (2026-11-13). A fault between rb_hash_lo and rb_hash_hi goes on at
+ * rb_hash_fail (rb_probe_fault, below). The same sum as before:
+ *   h = ((h ^ p[i]) * 0x01000193 ^ p[i + 1] ^ (p[i + 2] << 7) ^ (p[i + 3] >> 3)) * 0x01000193 */
+extern const u8 rb_hash_lo[] __asm__("rb_hash_lo"), rb_hash_hi[] __asm__("rb_hash_hi");
+extern const u8 rb_hash_fail[] __asm__("rb_hash_fail");
+
+__attribute__((naked, noinline, used)) static u32 ONI_FC hash_page(const u32 *p)
 {
-	u32 h = 0x811c9dc5u;
-	for (u32 i = 0; i < 1024; i += 4)
-		h = ((h ^ p[i]) * 0x01000193u ^ p[i + 1] ^ (p[i + 2] << 7) ^ (p[i + 3] >> 3)) * 0x01000193u;
-	return h;
+	__asm__ volatile(
+		"pushl %esi\n\t"
+		"movl %ecx, %esi\n\t"
+		"movl $0x811c9dc5, %eax\n\t"
+		"xorl %ecx, %ecx\n"
+		"rb_hash_lo:\n\t"
+		"xorl (%esi,%ecx,4), %eax\n\t"
+		"imull $0x01000193, %eax, %eax\n\t"
+		"xorl 4(%esi,%ecx,4), %eax\n\t"
+		"movl 8(%esi,%ecx,4), %edx\n\t"
+		"shll $7, %edx\n\t"
+		"xorl %edx, %eax\n\t"
+		"movl 12(%esi,%ecx,4), %edx\n\t"
+		"shrl $3, %edx\n\t"
+		"xorl %edx, %eax\n\t"
+		"imull $0x01000193, %eax, %eax\n\t"
+		"addl $4, %ecx\n\t"
+		"cmpl $1024, %ecx\n\t"
+		"jb rb_hash_lo\n"
+		"rb_hash_hi:\n\t"
+		"popl %esi\n\t"
+		"ret\n"
+		"rb_hash_fail:\n\t"
+		"xorl %eax, %eax\n\t"
+		"popl %esi\n\t"
+		"ret\n");
 }
 
 /* Hash every page of the listed regions still writable now into out[], 0 for gone ones */
@@ -334,6 +365,14 @@ void rollback_tick_end(void)
 #define SSgAmbientCount      (*(u32 *)0x5eb720)
 #define SSgAmbients          (*(u32 **)0x5eb728)
 #define SSrAmbient_Stop      ((void (ONI_FC *)(u32))0x4823c0)   /* ECX play id */
+/* Oni's table of the positioned ambients it plays (Oni_Sound2.c OSgPlayingAmbient): 1024 handles
+ * at *0x61fa34, each a 0x4c-byte entry (+0 index, +4 the handle a particle or object holds, +8
+ * the ambient, +0xc SS2's play id) or null. Game memory: a rollback puts it back. */
+#define OSgPlayingHandles    (*(u8 ***)0x61fa34)
+#define OScPlayingHandles    1024
+#define OS_PLAY_ID(a)        (*(const u32 *)((a) + 0xc))
+#define SSrAmbient_Start     0x4821f0
+#define SS_STATE_STOPPING    7
 #define SSgChannels1         (*(u8 **)0x5eb74c)   /* sound channels (made by 0x4830c0), *0x63f390 of them */
 #define SSgChannels2         (*(u8 **)0x5eb750)   /* and *0x63f388 more */
 #define SSgChannelCount1     (*(u32 *)0x63f390)
@@ -417,6 +456,7 @@ typedef struct {
 	u32 note_page[RB_MAX_NOTES], note_tid[RB_MAX_NOTES], nnotes, notes_logged;
 	u32 amb_stopped;
 	u32 acm_hits, acm_logs;        /* rb_acm_guard: ACM memory found in known pages */
+	u32 probe_faults;              /* rb_read8: reads of memory gone after rb_readable said yes */
 	u32 grow, grown, grow_logs;    /* rb_grow: Oni took memory the snapshots don't cover; pages added; logged */
 	u32 freed, freed_logs;         /* rb_forget: pages of allocations Oni gave back */
 	u32 reused, heap_pages, heap_logs, heap_walked;   /* rb_check_allocs, rb_heaps_guard */
@@ -591,6 +631,44 @@ static void rb_note(u32 p, u32 tid)
 
 static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid);
 
+/* Reads the 8 bytes at a into out[0], out[1]: 1, or 0 when either read faulted (rb_probe_fault
+ * sends a fault between rb_probe_lo and rb_probe_hi to rb_probe_fail). rb_readable's answer can
+ * be out of date by the time the memory is read: another thread can free it in between (the
+ * cache keeps an answer for a whole restore). A Windows host crashed so in rb_lock_mask
+ * (v0.4.0, 2026-11-12): a float, 20.0 (0x41a00000), looked like a critical
+ * section's DebugInfo, passed rb_readable, and reading it faulted. */
+extern const u8 rb_probe_lo[] __asm__("rb_probe_lo"), rb_probe_hi[] __asm__("rb_probe_hi");
+extern const u8 rb_probe_fail[] __asm__("rb_probe_fail");
+
+__attribute__((naked, noinline, used)) static int ONI_FC rb_read8(u32 a, u32 *out)
+{
+	__asm__ volatile(
+		"rb_probe_lo:\n\t"
+		"movl (%ecx), %eax\n\t"
+		"movl %eax, (%edx)\n\t"
+		"movl 4(%ecx), %eax\n\t"
+		"rb_probe_hi:\n\t"
+		"movl %eax, 4(%edx)\n\t"
+		"movl $1, %eax\n\t"
+		"ret\n"
+		"rb_probe_fail:\n\t"
+		"xorl %eax, %eax\n\t"
+		"ret\n");
+}
+
+/* Asked last, when the page watch didn't take the fault: a known page shut between ticks is
+ * opened and read as before, only memory that is really gone makes rb_read8 answer 0 */
+static long rb_probe_fault(EXCEPTION_POINTERS *ep)
+{
+	u32 code = ep->record->code, *eip = (u32 *)((u8 *)ep->context + 0xb8);   /* i386 CONTEXT Eip */
+	if (code != 0xc0000005u && code != 0xc0000006u) return 0;
+	if (*eip >= (u32)rb_probe_lo && *eip < (u32)rb_probe_hi) *eip = (u32)rb_probe_fail;
+	else if (*eip >= (u32)rb_hash_lo && *eip < (u32)rb_hash_hi) *eip = (u32)rb_hash_fail;   /* hash_page */
+	else return 0;
+	if (g_e) g_e->probe_faults++;
+	return -1;   /* EXCEPTION_CONTINUE_EXECUTION, at rb_probe_fail */
+}
+
 static long WINAPI rb_fault(EXCEPTION_POINTERS *ep)
 {
 	Engine *e = g_e;
@@ -599,12 +677,15 @@ static long WINAPI rb_fault(EXCEPTION_POINTERS *ep)
 	/* the match's snapshots are off (rb_reset opened every page): any fault now is someone
 	 * else's. Handled, a real crash during the next level's load looped here forever (the Windows
 	 * joiner froze going back to the lobby after a match) */
-	if (!e || !e->active) return 0;
-	if (tid != e->main_tid) return rb_fault_main(ep, tid);
-	e->in_fault = 1;
-	r = rb_fault_main(ep, tid);
-	e->in_fault = 0;
-	return r;
+	if (!e || !e->active) return rb_probe_fault(ep);
+	if (tid != e->main_tid) {
+		r = rb_fault_main(ep, tid);
+	} else {
+		e->in_fault = 1;
+		r = rb_fault_main(ep, tid);
+		e->in_fault = 0;
+	}
+	return r ? r : rb_probe_fault(ep);
 }
 
 static long rb_fault_main(EXCEPTION_POINTERS *ep, u32 tid)
@@ -740,7 +821,7 @@ static void rb_start(void)
 	for (u32 s = 0; s < RB_SLOTS; s++) e->slot_valid[s] = 0;
 	e->endc_ok = 0;
 	e->nnotes = e->notes_logged = 0;
-	e->amb_stopped = e->acm_hits = e->acm_logs = 0;
+	e->amb_stopped = e->acm_hits = e->acm_logs = e->probe_faults = 0;
 	e->grow = e->grown = e->grow_logs = e->plist_logs = e->plist_cuts = e->freed = e->freed_logs = 0;
 	e->reused = e->heap_pages = e->heap_logs = e->heap_walked = e->ndropped = e->seg_kept = 0;
 	e->vchecks = e->vbad = e->vlogs = 0;
@@ -761,8 +842,8 @@ static void rb_reset(const char *why)
 	if (g_e->nruns) rb_unprotect();
 	log_msg("rollback: snapshots off (%s); %d pages were known, %d KB taken during the match followed, %d KB given back "
 	        "dropped, %d broken particle lists cut, ACM memory in known pages %d times, %d freed addresses taken again, %d KB of "
-	        "other heaps dropped", why, g_e->npages, g_e->grown * 4, g_e->freed * 4, g_e->plist_cuts, g_e->acm_hits, g_e->reused,
-	        g_e->heap_pages * 4);
+	        "other heaps dropped, %d reads of memory freed under the lock test caught", why, g_e->npages, g_e->grown * 4,
+	        g_e->freed * 4, g_e->plist_cuts, g_e->acm_hits, g_e->reused, g_e->heap_pages * 4, g_e->probe_faults);
 	if (g_pool) log_msg("rollback: the pool for Oni's big blocks: at most %d of %d slots in use at once this match", g_pool_used_max, POOL_SLOTS);
 	g_pool_used_max = 0;
 	g_e->active = 0;
@@ -800,7 +881,9 @@ static void rb_snapshot(u32 tick, const void *action)
 /* Readable now. Asked of the system, not of the region list made at the engine's start: memory
  * freed since then (a heap shrinking) made a restore read a decommitted page and crash. The last
  * few readable regions are cached for one restore or comparison (rb_rd_forget clears them:
- * nothing is freed while the main thread is in there). */
+ * the game's own memory isn't freed while the main thread is in there). Other threads (sound,
+ * drivers) can free theirs at any time, so a "yes" can be out of date when the memory is read:
+ * memory that isn't the game's is read through rb_read8, which can't crash. */
 #define RB_RD_CACHE 16
 static u32 g_rd_lo[RB_RD_CACHE], g_rd_hi[RB_RD_CACHE], g_rd_next;
 
@@ -874,9 +957,10 @@ static void rb_lock_mask(u32 p)
 		 * like pointers made a restore cost tens of thousands of them (a visible hitch) */
 		int lock = (int)page[k + 1];
 		if (lock < -0x10000 || lock > 0x10000 || page[k + 2] > 0x10000 || page[k + 3] > 0x100000) continue;
-		if (!rb_readable(d) || !rb_readable(d + 7)) continue;
-		if (*(const u32 *)(d + 4) != (u32)(page + k)) continue;
-		if (*(const u16 *)d != 0) continue;   /* debug record Type: RTL_CRITSECT_TYPE */
+		u32 rec[2];   /* the debug record: +0 Type (u16), +4 CriticalSection */
+		if (!rb_readable(d) || !rb_readable(d + 7) || !rb_read8(d, rec)) continue;
+		if (rec[1] != (u32)(page + k)) continue;
+		if ((u16)rec[0] != 0) continue;   /* debug record Type: RTL_CRITSECT_TYPE */
 		for (u32 n = k; n < k + 6 && n < 1024; n++) g_e->mask[n] = 1;   /* 24 bytes */
 	}
 	if (rb_wine_segment(p << PAGE_SHIFT, page))
@@ -2175,6 +2259,60 @@ static void rb_sound_before_restore(u32 tick)
 	}
 }
 
+/* The sounds Oni's ambient table starts between ticks. Its entries are game memory, but it
+ * starts and halts SS2 plays outside the ticks too: each frame's sound update
+ * (OSiAmbient_UpdateAll, from the frame after its ticks) starts a play when the sound comes into
+ * hearing range (0x512062 in OSiAmbient_Update) and halts it when it leaves. A play started there
+ * after a tick's snapshot was lost when a rollback put that tick back: the entry got its old
+ * "not playing" back, the next frame started a second play, and the first looped forever (no
+ * id range of the ticks has it; user report 2026-11-12: Screaming Cells heard all the time
+ * during a match, more often with Fast Screamer's cells crossing in and out of range).
+ * So the plays the table starts (both its calls of SSrAmbient_Start: 0x511973 in
+ * OSrAmbient_Start, 0x512062) are noted, and after a restore any of them still playing that no
+ * entry holds is stopped. The table plays them again if they still should. */
+static const u32 g_os_start_calls[] = { 0x511973, 0x512062 };
+static u32 g_os_started[1024];   /* the table's play ids, at [id & 1023] */
+static u32 (ONI_FC *g_ss_ambient_start)(void *, void *, u32, u32, u32, u32, u32) =
+	(u32 (ONI_FC *)(void *, void *, u32, u32, u32, u32, u32))SSrAmbient_Start;
+
+static u32 ONI_FC os_ambient_start(void *ambient, void *pos, u32 dir, u32 vel, u32 maxd, u32 mind, u32 vol)
+{
+	u32 id = g_ss_ambient_start(ambient, pos, dir, vel, maxd, mind, vol);
+	if (id != 0xffffffffu) g_os_started[id & 1023] = id;
+	return id;
+}
+
+static void rb_os_orphans(u32 tick)
+{
+	static u32 held[OScPlayingHandles];
+	static int logs;
+	Engine *e = g_e;
+	u32 *t = SSgAmbients, n = SSgAmbientCount, nheld = 0;
+	u8 **h = OSgPlayingHandles;
+
+	if (!t || n > 4096 || !rb_readable((u32)t) || !rb_readable((u32)t + n * 0x58 - 1)) return;
+	if (!h || !rb_readable((u32)h) || !rb_readable((u32)h + OScPlayingHandles * 4 - 1)) return;
+	for (u32 i = 0; i < OScPlayingHandles; i++) {
+		const u8 *a = h[i];
+		if (a && rb_readable((u32)a) && rb_readable((u32)a + 0x4b) && OS_PLAY_ID(a) != 0xffffffffu)
+			held[nheld++] = OS_PLAY_ID(a);
+	}
+	for (u32 i = 0; i < n; i++) {
+		u32 *a = t + i * 0x16, id = a[0], k = 0;
+		if (!a[1] || a[1] == SS_STATE_STOPPING || g_os_started[id & 1023] != id) continue;
+		while (k < nheld && held[k] != id) k++;
+		if (k < nheld) continue;
+		if (logs++ < 8) {
+			const char *name = a[2] && rb_readable(a[2]) && rb_readable(a[2] + 31) ? (const char *)a[2] : "?";
+			log_msg("rollback: tick %d: stopped %.32s (play %u), which Oni's ambient table started and no longer holds",
+			        tick, name, id);
+		}
+		SSrAmbient_Stop(id);
+		g_os_started[id & 1023] = 0;
+		e->amb_stopped++;
+	}
+}
+
 u32 rollback_ambients_stopped(void) { return g_e ? g_e->amb_stopped : 0; }
 
 /* One-shot sounds while ticks run again (0), as usual after (1): lockstep.c's impulse_play then
@@ -2216,6 +2354,7 @@ int rollback_restore_tick(u32 tick)
 	if (lock) SSrLock(lock);
 	rb_sound_before_restore(tick);
 	rb_restore(s);
+	rb_os_orphans(tick);
 	if (lock) SSrUnlock(lock);
 	GS_TIME_BASE(ONgGameState) = base;
 	e->last_tick = tick;   /* not "the level restarted" */
@@ -2326,6 +2465,12 @@ void rollback_install(void)
 	char v[16];
 	const char *s = v;
 	float n = 0;
+	u32 calls = 0;
+
+	for (u32 i = 0; i < sizeof g_os_start_calls / sizeof g_os_start_calls[0]; i++)
+		calls += patch_call(g_os_start_calls[i], SSrAmbient_Start, (u32)os_ambient_start);
+	if (calls == 2) log_msg("rollback: the sounds Oni's ambient table starts are noted (a rollback stops the ones it loses)");
+	else log_msg("rollback: %u of Oni's ambient table's 2 sound starts found; lost ones may loop after rollbacks", calls);
 
 	if (GetEnvironmentVariableA("ARKLITE_ROLLBACK_TEST", v, sizeof v)) {
 		if (!parse_float(&s, &n) || n < 1) n = 10;
