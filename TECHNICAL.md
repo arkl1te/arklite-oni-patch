@@ -188,12 +188,12 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `/spectate` | Watch instead of playing: you fly the camera (move and look as usual, jump: up, crouch: down, walk: slow), a click follows the next player (the health and weapon rings show only while you follow one). A joiner moves to a spectator's place, a few seconds of loading: their place is free for someone else, and no one's game waits for their PC any more. The host watches in place |
 | `/join` | Play again after `/spectate`, or after joining with Spectate: a few seconds of loading, when a player's place is free (else you keep watching). Your score starts from 0 |
 | `/players` | Everyone in the game with their number: the host gives each internet address a number, from 1, in the order players first come, and keeps it while it hosts (a listen host is 1). Players on one PC or behind one router share it |
-| `/vote map Name` | Calls a vote to change the map: its folder in `CustomLevels` or its name, on the host's PC (no quotes needed, a start of it is enough when only one map fits). The map needs a spawn point for everyone here |
-| `/vote kick Who [reason]` | Calls a vote to kick a player: their name (or a start of it), or their number from `/players`. A number shared by more than one player asks for the name. The host can't be kicked |
+| `/callvote map Name` | Calls a vote to change the map: its folder in `CustomLevels` or its name, on the host's PC (no quotes needed, a start of it is enough when only one map fits). The map needs a spawn point for everyone here |
+| `/callvote kick Who [reason]` | Calls a vote to kick a player: their name (or a start of it), or their number from `/players`. A number shared by more than one player asks for the name. The host can't be kicked |
 | `/yes`, `/no` | Answers the vote (as Y and N do) |
 | `\/text` | Sends "/text" as a message, not a command |
 
-**Votes**: `/vote map` and `/vote kick` start a 30-second vote on every screen, with a soft
+**Votes**: `/callvote map` and `/callvote kick` start a 30-second vote on every screen, with a soft
 prompt sound: what it's about, the Yes and No counts, the seconds left. Answer with **Y** or
 **N** (while the chat is closed), `/yes` or `/no`, or the Yes and No buttons under the F1
 Scoreboard; you can change your answer while it's on, and calling a vote counts as your Yes. Only
@@ -307,13 +307,13 @@ console window comes instead; `ARKLITE_SERVER_CONSOLE=wine` asks for that from t
 |---|---|
 | `help` | Lists the commands |
 | `say <text>` | A server message to every player (plain text does the same) |
-| `players` | Each player's number, name, id (the `/players` number: one per address, as `/vote kick` takes it), state (playing, watching, joining, left), score, ping and address |
+| `players` | Each player's number, name, id (the `/players` number: one per address, as `/callvote kick` takes it), state (playing, watching, joining, left), score, ping and address |
 | `status` | Map, warm-up or match (and the time left), players, limits, port, the message of the day |
 | `kick <player> [reason]` | Out for 5 minutes. The player is its number from `players`, or its name. They see "Kicked for 5 min: reason" |
 | `ban <player> [reason]` | Out until the server closes |
 | `bans` | Who is kicked or banned, numbered, with the address and the time left |
 | `unban [who]` | Lets them back in: the number from `bans`, the player's name, the address, or `all`. Nothing needed when only one is out. A player still waiting in the warm-up comes in by itself |
-| `map <map>` | Changes the map now, without a vote (its folder or name, as `/vote map`); the players stay connected and come along |
+| `map <map>` | Changes the map now, without a vote (its folder or name, as `/callvote map`); the players stay connected and come along |
 | `start` | Starts the match now, from the warm-up |
 | `warmup` | Ends the match and goes back to a warm-up |
 | `timelimit <minutes>`, `scorelimit <points>` | From the next match (0: none; a negative score limit is reached by suicides) |

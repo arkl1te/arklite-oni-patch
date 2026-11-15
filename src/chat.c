@@ -688,8 +688,8 @@ static int help(void)
 		"/spectate\twatch without playing: a spectator's place, no one waits for you",
 		"/join\tplay again after /spectate or Spectate (your score starts at 0)",
 		"/players\tthe players and their numbers (one per internet address, from 1)",
-		"/vote map Name\tvote to change the map (its folder or its name)",
-		"/vote kick Who [why]\tvote to kick a player (name or number from /players)",
+		"/callvote map Name\tvote to change the map (its folder or its name)",
+		"/callvote kick Who [why]\tvote to kick a player (name or number from /players)",
 		"/yes, /no\tanswer the vote (or Y / N, or the F1 Scoreboard)",
 		"/ip\tyour internet address, for a host outside your network",
 		"/punch address\thost: let in a player outside whose host can't be reached (they tell you their /ip)",
@@ -698,7 +698,7 @@ static int help(void)
 	};
 	bold_text(info("Commands (taunts, sneeze and idles while standing; any key stops them):", 0, INFO), "Commands");
 	for (unsigned i = 0; i < sizeof rows / sizeof rows[0]; i++) {
-		Message *m = info(rows[i], "/whisper, /w Name text", WHITE);
+		Message *m = info(rows[i], "/callvote kick Who [why]", WHITE);   /* (the widest command: the column starts past it) */
 		bold(m, 0, m->tab);   /* the command */
 		m->ref_bold = 1;
 	}
@@ -706,7 +706,7 @@ static int help(void)
 }
 
 /* /players: everyone in this game with the number the host gave their internet address (net.c
- * "Votes"); /vote kick takes it */
+ * "Votes"); /callvote kick takes it */
 static int players_list(void)
 {
 	NetHud h;
@@ -736,16 +736,16 @@ static int players_list(void)
 	return n + 1;
 }
 
-/* /vote map Name, /vote kick Who [why]: the host runs it (net.c "Votes"), and says it to everyone */
+/* /callvote map Name, /callvote kick Who [why]: the host runs it (net.c "Votes"), and says it to everyone */
 static void vote(const char *args)
 {
 	const char *err;
 	if (!*args) {
-		info("Usage: /vote map Name, or /vote kick Who [why] (Who: a name, or a number from /players)", 0, INFO);
+		info("Usage: /callvote map Name, or /callvote kick Who [why] (Who: a name, or a number from /players)", 0, INFO);
 		return;
 	}
 	if ((err = net_vote_call(args))) info(err, 0, INFO);
-	else log_msg("chat: /vote %s", args);
+	else log_msg("chat: /callvote %s", args);
 }
 
 static void answer(int yes)
@@ -780,7 +780,7 @@ static int command(const char *t)
 		info(lagometer_on() ? "Lag-o-meter on (/lagometer again turns it off)" : "Lag-o-meter off", 0, INFO);
 		return 0;
 	}
-	if (ieq(cmd, "vote")) {
+	if (ieq(cmd, "callvote")) {
 		vote(args);
 		return 0;
 	}

@@ -424,7 +424,7 @@ static void help(void)
 {
 	say_back("Commands (anything else you type is said to every player as the server):\n"
 	         "  say <text>            a server message to every player\n"
-	         "  players               who's here: number, name, id (one per address, /vote kick's), state, score, ping, address\n"
+	         "  players               who's here: number, name, id (one per address, /callvote kick's), state, score, ping, address\n"
 	         "  status                map, warm-up or match, players, limits\n"
 	         "  kick <player> [why]   out for " "5" " minutes (player: its number from 'players', or its name)\n"
 	         "  ban <player> [why]    out until the server closes\n"

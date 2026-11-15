@@ -677,7 +677,7 @@ static int custom_spawns(CustomLevel *cl)
 	return cl->spawns;
 }
 
-/* /vote map (net.c): the CustomLevels map `what` names: its folder's name or its level.ini name
+/* /callvote map (net.c): the CustomLevels map `what` names: its folder's name or its level.ini name
  * whole (any case), else the one map whose folder or name starts with it. 1: found (folder, name
  * and spawns filled), 0: none, -1: more than one starts with it (name: the first, name2 the second,
  * for the answer) */

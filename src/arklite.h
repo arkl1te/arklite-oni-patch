@@ -115,7 +115,7 @@ int  custom_game_folder_path(const char *folder, char *out, u32 size);   /* Cust
 const char *custom_game_level_name(u32 level);   /* the custom level's name (level.ini), or 0 */
 int  custom_game_has_folder(const char *folder);  /* CustomLevels\<folder> holds a level */
 int  custom_game_folder_dir(const char *folder, char *out, u32 size);   /* its folder (ends with '\\'), 1 if it holds a level */
-/* The map a /vote names (folder or level.ini name, whole, else a unique start): 1 found, 0 none,
+/* The map a /callvote names (folder or level.ini name, whole, else a unique start): 1 found, 0 none,
  * -1 more than one (name and name2: two of them) */
 int  custom_game_find_map(const char *what, char *folder, u32 fsize, char *name, u32 nsize, char *name2, u32 n2size,
                           int *spawns);
@@ -387,7 +387,7 @@ enum {
 };
 #define NETBAD_LAST NETBAD_SPECTATE
 const char *net_kick_note(void);   /* joiner: why the server removed this PC, and for how long ("" none) */
-/* Votes (net.c "Votes"): /vote map <name>, /vote kick <player> [reason]; the host runs them. A
+/* Votes (net.c "Votes"): /callvote map <name>, /callvote kick <player> [reason]; the host runs them. A
  * vote lasts NET_VOTE_SECONDS; it passes when at least half of the players answered Yes, and its
  * command follows 3 s later. Only players vote, never spectators. */
 #define NET_VOTE_SECONDS 30

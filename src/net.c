@@ -374,7 +374,7 @@ typedef struct {
 typedef struct {
 	PktHead h;
 	char name[NPL][MP_NAME_MAX];   /* host: every player's ("" none) */
-	u32 id[NPL];                   /* host: every player's number (/players, /vote kick; 0 none) */
+	u32 id[NPL];                   /* host: every player's number (/players, /callvote kick; 0 none) */
 } PktNames;
 /* Chat (chat.c): only shown, never game state. Each link (host and one joiner) numbers its
  * messages in a stream (random per link); the receiver shows them in order and acknowledges the
@@ -392,7 +392,7 @@ typedef struct {
 } PktChat;
 #define CHAT_SERVER     0x100
 #define CHAT_ALL        0xffffffffu
-#define CHAT_VOTE       0xfffffffeu   /* to: a joiner's /vote call or answer, for the host alone ("Votes") */
+#define CHAT_VOTE       0xfffffffeu   /* to: a joiner's /callvote call or answer, for the host alone ("Votes") */
 /* A vote, as the host has it (see "Votes"): sent to every player's PC every VOTE_SEND_MS while it's
  * on, and for a moment after its end, so a lost one is never missed for long. A joiner's calls and
  * answers go the other way on the chat's stream (CHAT_VOTE), which is resent until acknowledged. */
@@ -7853,7 +7853,7 @@ int net_server_find(const char *who)
 	return count > 1 ? -2 : found;
 }
 
-/* voted: a passed /vote kick (see "Votes"), else the admin's kick or ban */
+/* voted: a passed /callvote kick (see "Votes"), else the admin's kick or ban */
 static const char *kick_link(int l, u32 minutes, const char *reason, int voted)
 {
 	static char out[160];
@@ -8045,7 +8045,7 @@ void net_server_quit(void)
 }
 
 /* ---- Votes (protocol 23) ------------------------------------------------------------------ *
- * /vote map <name> and /vote kick <player> [reason] (chat.c), answered with Y / N, /yes / /no or
+ * /callvote map <name> and /callvote kick <player> [reason] (chat.c), answered with Y / N, /yes / /no or
  * the F1 Scoreboard's buttons (mp_board.c). The host runs every vote: a joiner's call and answers
  * reach it as chat messages to CHAT_VOTE (the chat resends them until they're acknowledged, so
  * each arrives once, in order); a call it refuses gets a server line back, to that player alone.
@@ -8062,7 +8062,7 @@ void net_server_quit(void)
  * least half of the players answered Yes (yes * 2 >= players, those still playing at the end).
  * Its command follows VOTE_ACT_MS later.
  *
- * Player numbers (/players, /vote kick <number>): pid_of gives each internet address the next
+ * Player numbers (/players, /callvote kick <number>): pid_of gives each internet address the next
  * number when its first player comes (add_link, free_place), from 1, kept for as long as this PC
  * hosts; a listen host's own player is 1. Players at one address (one PC, one router, CGNAT) share
  * the number, so a kick by a number that means more than one of them asks for the name.
@@ -8229,7 +8229,7 @@ static const char *vote_check_map(const char *what, char *folder, char *name)
 	const char *cur = custom_game_level_folder(g_level);
 	int spawns = 0, r;
 
-	if (!*what) return "Usage: /vote map <the map's folder or name>";
+	if (!*what) return "Usage: /callvote map <the map's folder or name>";
 	if (!cur) return "Map votes need the game to be on a CustomLevels map.";
 	r = custom_game_find_map(what, folder, 64, full, sizeof full, other, sizeof other, &spawns);
 	str_cpy(name, 64, full);
@@ -8251,7 +8251,7 @@ static int vote_present(int p)
 	return p > 0 && p < NPL && g_link[p].used && !gone(p);
 }
 
-/* host: whom "/vote kick <args>" means: a number from /players, else the longest present player's
+/* host: whom "/callvote kick <args>" means: a number from /players, else the longest present player's
  * name the text starts with, else the one name that starts with its first word; *reason: the rest */
 static const char *vote_check_kick(int caller, const char *args, int *target, const char **reason)
 {
@@ -8259,7 +8259,7 @@ static const char *vote_check_kick(int caller, const char *args, int *target, co
 	int best = -1, best_len = 0, found = -1, count = 0, e = 0, digits = 1;
 	u32 id = 0;
 
-	if (!*args) return "Usage: /vote kick <player's name, or number from /players> [reason]";
+	if (!*args) return "Usage: /callvote kick <player's name, or number from /players> [reason]";
 	while (args[e] && args[e] != ' ') {
 		digits &= args[e] >= '0' && args[e] <= '9';
 		if (digits) id = id * 10 + (u32)(args[e] - '0');
@@ -8271,7 +8271,7 @@ static const char *vote_check_kick(int caller, const char *args, int *target, co
 		for (int l = 1; l < NPL; l++)
 			if (vote_present(l) && id && pid_of(g_link[l].addr.addr, 0) == id) found = l, count++;
 		if (!count) fmt(why, "Nobody here has the number %d (/players lists them).", id);
-		else if (count > 1) fmt(why, "Number %d is %d players at one internet address: /vote kick <name> instead.", id, count);
+		else if (count > 1) fmt(why, "Number %d is %d players at one internet address: /callvote kick <name> instead.", id, count);
 		if (count != 1) return why;
 		*target = found;
 	} else {
@@ -8322,7 +8322,7 @@ static const char *vote_call(int p, const char *text)
 		str_cpy(name, sizeof name, mp_name(target));
 		folder[0] = 0;
 	} else {
-		return "Usage: /vote map <map>, or /vote kick <player> [reason]";
+		return "Usage: /callvote map <map>, or /callvote kick <player> [reason]";
 	}
 	g_vote.id = g_vote.id ? g_vote.id + 1 : (GetTickCount() * 2654435761u ^ g_server_id) | 1;
 	if (!g_vote.id) g_vote.id = 1;

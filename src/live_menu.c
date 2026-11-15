@@ -39,8 +39,9 @@
  *     network match it opens only on the PC whose player used the console: Oni fires a console's
  *     events (and two other object types') through 0x4f3cc0 with the character that did it in edx.
  *     An "Execute Script" event only queues the script with that character's name; the queue runs
- *     later in the tick (0x4f2120), so each queued script is run with the character its name
- *     belongs to. A page asked for outside such a call (a script that sleeps first, or one no
+ *     later in the tick (0x4f2120 and five inlined copies of its loop, all hooked: the tick's own is
+ *     0x4dd0e2; hooking 0x4f2120's alone, up to 0.6.0, missed it, so every PC showed the page), so
+ *     each queued script is run with the character its name belongs to (a trigger volume's too). A page asked for outside such a call (a script that sleeps first, or one no
  *     player started) still opens on both PCs. A rollback runs the console's tick again, which
  *     asks for the page again: a request with the tick, character and page of one already taken
  *     is that one (asked_before), so the page opens once;
@@ -119,7 +120,11 @@
 #define ONcConsole_PartSpecBack 0x504cd8
 static const u32 ONcEventList_FireCalls[] = { 0x4c0934, 0x4c28d6, 0x4cbb0a };   /* console used, and two other objects' events */
 #define ONrScript_RunDeferredOne 0x5100b0                  /* (ecx script, edx character name): runs it now */
-#define ONcDeferred_RunCall     0x4f21a4                   /* in 0x4f2120, the deferred-script runner */
+/* The deferred-script runner: 0x4f2120, and five copies of its loop the compiler inlined into the
+ * game's update (the one that runs during a tick is 0x4dd0e2's). Each: lea edx,[esi+20h];
+ * lea ecx,[esi-20h]; mov [5ecbb8h],edx; mov edx,esi; call 0x5100b0 */
+static const u32 ONcDeferred_RunCalls[] = { 0x4f21a4, 0x4dd0e2, 0x4dd63b, 0x4dd9b1, 0x4e1319, 0x4e739f };
+static const u8 g_deferred_run_code[14] = { 0x8d, 0x56, 0x20, 0x8d, 0x4e, 0xe0, 0x89, 0x15, 0xb8, 0xcb, 0x5e, 0x00, 0x8b, 0xd6 };
 #define CHR_NAME                0x14                       /* char[32]: the name a deferred script gets */
 #define SSrSetMasterVolume      ((float (__stdcall *)(float))0x483e00)
 #define SSgMasterVolumeNow      (*(float *)0x5eb744)
@@ -270,15 +275,24 @@ static void run_console(void)
 	UIgPartSpec = parts;
 }
 
-/* Whether this PC shows a text console page that character's events asked for */
+/* Whether this PC shows a text console page that character's events asked for (logged: why) */
 static int console_for_this_pc(u8 *who)
 {
 	NetHud h;
 
 	net_hud(&h);
-	if (!who || h.state != NETHUD_MATCH) return 1;
+	if (h.state != NETHUD_MATCH) return 1;
+	if (!who) {
+		log_msg("live menu: a console page with no character asked for it (a script that slept first, or no player's): shown here");
+		return 1;
+	}
 	for (int s = 0; s < PLAYERS_MAX; s++)
-		if (who == players_char(s)) return s == h.local_char;
+		if (who == players_char(s)) {
+			log_msg("live menu: a console page player %d asked for: %s (this PC's is player %d)", s + 1,
+			        s == h.local_char ? "shown here" : "not here", h.local_player + 1);
+			return s == h.local_char;
+		}
+	log_msg("live menu: a console page a character that isn't a player asked for: shown here");
 	return 1;   /* an AI's: everyone's, as before */
 }
 
@@ -294,9 +308,11 @@ static u16 ONI_FC fire_events(void *events, u8 *who)
 }
 
 /* A console's "Execute Script" event (0x4f3d40) doesn't run the script: it queues it with the
- * character's name (0x4f2070: script, name, "eventlist"; up to 128 entries at 0x632540), and
- * 0x4f2120 runs the queue later in the tick, one 0x5100b0 call per entry. Player characters'
- * names are unique (players.c name_apart), so the name finds whose events these are */
+ * character's name (0x4f2070: script, name, "eventlist"; up to 128 entries at 0x632540), and the
+ * runner runs the queue later in the tick, one 0x5100b0 call per entry (0x4f2120, and its five
+ * inlined copies: ONcDeferred_RunCalls). Trigger volumes and a character's own scripts queue the
+ * same way. Player characters' names are unique (players.c name_apart), so the name finds whose
+ * events these are */
 static u16 ONI_FC run_deferred(const char *script, const char *name)
 {
 	u8 *outer = g_event_char, *who = 0;
@@ -549,8 +565,18 @@ void live_menu_install(void)
 	for (u32 i = 0; i < sizeof ONcEventList_FireCalls / sizeof *ONcEventList_FireCalls; i++)
 		if (!patch_call(ONcEventList_FireCalls[i], ONrEventList_Fire, (u32)fire_events))
 			log_msg("live menu: event call at 0x%x changed, its text console pages show on both PCs", ONcEventList_FireCalls[i]);
-	if (!patch_call(ONcDeferred_RunCall, ONrScript_RunDeferredOne, (u32)run_deferred))
-		log_msg("live menu: deferred script call at 0x%x changed, console pages show on both PCs", ONcDeferred_RunCall);
+	{   /* every copy of the deferred-script runner (one hooked alone missed the tick's: every PC showed the page) */
+		u32 n = sizeof ONcDeferred_RunCalls / sizeof *ONcDeferred_RunCalls, done = 0;
+		for (u32 i = 0; i < n; i++) {
+			u32 site = ONcDeferred_RunCalls[i];
+			if (code_matches(site - sizeof g_deferred_run_code, g_deferred_run_code, sizeof g_deferred_run_code) &&
+			    patch_call(site, ONrScript_RunDeferredOne, (u32)run_deferred))
+				done++;
+			else
+				log_msg("live menu: deferred script call at 0x%x changed: a console page its scripts ask for shows on every PC", site);
+		}
+		log_msg("live menu: console pages only on the PC whose player used the console (%u of %u script calls)", done, n);
+	}
 	{
 		static const u32 sites[][3] = {
 			{ ONcConsole_PartSpecSet, (u32)UIrPartSpec_Set, (u32)console_part_spec },
