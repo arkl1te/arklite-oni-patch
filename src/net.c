@@ -623,14 +623,31 @@ static int g_score_limit = 20;         /* 0: none */
  * every PC alike (players.c, char_menu_class_allowed) */
 static u32 g_char_rules = NET_CHARS_ALL;
 /* host: the message of the day (Arklite.ini [host] motd, the Host page), a server line to each
- * player who enters, after "Name entered the game"; "": none */
+ * player who enters, after "Name entered the game"; "": none. The host sees it too, once per
+ * hosting: a dedicated server's console when it starts (and in status), a listen host in its
+ * chat when its first session starts (motd_show). */
 static char g_motd[NET_MOTD_MAX];
+static int g_motd_shown;
 static void clean_text(char *s, u32 size);
 
 static void motd_load(void)
 {
 	ini_text("host", "motd", "", g_motd, sizeof g_motd);
 	clean_text(g_motd, sizeof g_motd);
+	g_motd_shown = 0;
+}
+
+static void motd_show(void)
+{
+	char t[CHAT_MAX];
+	if (g_mode != NET_HOST || !g_motd[0] || g_motd_shown) return;
+	g_motd_shown = 1;
+	if (server_running()) {
+		server_print("Message of the day (each player gets it on entering): %s", g_motd);
+		return;
+	}
+	fmt(t, "Server MOTD: %s", g_motd);
+	chat_server(t);
 }
 static int g_peer_ping[NPL];           /* joiner: each player's round trip to the host, as the host said */
 /* After the match (S_OVER) */
@@ -5521,6 +5538,7 @@ static void begin_run(void)
 		g_link[l].ping = -1;
 	}
 	players_reset_scores();
+	motd_show();   /* a listen host's own look at it (a dedicated server's is at its start) */
 	if (g_warm) {
 		players_set_limits(0, 0, 0);
 	} else {
@@ -7537,6 +7555,7 @@ static void dedicated_begin(void)
 	players_spectate_want(1);
 	players_set_dedicated(1);
 	server_start();
+	motd_show();
 }
 
 int net_dedicated_host(void) { return g_dedicated && g_mode == NET_HOST; }
@@ -7748,6 +7767,10 @@ const char *net_server_status(char *out, u32 size)
 	else tl[0] = 0;
 	fmt(out, "\"%s\" on UDP port %d: %s (%s), %s%s; %d of %d players, %d watching; %s",
 	    g_server_name, g_port, map ? map : "no map", folder ? folder : "-", state_text(), tl, players, max, spect, limits);
+	if (g_motd[0] && str_len(out) + 12 + str_len(g_motd) < size) {
+		str_cpy(out + str_len(out), size - str_len(out), "; MOTD: ");
+		str_cpy(out + str_len(out), size - str_len(out), g_motd);
+	}
 	out[size - 1] = 0;
 	return out;
 }

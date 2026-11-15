@@ -68,6 +68,8 @@
  * in a column (Message.tab_ref, the list's widest name, sets where), wrapping inside it. */
 #include "arklite.h"
 
+#define ONgGameWindow (*(void **)0x63100c)   /* ONgPlatformData.gameWindow */
+
 void *memcpy(void *, const void *, unsigned);
 
 __declspec(dllimport) short WINAPI GetAsyncKeyState(int);
@@ -1060,12 +1062,15 @@ static long WINAPI window_proc(void *hwnd, u32 msg, u32 wp, long lp)
 void chat_frame(void)
 {
 	if (!g_old_proc) {
+		static int said;
 		u32 pid = 0;
 		void *w = GetForegroundWindow();
 		if (w) GetWindowThreadProcessId(w, &pid);
-		if (w && pid == GetCurrentProcessId()) {
+		/* Oni's game window only: a dedicated server's console window (conhost's) also says it's this
+		 * process's, and can't be hooked: that was a log line every frame */
+		if (w && pid == GetCurrentProcessId() && (!ONgGameWindow || w == ONgGameWindow)) {
 			g_old_proc = (WNDPROC)SetWindowLongW(w, GWL_WNDPROC, (long)window_proc);
-			if (!g_old_proc) log_msg("chat: can't read the keyboard (no window procedure)");
+			if (!g_old_proc && !said++) log_msg("chat: can't read the keyboard (no window procedure)");
 		}
 	}
 	if (g_open && !allowed()) close_chat(0);

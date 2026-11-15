@@ -100,7 +100,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `bombs` | 0 | The Bombs For Days mutator: everyone dies as the Mad Bomber does, a blast three seconds later. With or without it, a bomb's body vanishes when it goes off and leaves a black scorch |
 | | `fast_ball` | 0 | The Fast Ball mutator: the Super Ball Gun's ball flies twice as fast |
 | | `jamming_guns` | 0 | The Jamming Guns mutator: each shot a player fires has a 5% chance of jamming the gun (the round is lost). A jammed gun clicks instead of firing until it has been dropped 1 to 3 times (a drop counts when it lands) and reloaded 0 or 1 times, in any order; the screen says what's left. The jam stays with the gun, whoever picks it up |
-| | `motd` | (empty) | The message of the day: a server line in the chat ("Server MOTD: ...") for each player who enters the game, only them. The Host page's field saves it; up to 114 characters here, as many as fit in the field there. Empty: none |
+| | `motd` | (empty) | The message of the day: a server line in the chat ("Server MOTD: ...") for each player who enters the game, only them. The host sees it too: a listen host in its chat when the first warm-up starts, a dedicated server on its console at the start and in `status`. The Host page's field saves it; up to 114 characters here, as many as fit in the field there. Empty: none |
 | `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by + and - |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's). Force fields and phase cloaks always take 60 |
@@ -304,7 +304,7 @@ console window comes instead; `ARKLITE_SERVER_CONSOLE=wine` asks for that from t
 | `help` | Lists the commands |
 | `say <text>` | A server message to every player (plain text does the same) |
 | `players` | Each player's number, name, id (the `/players` number: one per address, as `/vote kick` takes it), state (playing, watching, joining, left), score, ping and address |
-| `status` | Map, warm-up or match (and the time left), players, limits, port |
+| `status` | Map, warm-up or match (and the time left), players, limits, port, the message of the day |
 | `kick <player> [reason]` | Out for 5 minutes. The player is its number from `players`, or its name. They see "Kicked for 5 min: reason" |
 | `ban <player> [reason]` | Out until the server closes |
 | `bans` | Who is kicked or banned, numbered, with the address and the time left |

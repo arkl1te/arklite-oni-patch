@@ -52,6 +52,7 @@ EXPORTS
   GetLocalTime@4
   TerminateProcess@8
   AllocConsole@0
+  SetStdHandle@8
   GetStdHandle@4
   WriteConsoleA@20
   WriteConsoleW@20

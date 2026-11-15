@@ -59,6 +59,8 @@
 
 typedef struct { u16 year, month, weekday, day, hour, minute, second, ms; } SYSTEMTIME;
 __declspec(dllimport) int    WINAPI AllocConsole(void);
+__declspec(dllimport) int    WINAPI SetStdHandle(u32, HANDLE);
+__declspec(dllimport) u32    WINAPI GetLastError(void);
 __declspec(dllimport) HANDLE WINAPI GetStdHandle(u32);
 __declspec(dllimport) int    WINAPI ReadFile(HANDLE, void *, u32, u32 *, void *);
 __declspec(dllimport) int    WINAPI ReadConsoleInputW(HANDLE, void *, u32, u32 *);
@@ -841,9 +843,31 @@ void server_install(void)
 static void wine_console(void)
 {
 	char name[NET_SERVER_NAME_MAX];
-	AllocConsole();   /* fails if there's one already: then that one */
-	g_in = GetStdHandle(STD_INPUT_HANDLE);
-	g_out = GetStdHandle(STD_OUTPUT_HANDLE);
+	/* The console's own handles (CONIN$/CONOUT$), not the process's standard ones: Oni's may
+	 * point elsewhere (whatever started it), and AllocConsole doesn't always replace them. Every
+	 * Dedicate from a running game on Windows in 0.5.0 wrote to those and read nothing: a black,
+	 * empty console ("no input to read commands from"); server.bat's fresh Oni worked. */
+	HANDLE old_in = GetStdHandle(STD_INPUT_HANDLE), old_out = GetStdHandle(STD_OUTPUT_HANDLE);
+	int made = AllocConsole();   /* fails if there's one already: then that one */
+	u32 made_err = made ? 0 : GetLastError();
+	HANDLE in = CreateFileA("CONIN$", 0xc0000000 /* GENERIC_READ | GENERIC_WRITE */, 3 /* FILE_SHARE_READ | WRITE */, 0, 3 /* OPEN_EXISTING */, 0, 0);
+	HANDLE out = CreateFileA("CONOUT$", 0xc0000000, 3, 0, 3, 0, 0);
+	log_msg("server: console %s (error %u); standard handles were %x (type %u) and %x (type %u); its own %s",
+	        made ? "made" : "not made", made_err, (u32)old_in, old_in && old_in != INVALID_HANDLE_VALUE ? GetFileType(old_in) : 0,
+	        (u32)old_out, old_out && old_out != INVALID_HANDLE_VALUE ? GetFileType(old_out) : 0,
+	        in != INVALID_HANDLE_VALUE && out != INVALID_HANDLE_VALUE ? "opened" : "didn't open: the standard ones");
+	if (in != INVALID_HANDLE_VALUE && out != INVALID_HANDLE_VALUE) {
+		SetStdHandle(STD_INPUT_HANDLE, in);
+		SetStdHandle(STD_OUTPUT_HANDLE, out);
+		SetStdHandle((u32)-12 /* STD_ERROR_HANDLE */, out);
+		g_in = in;
+		g_out = out;
+	} else {
+		if (in != INVALID_HANDLE_VALUE) CloseHandle(in);
+		if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+		g_in = GetStdHandle(STD_INPUT_HANDLE);
+		g_out = GetStdHandle(STD_OUTPUT_HANDLE);
+	}
 	ini_text("host", "name", "Arklite dedicated server", name, sizeof name);
 	SetConsoleTitleA(name);
 	SetConsoleCtrlHandler(on_console_event, 1);
