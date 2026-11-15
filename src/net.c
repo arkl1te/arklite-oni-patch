@@ -536,6 +536,11 @@ static int g_rb_started;               /* the engine is on for this match */
 static u8  g_sound_on;                 /* ONgSoundOn as the game had it */
 static u32 g_rollbacks, g_resim_ticks, g_rb_failed, g_rb_deepest, g_rb_frames;
 static u32 g_rb_us_sum, g_rb_us_max, g_rb_restore_us_max, g_rb_timed;   /* rollback cost since the last 30 s log line */
+/* Since the last 30 s log line (the netcode's measurements): the frames that waited, by the player whose
+ * input held them; the rollbacks by the player whose input was guessed wrong, and what differed first
+ * (0 buttons: words 0-1, 1 aim and look: 7-10, 2 other analogs: 2-6, 3 word 11: F2, emote, who's in);
+ * and a rollback's time putting memory back, and running the ticks again */
+static u32 g_wait_by[NPL], g_rb_by[NPL][4], g_rb_restore_us_sum, g_rb_rerun_us_sum, g_rb_rerun_ticks;
 
 /* The performance counter's low half: differences over short spans only; us() turns them into
  * microseconds (32-bit math: -nostdlib has no 64-bit division) */
@@ -6826,14 +6831,17 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 {
 	/* the inputs that came in: were the guesses right? From the first wrong one on, again */
 	u32 bad = 0xffffffffu;
-	int bad_player = 0;
+	int bad_player = 0, bad_kind = 3;
 	for (int p = 0; p < (int)g_nplayers; p++) {
 		if (!remote(p)) continue;
 		u32 upto = g_have[p] < g_ticks ? g_have[p] : g_ticks;
 		for (u32 t = g_verified; t < upto && t < bad; t++)
 			if (!same_input(g_pred[p][t % RING], g_in[p][t % RING])) {
+				const u32 *a = g_pred[p][t % RING], *b = g_in[p][t % RING];
 				bad = t;
 				bad_player = p;
+				bad_kind = a[0] != b[0] || a[1] != b[1] ? 0 : a[7] != b[7] || a[8] != b[8] || a[9] != b[9] || a[10] != b[10] ? 1 :
+				           a[11] != b[11] ? 3 : 2;
 				break;
 			}
 	}
@@ -6846,6 +6854,10 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 			t0 = us(counter() - t0);
 			g_rb_us_sum += t0;
 			g_rb_timed++;
+			g_rb_restore_us_sum += t1;
+			g_rb_rerun_us_sum += t0 - t1;
+			g_rb_rerun_ticks += to - t;
+			if (bad_player >= 0 && bad_player < NPL) g_rb_by[bad_player][bad_kind]++;
 			if (t0 > g_rb_us_max) g_rb_us_max = t0;
 			if (t1 > g_rb_restore_us_max) g_rb_restore_us_max = t1;
 			g_rollbacks++;
@@ -6890,6 +6902,11 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 		g_stall_frames++;
 		g_stall_ticks += n - can;
 		n = can;
+		for (int p = 0; p < (int)g_nplayers; p++)   /* whose input held it (remote_min's) */
+			if (remote(p) && g_have[p] == avail) {
+				g_wait_by[p]++;
+				break;
+			}
 	}
 	if ((count & 0xffff) && actions) take_record((const u32 *)actions);
 	while (g_gen < g_ticks + n) make_input();
@@ -6910,6 +6927,29 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 			        g_sync_skipped, ahead(), others(), pings[0] ? pings : "-",
 			        g_rb_timed ? g_rb_us_sum / g_rb_timed / 1000 : 0, g_rb_timed ? g_rb_us_sum / g_rb_timed / 100 % 10 : 0,
 			        g_rb_us_max / 1000, g_rb_us_max / 100 % 10, g_rb_restore_us_max / 1000, g_rb_restore_us_max / 100 % 10);
+		{   /* by player: waits, rollbacks (buttons/aim/analog/word 11), and a rollback's two parts */
+			char line[400] = "";
+			for (int p = 0; p < (int)g_nplayers && p < NPL; p++) {
+				char one[96];
+				u32 r = g_rb_by[p][0] + g_rb_by[p][1] + g_rb_by[p][2] + g_rb_by[p][3];
+				if (!remote(p) || (!g_wait_by[p] && !r)) continue;
+				fmt(one, "%splayer %d: waited %u frames, %u rollbacks (%u buttons, %u aim, %u analog, %u word 11)",
+				    line[0] ? "; " : "", p + 1, g_wait_by[p], r, g_rb_by[p][0], g_rb_by[p][1], g_rb_by[p][2], g_rb_by[p][3]);
+				if (str_len(line) + str_len(one) < sizeof line) str_cpy(line + str_len(line), sizeof line - str_len(line), one);
+			}
+			if (line[0] || g_rb_timed)
+				log_msg("net: in the last %d s by player: %s; a rollback put back %u us and ran %u ticks again at %u us a tick, on average",
+				        STALL_LOG_MS / 1000, line[0] ? line : "-", g_rb_timed ? g_rb_restore_us_sum / g_rb_timed : 0,
+				        g_rb_timed ? g_rb_rerun_ticks / g_rb_timed : 0, g_rb_rerun_ticks ? g_rb_rerun_us_sum / g_rb_rerun_ticks : 0);
+			{   /* every tick's parts (rollback.c), first runs and re-runs alike */
+				char ph[640];
+				rollback_phase_text(ph, sizeof ph);
+				if (ph[0]) log_msg("net: a tick's parts: %s", ph);
+			}
+			memset(g_wait_by, 0, sizeof g_wait_by);
+			memset(g_rb_by, 0, sizeof g_rb_by);
+			g_rb_restore_us_sum = g_rb_rerun_us_sum = g_rb_rerun_ticks = 0;
+		}
 		g_rb_us_sum = g_rb_us_max = g_rb_restore_us_max = g_rb_timed = 0;
 		g_stall_frames = g_stall_ticks = 0;
 		g_last_stall_log = now;
@@ -7027,6 +7067,9 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 
 	receive();
 	now = GetTickCount();   /* after receive(), which stamps last_recv: now - last_recv mustn't wrap */
+	/* the host passes the inputs that just came on at once: before, they left after this frame's
+	 * rollback and ticks (20-60 ms with 4 players), on every joiner's inputs to every other joiner */
+	if (g_mode == NET_HOST && g_state == S_RUN && ROLLING) send_inputs_due(now);
 	vote_keys();
 	vote_frame(now);   /* (a passed map vote reloads the level: S_IDLE below) */
 	send_names(now);
@@ -7482,6 +7525,7 @@ static u8 ONI_FC character_on_screen(u8 *c) { return players_hidden(c) || photo_
 static void ONI_FC camera_update(u32 ticks, u32 edx, u32 arg)
 {
 	u8 *gs = ONgGameState, *cam = gs ? GS_CAMERA(gs) : 0;
+	if (!ticks) rollback_update_end();   /* the frame's call, after the tick loop: no protection kept past it */
 	if (photo_owns_camera()) return;   /* photo.c moves it itself (single player only) */
 	watch_keys();
 	if (cam && flying()) {
@@ -9097,8 +9141,10 @@ void net_install(void)
 	/* Always on: the kill camera (players_killcam) is every PC's and a local game's too; the rest
 	 * of camera_update only changes anything on a joiner */
 	if (patch_call(0x4fb141, (u32)ONrCamera_Update, (u32)camera_update) &&
-	    patch_call(0x4fb170, (u32)ONrCamera_Update, (u32)camera_update))
+	    patch_call(0x4fb170, (u32)ONrCamera_Update, (u32)camera_update)) {
 		log_msg("net: the camera follows this PC's player");
+		rollback_gap_allow();   /* (the frame's call ends a protection kept between ticks) */
+	}
 	/* also always on: photo mode hides the player with it */
 	if (!patch_call(ONcDraw_OnScreenCall, (u32)ONrCharacter_OnScreen, (u32)character_on_screen))
 		log_msg("net: draw pass call 0x%x changed, a watching host's character stays drawn", ONcDraw_OnScreenCall);

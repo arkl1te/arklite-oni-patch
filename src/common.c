@@ -4,20 +4,24 @@
 /* The MSVC target emits a reference to this whenever floats are used. */
 int _fltused;
 
-/* The compiler may emit calls to these even with -ffreestanding. */
+/* The compiler may emit calls to these even with -ffreestanding. The x86 string instructions: the
+ * byte loops they replace (volatile, so the compiler couldn't turn them into calls to themselves)
+ * ran at ~1.5 GB/s, and rollback copies its snapshot pages with memcpy every tick (2026-11-15: 0.8 ms
+ * of a tick whose own work takes 0.12 ms). rep movsb copies forward byte by byte as the loop did
+ * (net.c moves a buffer down onto itself), in large blocks on any CPU since 2012 (ERMSB); the
+ * direction flag is clear at every call (the calling convention). */
 void *memset(void *d, int c, unsigned n)
 {
-	volatile u8 *p = d;
-	while (n--) *p++ = (u8)c;
-	return d;
+	void *r = d;
+	__asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
+	return r;
 }
 
 void *memcpy(void *d, const void *s, unsigned n)
 {
-	volatile u8 *p = d;
-	const u8 *q = s;
-	while (n--) *p++ = *q++;
-	return d;
+	void *r = d;
+	__asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
+	return r;
 }
 
 /* ---- Log (AE\logs\Arklite_<date>_<time>.log, open for the whole session) ------------------ */

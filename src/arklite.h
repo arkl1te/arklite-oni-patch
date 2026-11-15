@@ -207,6 +207,9 @@ void rollback_tick_end(void);
 int  rollback_test_tick(void *action, void (*body)(void *));
 int  rollback_net_begin(void);            /* net.c: snapshots from the next tick on */
 void rollback_net_end(void);
+void rollback_phase_text(char *out, u32 size);   /* a tick's parts' average time since the last call (net.c's 30 s line) */
+void rollback_gap_allow(void);            /* net.c hooked the frame's camera call after the tick loop... */
+void rollback_update_end(void);           /* ...which calls this: protection kept between ticks ends */
 int  rollback_restore_tick(u32 tick);     /* back to the start of tick: 1, or 0 if not kept */
 void rollback_impulses(int on);           /* one-shot sounds off while ticks run again */
 u32  rollback_ambients_stopped(void);     /* ambient sounds stopped because their ticks were taken back */
