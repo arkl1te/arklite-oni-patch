@@ -23,6 +23,9 @@
  *                     inputs 5 and 6), whichever way it was read: DirectInput, the Windows cursor,
  *                     or Daodan's raw input (whose own [windows] mousesensitivity in daodan.ini
  *                     multiplies on top). Menus use the Windows cursor and aren't affected.
+ *   (test build)      Only with a test build in AE\arklite-test\ (test_build.c), under Sensitivity in
+ *                     the same frame: a checkbox "Test build <commit>, <date>" (checked: the loader
+ *                     runs it from the next start) and a line saying a restart switches builds.
  *
  * Values are saved in Arklite.ini, [options]. */
 #include "arklite.h"
@@ -138,9 +141,9 @@ enum {
 	ID_MORE = 113,
 	ID_HUD_SCALE = 120, ID_PAUSE_BACKGROUND,
 	ID_MUSIC_KEEP, ID_MUSIC_THEME, ID_MUSIC_SILENCE,
-	ID_SHOW_FPS, ID_SENSITIVITY, ID_SENSITIVITY_VALUE, ID_HUD_CENTER,
+	ID_SHOW_FPS, ID_SENSITIVITY, ID_SENSITIVITY_VALUE, ID_HUD_CENTER, ID_TEST_BUILD,
 };
-#define ID_LAST ID_HUD_CENTER
+#define ID_LAST ID_TEST_BUILD
 #define DLGcMessage_GetDefaultID 0x3e
 #define ID_CLOSE    2
 #define ID_SOUND    102   /* stock Overall Volume slider, Sound Volume after volume.c */
@@ -152,6 +155,7 @@ static WMtWindow *g_ours[MAX_WINDOWS];    /* our controls, hidden on the stock p
 static u32 g_nstock, g_nours;
 static WMtWindow *g_centerSlider;
 static WMtWindow *g_dialog, *g_more, *g_hudValue, *g_centerValue, *g_backgroundValue, *g_sensSlider, *g_sensField;
+static WMtWindow *g_testBox, *g_testNote;   /* the build switch (only with a test build installed) */
 /* Stock windows that move on our page: the Graphics, Sound and misc frames and Close */
 #define cRowStep 25
 static WMtWindow *g_frameDisplay, *g_frameSound, *g_frameMisc, *g_close;
@@ -264,6 +268,21 @@ static void sens_save(void)
 	WritePrivateProfileStringA("options", "mouse_sensitivity", text, ini_path());
 }
 
+/* The build switch's line: what a restart does, when the choice isn't the build running now */
+static void test_note(void)
+{
+#ifdef ARKLITE_TEST
+	int running_test = 1;
+#else
+	int running_test = 0;
+#endif
+	int chosen = test_build_chosen();
+	if (g_testBox) WMrCheckBox_SetCheck(g_testBox, chosen);
+	if (g_testNote)
+		WMrWindow_SetTitle(g_testNote, chosen == running_test ? "" : chosen ? "Restart Oni to play the test build."
+		                                                                    : "Restart Oni to play the release.", 0x100);
+}
+
 static void frame(void)
 {
 	ui_frame_hook_call(g_frameHookOld);
@@ -285,6 +304,7 @@ void more_options_init(WMtWindow *dialog)
 	g_anchor = rowLabel;
 	g_nstock = g_nours = 0;
 	g_more = g_hudValue = g_centerValue = g_backgroundValue = g_sensSlider = g_sensField = g_centerSlider = 0;
+	g_testBox = g_testNote = 0;
 	g_frameDisplay = find_child(dialog, 5, 50);
 	g_frameSound = find_child(dialog, 5, 175);
 	g_frameMisc = find_child(dialog, 5, 290);
@@ -345,6 +365,14 @@ void more_options_init(WMtWindow *dialog)
 		WMrWindow_SetVisible(g_sensField, 0);
 		if (g_nours < MAX_WINDOWS) g_ours[g_nours++] = g_sensField;
 	}
+	{   /* the build switch, under Sensitivity (the frame's rows are 25 px apart; it ends at 415) */
+		char desc[64], text[96];
+		if (test_build_installed(desc, sizeof desc)) {
+			fmt(text, "Test build %s", desc[0] ? desc : "(no build.txt)");
+			g_testBox = add(checkbox, text, ID_TEST_BUILD, 30, 330 + d, 270, 20);
+			g_testNote = add(rowLabel, "", 0, 30, 355 + d, 270, 20);
+		}
+	}
 	g_frameHookOld = ui_frame_hook(frame);
 
 	if (hud) {
@@ -361,6 +389,7 @@ void more_options_init(WMtWindow *dialog)
 	if (fps) WMrCheckBox_SetCheck(fps, g_showFps);
 	if (g_sensSlider) WMrSlider_SetRange(g_sensSlider, 0, cSensSteps);
 	sens_show(1, 0);
+	test_note();
 
 	/* "More..." left of Close, same size */
 	g_more = WMrWindow_New(WIN_CLASS(close), "More...", WIN_FLAGS(close), WIN_STYLE(close), ID_MORE,
@@ -437,6 +466,11 @@ int more_options_command(WMtWindow *dialog, u32 id, u32 notify)
 		sens_set(cSensSlideMin + step * cSensSlideStep);
 		sens_save();
 		sens_show(0, 1);
+	} else if (id == ID_TEST_BUILD) {
+		int on = !test_build_chosen();
+		if (!test_build_choose(on)) log_msg("options: couldn't %s AE\\" TEST_DIR "\\active", on ? "write" : "delete");
+		else log_msg("options: the %s runs from the next start", on ? "test build" : "release");
+		test_note();
 	} else if (id == ID_SHOW_FPS) {
 		WMtWindow *box = WMrDialog_GetItemByID(dialog, id);
 
@@ -468,7 +502,7 @@ void more_options_end(WMtWindow *dialog)
 		g_fieldsOn = 0;
 	}
 	g_dialog = 0;
-	g_sensSlider = g_sensField = g_centerSlider = 0;
+	g_sensSlider = g_sensField = g_centerSlider = g_testBox = g_testNote = 0;
 	g_frameDisplay = g_frameSound = g_frameMisc = g_close = 0;
 }
 

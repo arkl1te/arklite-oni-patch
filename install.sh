@@ -106,6 +106,7 @@ if [ $MODE = copy ]; then
 	fi
 	rm -f "$AE/realbink.dll"
 	cp "$SRC/arklite_loader.dll" "$AE/realbink.dll"
+	rm -f "$AE/arklite-test/active"   # a test build beside it (install-test.sh) waits until Options > More... picks it again
 	# The dedicated server's scripts, next to Oni.exe where they run (zips of 0.4.1 and older have none).
 	for s in server.sh server.bat; do
 		if [ -f "$SRC/$s" ] && [ ! "$SRC/$s" -ef "$AE/$s" ]; then

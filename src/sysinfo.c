@@ -560,8 +560,8 @@ static void dump_persist(void)
 	static const char hx[] = "0123456789abcdef";
 	u32 n;
 	oni_dir(dir);
-	fmt(path, "%sAE\\persist.dat", dir);
-	if (!(n = file_text(path, (char *)buf, sizeof buf))) { fmt(path, "%spersist.dat", dir); if (!(n = file_text(path, (char *)buf, sizeof buf))) return; }
+	fmt(path, "%sAE\\" OWN_DIR "persist.dat", dir);   /* (a test build's own: test_build.c) */
+	if (!(n = file_text(path, (char *)buf, sizeof buf))) { fmt(path, "%s" OWN_DIR "persist.dat", dir); if (!(n = file_text(path, (char *)buf, sizeof buf))) return; }
 	section("persist.dat (hex)");
 	for (u32 o = 0; o < n; o += 32) {
 		u32 k = 0;
@@ -623,7 +623,7 @@ static u32 WINAPI profile_thread(void *arg)
 	dump_files();
 	dump_packages();
 	dump_text_file("daodan.ini", "daodan.ini", 0);
-	dump_text_file("Arklite.ini (addresses masked)", "Arklite.ini", 1);
+	dump_text_file("Arklite.ini (addresses masked)", OWN_DIR "Arklite.ini", 1);   /* (a test build's own) */
 	dump_persist();
 	dump_modules();
 	f = CreateFileA(s->path, 0x40000000, 1, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);

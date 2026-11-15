@@ -14,7 +14,7 @@
  * an address that didn't ask. Packets from anywhere but the helper's address, or whose key isn't
  * the one the helper gave this socket, are dropped.
  *
- * [net] helper (default DEFAULT_HELPER; empty: none). [host] listed=0 keeps a game off the list
+ * [net] helper (default 51.20.130.46:27780, a test build's :27781: net_helper_address; empty: none). [host] listed=0 keeps a game off the list
  * (introductions still work). The name is looked up on a thread of its own, once.
  *
  * Each socket has its own NAT mapping and so its own key: the state is kept per socket (the Join
@@ -36,7 +36,6 @@ __declspec(dllimport) HANDLE WINAPI CreateThread(void *, u32, u32 (WINAPI *)(voi
 void *memcpy(void *, const void *, unsigned);
 void *memset(void *, int, unsigned);
 
-#define DEFAULT_HELPER  "51.20.130.46:27780"
 #define HMAGIC          0x50484b41u   /* "AKHP" */
 #define HVERSION        1
 enum { H_COOKIE = 1, H_BEAT, H_BEAT_ACK, H_LIST_REQ, H_LIST, H_INTRO_REQ, H_INTRO_ACK, H_INTRO };
@@ -130,7 +129,7 @@ static u32 WINAPI resolver(void *unused)
 static int ready(void)
 {
 	if (g_on < 0) {
-		GetPrivateProfileStringA("net", "helper", DEFAULT_HELPER, g_name, sizeof g_name, ini_path());
+		net_helper_address(g_name, sizeof g_name);   /* (a test build: the dev helper) */
 		g_listed = GetPrivateProfileIntA("host", "listed", 1, ini_path()) != 0;
 		g_on = g_name[0] != 0;
 		if (!g_on) log_msg("helper: off (Arklite.ini [net] helper is empty): no server list or introductions");

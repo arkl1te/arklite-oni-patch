@@ -3,7 +3,8 @@ rem Removes Arklite from Oni's AE folder and puts AE's original realbink.dll bac
 rem
 rem   uninstall.bat [/purge] ["C:\path\to\Oni\AE"]
 rem
-rem Kept unless /purge: AE\Arklite.ini (settings) and Arklite's logs (AE\logs). Always kept: custom levels in
+rem Kept unless /purge: AE\Arklite.ini (settings), Arklite's logs (AE\logs) and a test build beside it
+rem (AE\arklite-test, which can't run without Arklite's loader). Always kept: custom levels in
 rem AE\GameDataFolder\CustomLevels (an empty folder is removed), recordings (*.akr), persist.dat
 rem and persist.dat.before-arklite (the save file as it was before the first install).
 setlocal EnableExtensions
@@ -45,8 +46,9 @@ rmdir "%AE%\GameDataFolder\CustomLevels" 2>nul
 if defined PURGE del /f "%AE%\Arklite.ini" "%AE%\Arklite.log" 2>nul
 if defined PURGE del /f /q "%AE%\logs\Arklite*" 2>nul
 if defined PURGE rmdir "%AE%\logs" 2>nul
+if defined PURGE if exist "%AE%\arklite-test" rmdir /s /q "%AE%\arklite-test"
 echo Arklite removed from "%AE%".
-if not defined PURGE echo Kept AE\Arklite.ini and the logs in AE\logs (/purge removes them).
+if not defined PURGE echo Kept AE\Arklite.ini and the logs in AE\logs (/purge removes them, and a test build in AE\arklite-test).
 goto end
 
 :denied

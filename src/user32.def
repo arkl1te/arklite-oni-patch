@@ -21,3 +21,4 @@ EXPORTS
   WindowFromDC@4
   ShowWindow@8
   SetWindowTextA@8
+  MessageBoxA@16

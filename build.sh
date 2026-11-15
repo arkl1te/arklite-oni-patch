@@ -1,6 +1,8 @@
 #!/bin/bash
 # Builds build/Arklite.dll (the mod; chat.c puts moves.md inside it) and build/realbink.dll (its loader: Daodan loads that name)
 # as 32-bit Windows DLLs with clang + lld; no MinGW or MSVC SDK needed.
+# ARKLITE_TEST=1 builds a test build into build/test/ instead (src/test_build.c: it lives in AE/arklite-test/
+# beside the release, shows its commit on screen and talks to the dev helper); package.sh test zips it.
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build
@@ -11,6 +13,14 @@ BUILD="$VERSION"
 if commit="$(git rev-parse --short=7 HEAD 2>/dev/null)"; then
 	BUILD="$VERSION+$commit"
 	git diff --quiet HEAD -- src 2>/dev/null || BUILD="$BUILD*"
+fi
+OUT=build
+TEST=()
+if [ "${ARKLITE_TEST:-}" = 1 ]; then
+	[ -n "${commit:-}" ] || { echo "error: a test build needs git (its commit is its name)" >&2; exit 1; }
+	OUT=build/test
+	mkdir -p "$OUT"
+	TEST=(-DARKLITE_TEST "-DARKLITE_COMMIT=\"$commit\"" "-DARKLITE_COMMIT_DATE=\"$(git show -s --format=%cs HEAD)\"")
 fi
 # What the network handshake compares to tell whether two PCs run the same Arklite: a hash of the
 # source (and this script's flags), not of the DLL, whose bytes differ with the compiler version
@@ -31,9 +41,9 @@ done
 CC=(clang --target=i686-pc-windows-msvc -O2 -Wall -Wno-unused-parameter
 	-ffreestanding -fno-builtin -fno-stack-protector -mno-stack-arg-probe
 	-nostdlib -fuse-ld=lld -shared -Ibuild "-DARKLITE_VERSION=\"$BUILD\"" "-DARKLITE_SRC_HASH=0x$SRC_HASH")
-"${CC[@]}" -Wl,/entry:DllMain,/out:build/Arklite.dll \
-	src/arklite.c src/common.c src/custom_game.c src/level0_swap.c src/mp_menu.c src/volume.c src/more_options.c src/hud_scale.c src/hud_smooth.c src/random_class.c src/texture_clamp.c src/particle_table.c src/char_limit.c src/lockstep.c src/live_menu.c src/players.c src/items.c src/respawn_fx.c src/mp_rules.c src/obituary.c src/regen.c src/net.c src/mp_hud.c src/char_menu.c src/mp_names.c src/chat.c src/menu_wheel.c src/mp_board.c src/vertex_light.c src/spin_particle.c src/bench.c src/crash_log.c src/heap_check.c src/rollback.c src/upnp.c src/stun.c src/helper.c src/screenshot.c src/photo.c src/server.c src/report.c src/sysinfo.c src/lagometer.c src/bug.c src/flare_depth.c src/invis.c src/fx_menu.c src/motion_blur.c src/sprite_aspect.c src/mutators.c src/big_font.c src/text.c build/kernel32.lib build/user32.lib build/ws2_32.lib build/gdi32.lib
-"${CC[@]}" -Wl,/entry:DllMain,/def:src/realbink.def,/out:build/realbink.dll \
+"${CC[@]}" "${TEST[@]}" -Wl,/entry:DllMain,/out:$OUT/Arklite.dll \
+	src/arklite.c src/common.c src/custom_game.c src/level0_swap.c src/mp_menu.c src/volume.c src/more_options.c src/hud_scale.c src/hud_smooth.c src/random_class.c src/texture_clamp.c src/particle_table.c src/char_limit.c src/lockstep.c src/live_menu.c src/players.c src/items.c src/respawn_fx.c src/mp_rules.c src/obituary.c src/regen.c src/net.c src/mp_hud.c src/char_menu.c src/mp_names.c src/chat.c src/menu_wheel.c src/mp_board.c src/vertex_light.c src/spin_particle.c src/bench.c src/crash_log.c src/heap_check.c src/rollback.c src/upnp.c src/stun.c src/helper.c src/screenshot.c src/photo.c src/server.c src/report.c src/sysinfo.c src/lagometer.c src/bug.c src/flare_depth.c src/invis.c src/fx_menu.c src/motion_blur.c src/sprite_aspect.c src/mutators.c src/big_font.c src/text.c src/test_build.c build/kernel32.lib build/user32.lib build/ws2_32.lib build/gdi32.lib
+"${CC[@]}" -Wl,/entry:DllMain,/def:src/realbink.def,/out:$OUT/realbink.dll \
 	src/loader.c build/kernel32.lib
-rm -f build/Arklite.lib build/Arklite.exp build/realbink.lib build/realbink.exp a.lib
-echo "built build/Arklite.dll and build/realbink.dll (Arklite $BUILD, source $SRC_HASH)"
+rm -f "$OUT"/Arklite.lib "$OUT"/Arklite.exp "$OUT"/realbink.lib "$OUT"/realbink.exp a.lib
+echo "built $OUT/Arklite.dll and $OUT/realbink.dll (Arklite $BUILD${TEST:+, test build}, source $SRC_HASH)"

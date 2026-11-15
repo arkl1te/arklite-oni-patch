@@ -33,6 +33,7 @@ __declspec(dllimport) HANDLE WINAPI FindFirstFileA(const char *, WIN32_FIND_DATA
 __declspec(dllimport) int    WINAPI FindNextFileA(HANDLE, WIN32_FIND_DATAA *);
 __declspec(dllimport) int    WINAPI FindClose(HANDLE);
 __declspec(dllimport) u32    WINAPI GetFileAttributesA(const char *);
+__declspec(dllimport) int    WINAPI CreateDirectoryA(const char *, void *);
 __declspec(dllimport) u32    WINAPI GetFullPathNameA(const char *, u32, char *, char **);
 __declspec(dllimport) u32    WINAPI GetPrivateProfileStringA(const char *, const char *, const char *, char *, u32, const char *);
 __declspec(dllimport) u32    WINAPI GetEnvironmentVariableA(const char *, char *, u32);
@@ -44,8 +45,19 @@ __declspec(dllimport) void * WINAPI AddVectoredExceptionHandler(u32, void *);
 
 /* ---- common.c ---------------------------------------------------------------------------- */
 
-/* Logs and dumps go to AE\logs\<name>_<date>_<time>.<ext>, the newest LOG_KEEP of each name kept */
-#define LOG_DIR  "logs"
+/* A test build (build.sh with ARKLITE_TEST=1; package.sh test) keeps everything of its own in
+ * AE\arklite-test\ (test_build.c): itself, its options, logs, saves and Oni's persist.dat. The
+ * release's files are never opened by it. OWN_DIR prefixes every path of Arklite's own files. */
+#define TEST_DIR "arklite-test"
+#ifdef ARKLITE_TEST
+#define OWN_DIR  TEST_DIR "\\"
+#else
+#define OWN_DIR  ""
+#endif
+
+/* Logs and dumps go to AE\logs\<name>_<date>_<time>.<ext> (a test build's to AE\arklite-test\logs),
+ * the newest LOG_KEEP of each name kept */
+#define LOG_DIR  OWN_DIR "logs"
 #define LOG_KEEP 3
 HANDLE log_file_create(const char *name, char *path);   /* path: MAX_PATH, gets the file's name */
 void log_open(const char *name);
@@ -866,3 +878,11 @@ void fx_menu_draw(int width, int height);   /* inside mp_hud.c's text setup */
 int  fx_menu_open(void);              /* the cloaked player sees themselves at 50% */
 void sprite_aspect_install(void);      /* sprite_aspect.c: screen-facing sprites keep their shape on wide screens */
 int  invis_hidden(u8 *c);              /* cloaked (or still fading back in): no name tag over it */
+
+/* test_build.c: test builds (TEST_DIR, OWN_DIR above) */
+void test_build_install(void);         /* a test build: Oni's persist.dat in AE\arklite-test\ (at load, before Oni reads it) */
+void test_build_present(void *dc);     /* screenshot.c's SwapBuffers hook: a test build's label and window title */
+void net_helper_address(char *out, u32 size);   /* [net] helper; a test build's default is the dev helper */
+int  test_build_installed(char *desc, u32 size); /* AE\arklite-test\ holds a test build: 1, desc its "commit date" */
+int  test_build_chosen(void);          /* the loader runs the test build at the next start */
+int  test_build_choose(int on);        /* ...or not: 1 done */

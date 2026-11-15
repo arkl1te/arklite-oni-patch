@@ -56,7 +56,6 @@ __declspec(dllimport) int  WINAPI DeleteFileA(const char *);
 #define MAX_FILES       7
 #define FILE_MAX        (64u << 20)   /* bigger files aren't sent */
 #define SEND_MAX        (12u << 20)   /* the packed report, at most */
-#define DEFAULT_HELPER  "51.20.130.46:27780"
 #define PENDING         LOG_DIR "\\report-pending.txt"
 
 static int g_on;
@@ -523,7 +522,7 @@ void report_install(void *instance)
 	u32 n;
 
 	g_on = GetPrivateProfileIntA("reports", "send", 1, ini_path()) != 0;
-	GetPrivateProfileStringA("net", "helper", DEFAULT_HELPER, g_helper, sizeof g_helper, ini_path());
+	net_helper_address(g_helper, sizeof g_helper);   /* (a test build: the dev helper) */
 	if (!g_helper[0]) g_on = 0;
 	{   /* a recording playing (net.c "Playback") sends nothing */
 		char v[4];
@@ -549,6 +548,6 @@ void report_install(void *instance)
 		log_msg("report: problem reports off (Arklite.ini [reports] send=0, or no helper)");
 		return;
 	}
-	log_msg("report: problem reports on (desyncs, dropped players, crashes, heap damage; with the players' names, chat and the machine and setup dump; [reports] send=0 turns them off)");
+	log_msg("report: problem reports on, to the helper %s (desyncs, dropped players, crashes, heap damage; with the players' names, chat and the machine and setup dump; [reports] send=0 turns them off)", g_helper);
 	send_pending();
 }

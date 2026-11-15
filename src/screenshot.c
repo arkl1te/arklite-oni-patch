@@ -301,6 +301,7 @@ int  screenshot_hooked(void) { return g_hooked; }
 static int WINAPI swap_buffers(void *dc)
 {
 	flare_depth_present();
+	test_build_present(dc);   /* a test build's label: in every frame shown, so in screenshots too */
 	if (g_done) {   /* the game-saved sound, as chat's mp_sound plays it */
 		static int warned;
 		u8 *sound = SSrImpulse_GetByName("autosave");

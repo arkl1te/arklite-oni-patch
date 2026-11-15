@@ -227,10 +227,14 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 			str_cpy(log_name, sizeof log_name,
 			        GetEnvironmentVariableA("ARKLITE_DEDICATED", v, sizeof v) ? "Arklite-server.log" :
 			        GetEnvironmentVariableA("ARKLITE_JOIN", v, sizeof v) ? "Arklite-join.log" : "Arklite.log");
+#ifdef ARKLITE_TEST
+		CreateDirectoryA(TEST_DIR, 0);   /* (normally there: the loader ran this build from it) */
+#endif
 		log_open(log_name);
 	}
 	log_msg("Arklite %s loaded", ARKLITE_VERSION);
 	log_cpu();
+	test_build_install();   /* a test build: Oni's persist.dat in its own folder, before Oni reads it */
 	crash_log_install(instance);
 	heap_check_install();   /* before rollback_install: rollback.c's heap hooks go through it */
 	more_options_install();

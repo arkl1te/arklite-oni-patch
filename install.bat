@@ -59,6 +59,8 @@ set "SAME="
 for %%A in ("%AE%") do for %%H in ("%HERE%.") do if /i "%%~fA"=="%%~fH" set "SAME=1"
 if not defined SAME copy /y "%HERE%Arklite.dll" "%AE%\Arklite.dll" >nul || goto denied
 copy /y "%HERE%arklite_loader.dll" "%AE%\realbink.dll" >nul || goto denied
+rem A test build beside it (install-test.bat) waits until Options > More... picks it again.
+if exist "%AE%\arklite-test\active" del /f "%AE%\arklite-test\active" >nul 2>nul
 rem The dedicated server's scripts, next to Oni.exe where they run (zips of 0.4.1 and older have none).
 if not defined SAME for %%S in (server.bat server.sh) do if exist "%HERE%%%S" copy /y "%HERE%%%S" "%AE%\%%S" >nul || goto denied
 if not exist "%AE%\GameDataFolder\CustomLevels" mkdir "%AE%\GameDataFolder\CustomLevels"

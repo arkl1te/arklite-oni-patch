@@ -172,8 +172,8 @@ const char *ini_path(void)
 {
 	static char path[MAX_PATH];
 
-	if (!path[0] && !GetFullPathNameA("Arklite.ini", sizeof path, path, 0))
-		str_cpy(path, sizeof path, "Arklite.ini");
+	if (!path[0] && !GetFullPathNameA(OWN_DIR "Arklite.ini", sizeof path, path, 0))
+		str_cpy(path, sizeof path, OWN_DIR "Arklite.ini");
 	return path;
 }
 

@@ -29,6 +29,8 @@ Problem reports (TCP, the same port number; --reports DIR, off without it):
   each file an LZ4 block. One report per connection: "AKRP", version, body length, the body
   (Arklite version, source hash, reason, player slot, tick, session ID, the files), answered "OK".
 - Kept in DIR/<day>/<session>/<slot>-<reason>-<time>-<n>/: info.json and each file as <name>.lz4.
+  With --by-commit (the dev helper, for test builds): DIR/<commit>/<day>/..., the commit taken from the
+  sender's Arklite version (0.6.0+aae9b9f), "unknown" without one.
   The sender's address is never written (it only rate-limits, in memory). Reports older than
   REPORT_KEEP_DAYS go, and the oldest go first when DIR holds more than --reports-max-mb.
 """
@@ -108,9 +110,10 @@ class Game:
 class Reports:
     """The TCP side: one problem report per connection (see the top)."""
 
-    def __init__(self, sock, folder, max_bytes, count):
+    def __init__(self, sock, folder, max_bytes, count, by_commit=False):
         self.sock = sock
         self.folder = folder
+        self.by_commit = by_commit
         self.max_bytes = max_bytes
         self.count = count
         self.conns = {}           # socket -> [buffer, opened at, ip]
@@ -206,7 +209,11 @@ class Reports:
             pos += packed
         t = time.gmtime()
         self.serial += 1
-        where = os.path.join(self.folder, time.strftime("%Y-%m-%d", t), session,
+        base = self.folder
+        if self.by_commit:
+            m = re.search(r"\+([0-9a-f]{7,40})", self.text(version))
+            base = os.path.join(self.folder, m.group(1) if m else "unknown")
+        where = os.path.join(base, time.strftime("%Y-%m-%d", t), session,
                              f"{slot if slot < 64 else 'x'}-{REASONS.get(reason, 'other')}-{time.strftime('%H%M%S', t)}-{self.serial}")
         os.makedirs(where, exist_ok=True)
         info = {"arklite": self.text(version), "source": f"{src_hash:08x}", "reason": REASONS.get(reason, str(reason)),
@@ -226,12 +233,16 @@ class Reports:
             del self.buckets[ip]
 
     def tidy(self):
-        """Days older than REPORT_KEEP_DAYS go, then the oldest days while over the size limit."""
-        days = sorted(d for d in os.listdir(self.folder) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
+        """Days older than REPORT_KEEP_DAYS go, then the oldest days while over the size limit (with
+        --by-commit, every commit's days together)."""
+        bases = [self.folder]
+        if self.by_commit:
+            bases = [os.path.join(self.folder, c) for c in os.listdir(self.folder) if os.path.isdir(os.path.join(self.folder, c))]
+        days = sorted((d, os.path.join(b, d)) for b in bases for d in os.listdir(b) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d))
         cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - REPORT_KEEP_DAYS * 86400))
-        for d in [d for d in days if d < cutoff]:
-            shutil.rmtree(os.path.join(self.folder, d), ignore_errors=True)
-        days = [d for d in days if d >= cutoff]
+        for d, path in [x for x in days if x[0] < cutoff]:
+            shutil.rmtree(path, ignore_errors=True)
+        days = [x for x in days if x[0] >= cutoff]
 
         def size(path):
             total = 0
@@ -242,12 +253,12 @@ class Reports:
                     except OSError:
                         pass
             return total
-        sizes = {d: size(os.path.join(self.folder, d)) for d in days}
+        sizes = {path: size(path) for _, path in days}
         total = sum(sizes.values())
         while days and total > self.max_bytes:
-            d = days.pop(0)
-            shutil.rmtree(os.path.join(self.folder, d), ignore_errors=True)
-            total -= sizes[d]
+            _, path = days.pop(0)
+            shutil.rmtree(path, ignore_errors=True)
+            total -= sizes[path]
 
 
 class Helper:
@@ -406,6 +417,7 @@ def main():
     p.add_argument("--games-per-ip", type=int, default=MAX_GAMES_PER_IP, help="for tests on one PC")
     p.add_argument("--reports", help="folder for problem reports (TCP on the same port); none: off")
     p.add_argument("--reports-max-mb", type=int, default=4000, help="the reports folder's size limit")
+    p.add_argument("--by-commit", action="store_true", help="file reports under the sender's commit (the dev helper)")
     a = p.parse_args()
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((a.bind, a.port))
@@ -419,7 +431,7 @@ def main():
         t.bind((a.bind, a.port))
         t.listen(32)
         t.setblocking(False)
-        reports = Reports(t, a.reports, a.reports_max_mb << 20, helper.count)
+        reports = Reports(t, a.reports, a.reports_max_mb << 20, helper.count, a.by_commit)
         print(f"problem reports on TCP {a.bind}:{a.port} into {a.reports}", flush=True)
     try:
         helper.run(reports)

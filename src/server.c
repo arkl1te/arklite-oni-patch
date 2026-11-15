@@ -717,8 +717,8 @@ static int term_prepare(void)
 	}
 	random_key();
 	fmt(line, "%d %s\n", net_server_port(), g_key);
-	if (!write_file("Arklite-console.key", line, str_len(line)) ||
-	    !write_file("Arklite-console.sh", g_console_sh, sizeof g_console_sh - 1)) {
+	if (!write_file(OWN_DIR "Arklite-console.key", line, str_len(line)) ||
+	    !write_file(OWN_DIR "Arklite-console.sh", g_console_sh, sizeof g_console_sh - 1)) {
 		log_msg("server: can't write Arklite-console.sh/.key here: Wine's console instead");
 		closesocket(g_listen);
 		g_listen = NO_SOCKET;
@@ -738,7 +738,7 @@ static void term_launch(void)
 
 	g_term_launched = GetTickCount() | 1;
 	if (!unix_name || !GetCurrentDirectoryA(sizeof dir, dir)) goto fail;
-	fmt(path, "%s\\Arklite-console.sh", dir);
+	fmt(path, "%s\\" OWN_DIR "Arklite-console.sh", dir);
 	if (!MultiByteToWideChar(0 /* CP_ACP */, 0, path, -1, wide, MAX_PATH + 32)) goto fail;
 	u = unix_name(wide);
 	if (!u || str_len(u) > MAX_PATH) goto fail;

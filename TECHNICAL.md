@@ -81,7 +81,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `join` | (empty) | `<ip>[:port]`: join that host, as `ARKLITE_JOIN` does. Empty it for single player |
 | | `port` | 27777 | The host's UDP port, if `ARKLITE_HOST` doesn't give one. The Host dialog saves its Port here |
 | | `stun`, `stun2` | `stun.l.google.com:19302`, `stun.cloudflare.com:3478` | The public STUN servers your game asks for its internet address (`/ip`, `/punch`), every 25 s while it's in a network game; the second one if the first doesn't answer. Empty both to never ask |
-| | `helper` | `51.20.130.46:27780` | The Arklite helper: the server list in Join, and introductions that open a host's router for its players (see below). Empty: none |
+| | `helper` | `51.20.130.46:27780` | The Arklite helper: the server list in Join, and introductions that open a host's router for its players (see below). Empty: none. A test build's default is the dev helper, `:27781` |
 | | `upnp` | 1 | 1: while this PC hosts, ask the router (UPnP) to forward the UDP port to it, and take the forwarding back when hosting stops. 0: don't; forward the port by hand if players on the internet should join |
 | | `record` | 1 | 0: don't record network games to `Arklite-net-host.akr` / `-join.akr`. Only matches of two players with input delay are recorded |
 | `[host]` | `listed` | 1 | 0: your game stays off the server list (players who know your address still get introduced) |
@@ -761,12 +761,28 @@ The version is in `VERSION`, and Arklite writes it at the top of the newest `AE/
 (`.github/workflows/build.yml`) builds every push and pull request, and for a `v*` tag
 that matches `VERSION` it publishes a release with the zip attached.
 
+**Test builds**: `./package.sh test` makes `dist/Arklite-test-<commit>.zip` from a clean commit
+(it refuses uncommitted changes). Testers install it beside their release with `install-test.bat`
+or `install-test.sh` (see `README-test.md` in the zip). It lives in `AE/arklite-test/`:
+
+- **Its files**: its own `Arklite.ini`, logs, custom-level saves and Oni's `persist.dat`, copied from
+  the release's at the first install. The release's files are never read or written by it.
+- **The switch**: Arklite's loader runs it while `AE/arklite-test/active` exists. Options > More...
+  switches between the builds (from the next start); `uninstall-test` deletes the folder.
+- **On screen**: "Arklite test <commit> · <date>" at the bottom of every frame, screenshots and
+  recordings included, and in the window title.
+- **Online**: it uses the dev helper, `51.20.130.46:27781`, so testers' games only appear to each
+  other. Its problem reports are filed by commit there.
+
+`ARKLITE_TEST=1 ./build.sh` builds one into `build/test/` without packaging it.
+
 | File | What |
 | --- | --- |
 | `build.sh` | Builds `build/Arklite.dll` and `build/realbink.dll` with clang + lld |
-| `package.sh` | Builds and makes `dist/Arklite-<version>.zip` |
+| `package.sh` | Builds and makes `dist/Arklite-<version>.zip` (`package.sh test`: a test build's zip) |
 | `install.sh` / `uninstall.sh` | Install or remove (Linux/macOS, Wine). From a release they copy; from the repository they link `build/*.dll` |
 | `install.bat` / `uninstall.bat` | Install or remove (Windows) |
+| `install-test.*` / `uninstall-test.*` | A test build beside the release, and its removal (in test zips) |
 | `tools/gen_char_limit.py` | Regenerates `src/char_limit_sites.h` (needs `objdump`; set the `ONI` and `DAODAN` paths at its top) |
 | `tools/gen_respawn_fx.py` | Regenerates `src/respawn_fx_data.h`, the respawn effect's edit lists, from a Catwalk project's classes |
 | `tools/oni-bench.sh` | Times a level's frames hands off (`ARKLITE_BENCH`). Set your paths at its top first; it needs a nested KWin and two small helper tools that aren't in this repository |

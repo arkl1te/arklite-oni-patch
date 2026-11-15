@@ -7195,7 +7195,7 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	if (n && !g_ticks) {
 		lockstep_set_seeds(g_seed, g_local_seed);
 		if (g_record && g_nplayers == 2) {
-			const char *path = g_mode == NET_HOST ? "Arklite-net-host.akr" : "Arklite-net-join.akr";
+			const char *path = g_mode == NET_HOST ? OWN_DIR "Arklite-net-host.akr" : OWN_DIR "Arklite-net-join.akr";
 			if (lockstep_net_record_begin(g_level, path)) log_msg("net: recording this game to %s", path);
 		} else if (g_record) {
 			log_msg("net: not recording this game: recordings hold two players, this match has %d", g_nplayers);

@@ -94,7 +94,7 @@ static int persist_valid(u32 level, u32 sp)
  * saves go to AE\saves\<folder>.sav, Custom Game lists them under the level, the stock Load Game
  * leaves the custom level's number out, and a start hands the engine its continue directly
  * (start_continue_hook) instead of through persist.dat. */
-#define SAVES_DIR      "saves"
+#define SAVES_DIR      OWN_DIR "saves"   /* (a test build's: AE\arklite-test\saves, test_build.c) */
 #define SAVES_MAGIC    0x534b5241   /* "ARKS" */
 #define SAVES_VERSION  1
 
