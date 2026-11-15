@@ -65,20 +65,155 @@ static int  g_forceSlot = -1;                 /* joining: the host's slot, so bo
  * ARKLITE_DEDICATED=<folder>[:port] does the same for a dedicated server (net.c, server.c). */
 static char g_autostart[64];
 static int  g_autostartPending;
-/* ARKLITE_SAVEPOINT=<n> (with AUTOSTART): start that level at save point n. */
-static u32  g_autostartSavePoint;
-static u32  g_startSavePoint;
+/* ARKLITE_SAVEPOINT=<n> (with AUTOSTART): start that level at save point n, the engine's number
+ * as Catwalk gives it (a copy of level 1: 0 Combat Training, 1 the Warehouse). -1: not given. */
+static int  g_autostartSavePoint = -1;
+static int  g_startSavePoint = -1;
 
 /* persist.dat save games in memory (ONrPersist, 0x50f320): [40 levels][10 save points],
- * 0x204 bytes each, byte 0x40 bit 0 = present. */
+ * 0x204 bytes each (ONtContinue: name[64], flags at 0x40: bit 0 = present, bit 1 = restore_game
+ * ignores it). */
 #define PERSIST_SAVES  ((u8 *)0x5ed3a0)
 #define PERSIST_ENTRY  0x204
+#define CONTINUE_VALID          1
+#define CONTINUE_IGNORE_RESTORE 2
 
 static u8 *persist_entry(u32 level, u32 sp) { return PERSIST_SAVES + (level * 10 + sp) * PERSIST_ENTRY; }
 
 static int persist_valid(u32 level, u32 sp)
 {
-	return level < 40 && sp < 10 && (persist_entry(level, sp)[0x40] & 1);
+	return level < 40 && sp < 10 && (persist_entry(level, sp)[0x40] & CONTINUE_VALID);
+}
+
+/* ---- A custom level's own save points ----------------------------------------------------
+ *
+ * The engine's save_game (0x4fd690) keeps a save point in persist.dat under the level's number.
+ * Custom levels share the numbers 20-31, so one map's saves turned up in another (a level 9 copy's
+ * save point 1 restored in a level 1 copy put Konoko in the wrong place), and the stock Load Game
+ * listed them under level0's descriptor for that number (31: "Crossing Zone"). So a custom level's
+ * saves go to AE\saves\<folder>.sav, Custom Game lists them under the level, the stock Load Game
+ * leaves the custom level's number out, and a start hands the engine its continue directly
+ * (start_continue_hook) instead of through persist.dat. */
+#define SAVES_DIR      "saves"
+#define SAVES_MAGIC    0x534b5241   /* "ARKS" */
+#define SAVES_VERSION  1
+
+typedef struct {
+	u32 magic, version, count, size;
+	u8  sp[10][PERSIST_ENTRY];
+} SaveFile;
+
+static SaveFile g_saves;        /* the mounted level's (g_mountedFolder) */
+static SaveFile g_listSaves;    /* scratch for the level list (too big for the stack) */
+
+/* The continue to hand the engine at the next level start */
+static u8   g_pendingContinue[PERSIST_ENTRY];
+static u32  g_pendingSavePoint;
+static int  g_pendingSet;
+
+#define ONrPersist_SetContinue  ((void (ONI_FC *)(u32, u32, const void *))0x50f360)
+#define ONrGame_ClearContinue   ((void (ONI_FC *)(void))0x4fda80)
+#define ONrGame_SetContinue     ((void (ONI_FC *)(u32, const void *))0x4fdaa0)   /* save point, data */
+#define TMrLevel_Exists         ((u8 (ONI_FC *)(u32))0x4217b0)
+#define StartLevel_ClearCall    0x4beb84   /* ONrGame_StartLevel: the continue cleared, before persist.dat's */
+#define SaveGame_SetContinueCall 0x4fd881  /* save_game: the save point into persist.dat */
+#define LoadList_ExistsCall     0x4bea3c   /* the Load Game list (0x4be9d0): a descriptor's level there? */
+
+__declspec(dllimport) int WINAPI MoveFileExA(const char *, const char *, u32);
+
+static int saves_path(char *out, const char *folder, const char *ext)
+{
+	if (str_len(folder) + str_len(SAVES_DIR) + 8 > MAX_PATH) return 0;
+	fmt(out, SAVES_DIR "\\%s.%s", folder, ext);
+	return 1;
+}
+
+/* The folder's saves into *s (none: all empty). The number of save points in it. */
+static int load_saves(const char *folder, SaveFile *s)
+{
+	char path[MAX_PATH];
+	HANDLE f;
+	u32 got = 0;
+	int n = 0;
+
+	memset(s, 0, sizeof *s);
+	if (!saves_path(path, folder, "sav")) return 0;
+	f = CreateFileA(path, 0x80000000 /* GENERIC_READ */, 1, 0, 3 /* OPEN_EXISTING */, 0x80, 0);
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	if (!ReadFile(f, s, sizeof *s, &got, 0)) got = 0;
+	CloseHandle(f);
+	if (got != sizeof *s || s->magic != SAVES_MAGIC || s->version != SAVES_VERSION || s->count != 10 ||
+	    s->size != PERSIST_ENTRY) {
+		log_msg("saves: %s isn't a save file of this version, ignored", path);
+		memset(s, 0, sizeof *s);
+		return 0;
+	}
+	for (int sp = 0; sp < 10; sp++)
+		if (s->sp[sp][0x40] & CONTINUE_VALID) n++;
+	return n;
+}
+
+static int write_saves(const char *folder, SaveFile *s)
+{
+	char tmp[MAX_PATH], path[MAX_PATH];
+	HANDLE f;
+	u32 put = 0;
+
+	if (!saves_path(tmp, folder, "tmp") || !saves_path(path, folder, "sav")) return 0;
+	s->magic = SAVES_MAGIC;
+	s->version = SAVES_VERSION;
+	s->count = 10;
+	s->size = PERSIST_ENTRY;
+	CreateDirectoryA(SAVES_DIR, 0);
+	f = CreateFileA(tmp, 0x40000000 /* GENERIC_WRITE */, 0, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+	if (f == INVALID_HANDLE_VALUE) {
+		log_msg("saves: couldn't write %s", tmp);
+		return 0;
+	}
+	if (!WriteFile(f, s, sizeof *s, &put, 0)) put = 0;
+	CloseHandle(f);
+	if (put != sizeof *s || !MoveFileExA(tmp, path, 3 /* MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED */)) {
+		log_msg("saves: couldn't write %s", path);
+		return 0;
+	}
+	return 1;
+}
+
+/* save_game's persist.dat write: the custom level's save point goes to its own file instead.
+ * save_game has already made it the continue in memory, so a death still restarts there. */
+static void ONI_FC set_continue_hook(u32 level, u32 sp, const void *data)
+{
+	level &= 0xffff;
+	if (g_slot < 0 || level != (u32)g_slot || !g_mountedFolder[0]) {
+		ONrPersist_SetContinue(level, sp, data);
+		return;
+	}
+	if (sp >= 10) return;
+	if (net_active()) {
+		log_msg("save point %d: a network game, not kept", (int)sp);
+		return;
+	}
+	for (u32 i = 0; i < PERSIST_ENTRY; i++) g_saves.sp[sp][i] = ((const u8 *)data)[i];
+	if (write_saves(g_mountedFolder, &g_saves))
+		log_msg("save point %d: saved to " SAVES_DIR "\\%s.sav", (int)sp, g_mountedFolder);
+}
+
+/* ONrGame_StartLevel clears the continue, then looks in persist.dat for the save point it was
+ * given. Custom Game starts with none there and hands its continue over here. */
+static void ONI_FC start_continue_hook(void)
+{
+	ONrGame_ClearContinue();
+	if (!g_pendingSet) return;
+	g_pendingSet = 0;
+	ONrGame_SetContinue(g_pendingSavePoint, g_pendingContinue);
+}
+
+/* The stock Load Game list: the custom level's number is no level of the game's */
+static u8 ONI_FC load_list_exists_hook(u32 level)
+{
+	level &= 0xffff;
+	if (g_slot >= 0 && level == (u32)g_slot) return 0;
+	return TMrLevel_Exists(level);
 }
 
 static const u8 g_original[] = { 1, 2, 3, 4, 6, 8, 9, 10, 11, 12, 13, 14, 18, 19 };
@@ -307,6 +442,10 @@ static int mount_custom_level(const CustomLevel *cl)
 	fmt(g_mountedDir, "%sCustomLevels\\%s\\", g_dataDir, cl->folder);
 	str_cpy(g_mountedFolder, sizeof g_mountedFolder, cl->folder);
 	str_cpy(g_mountedName, sizeof g_mountedName, cl->name);
+	{
+		int n = load_saves(cl->folder, &g_saves);
+		if (n) log_msg("mount: %d save point(s) in " SAVES_DIR "\\%s.sav", n, cl->folder);
+	}
 
 	fmt(path, "%sCustomLevels\\%s\\IGMD", g_dataDir, cl->folder);
 	if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
@@ -538,6 +677,40 @@ static int custom_spawns(CustomLevel *cl)
 	return cl->spawns;
 }
 
+/* /vote map (net.c): the CustomLevels map `what` names: its folder's name or its level.ini name
+ * whole (any case), else the one map whose folder or name starts with it. 1: found (folder, name
+ * and spawns filled), 0: none, -1: more than one starts with it (name: the first, name2 the second,
+ * for the answer) */
+int custom_game_find_map(const char *what, char *folder, u32 fsize, char *name, u32 nsize, char *name2, u32 n2size,
+                         int *spawns)
+{
+	u32 n = str_len(what);
+	int pick = -1, other = -1, count = 0;
+
+	scan_custom_levels();
+	if (!n) return 0;
+	for (int pass = 0; pass < 2 && pick < 0; pass++)   /* the folder whole, then the name whole */
+		for (int i = 0; i < g_ncustom && pick < 0; i++) {
+			const char *s = pass ? g_custom[i].name : g_custom[i].folder;
+			if (str_len(s) == n && str_ieq_n(s, what, n)) pick = i;
+		}
+	if (pick < 0)
+		for (int i = 0; i < g_ncustom; i++)
+			if (str_ieq_n(g_custom[i].folder, what, n) || str_ieq_n(g_custom[i].name, what, n)) {
+				if (count++) { if (other < 0) other = i; }
+				else pick = i;
+			}
+	if (pick < 0) return 0;
+	str_cpy(folder, fsize, g_custom[pick].folder);
+	str_cpy(name, nsize, g_custom[pick].name);
+	if (count > 1) {
+		str_cpy(name2, n2size, g_custom[other].name);
+		return -1;
+	}
+	*spawns = custom_spawns(&g_custom[pick]);
+	return 1;
+}
+
 /* A numbered level installed the classic way: its files in the engine's table */
 static int level_spawns(u32 level)
 {
@@ -554,7 +727,13 @@ static int level_spawns(u32 level)
 /* ---- New: the level list (the Load Game dialog 0x97, its list as it is) ---------------------- */
 
 #define SEL_HOST        0x10000   /* with the list's item data: the level is to be hosted */
-#define MAX_ROWS        (MAX_CUSTOM + 127)
+#define SEL_JOIN        0x20000   /* the host's level, joined */
+/* A custom level's rows: ITEM_CUSTOM + index (< 0x1000), and in bits 12-15 where it starts:
+ * 0 its beginning, otherwise save point (n - 1) */
+#define SEL_INDEX(d)    ((d) & 0xfff)
+#define SEL_SP(d)       (((d) >> 12) & 0xf)
+#define SEL_AT_SP(sp)   (((u32)(sp) + 1) << 12)
+#define MAX_ROWS        (MAX_CUSTOM * 2 + 127)
 #define ROW_TEXT_W      345       /* the list's 375 px less its scroll bar and margins */
 enum { ID_PLAY = 1, ID_BACK = 2, ID_HOST = 3, ID_LIST = 100 };
 
@@ -616,7 +795,7 @@ static int host_map_dir(int i, char *out, u32 size)
 	u32 data;
 
 	if (i < 0 || i >= g_nhostMaps) return 0;
-	data = row_data(g_hostRow[i]);
+	data = SEL_INDEX(row_data(g_hostRow[i]));
 	if (data < ITEM_CUSTOM || data - ITEM_CUSTOM >= (u32)g_ncustom || size < MAX_PATH) return 0;
 	fmt(out, "%sCustomLevels\\%s\\", g_dataDir, g_custom[data - ITEM_CUSTOM].folder);
 	return 1;
@@ -664,6 +843,21 @@ static void fill_level_list(WMtWindow *dialog)
 		if (twin) fmt(label, "%s (%s)", g_custom[i].name, g_custom[i].folder);
 		else str_cpy(label, sizeof label, g_custom[i].name);
 		add_row(label, ITEM_CUSTOM + i, custom_spawns(&g_custom[i]));
+
+		/* Under it, where else it can start: a copy of level 1 its Combat Training (save point 0;
+		 * the level's row is the Warehouse, save point 1), then its own save points, as the stock
+		 * Load Game lists a level's. Not hostable, so never blue. */
+		if (g_custom[i].source == 1) add_row("    Combat Training", ITEM_CUSTOM + i + SEL_AT_SP(0), -1);
+		if (load_saves(g_custom[i].folder, &g_listSaves))
+			for (int sp = g_custom[i].source == 1 ? 2 : 1; sp < 10; sp++) {
+				const char *name = (const char *)g_listSaves.sp[sp];
+				if (!(g_listSaves.sp[sp][0x40] & CONTINUE_VALID)) continue;
+				g_listSaves.sp[sp][63] = 0;
+				while (*name == ' ') name++;
+				if (*name) fmt(label, "    %s", name);
+				else fmt(label, "    Save Point %d", sp);
+				add_row(label, ITEM_CUSTOM + i + SEL_AT_SP(sp), -1);
+			}
 	}
 
 	/* Non-original levels installed the classic way (numbered files in GameDataFolder). */
@@ -691,7 +885,10 @@ static void fill_level_list(WMtWindow *dialog)
 		int found = 0;
 		for (int i = 0; i < g_ncustom && !found; i++)
 			if (str_ieq_n(g_custom[i].folder, g_autostart, sizeof g_autostart)) {
-				log_msg("autostart: %s (save point %d)", g_custom[i].folder, (int)g_autostartSavePoint);
+				if (g_autostartSavePoint >= 0)
+					log_msg("autostart: %s (save point %d)", g_custom[i].folder, g_autostartSavePoint);
+				else
+					log_msg("autostart: %s", g_custom[i].folder);
 				g_startSavePoint = g_autostartSavePoint;
 				WMrDialog_ModalEnd(dialog, ITEM_CUSTOM + i);
 				found = 1;
@@ -803,54 +1000,80 @@ static void add_custom_game_button(WMtWindow *dialog)
 	        WIN_CLASS(load), WIN_FLAGS(load), WIN_STYLE(load));
 }
 
-/* Save points of a custom level live in its slot. A level copied from an original one has
- * none yet, so the original level's saved game for that save point is used (the player
- * must have reached it there). Returns the save point to start at (0 = beginning). */
-static u32 prepare_save_point(const CustomLevel *cl, u32 slot, u32 sp)
+/* The continue a start at save point sp hands the engine (start_continue_hook): the level's own
+ * saved game, else the original level's (the player must have reached it there). The level's
+ * script reads the number as save_point; with no continue it would read 0. Returns the save
+ * point the level starts at (0 = its beginning). */
+static u32 prepare_save_point(const CustomLevel *cl, u32 sp)
 {
+	const u8 *from = 0;
+
+	g_pendingSet = 0;
 	if (sp == 0 || sp >= 10) return 0;
-	if (persist_valid(slot, sp)) return sp;
-	if (cl->source && persist_valid(cl->source, sp)) {
-		u8 *from = persist_entry(cl->source, sp), *to = persist_entry(slot, sp);
-		for (u32 i = 0; i < PERSIST_ENTRY; i++) to[i] = from[i];
-		log_msg("save point %d: using level %d's saved game", (int)sp, (int)cl->source);
-		return sp;
-	}
-	/* Level 1's save point 0 is Combat Training; save point 1 is the Warehouse start, which
-	 * Catwalk uses as "beginning". Its script places Konoko itself, and restore_game
-	 * (0x4fd8b0) just logs "invalid save" when there's nothing to restore. */
 	if (cl->source == 1 && sp == 1) {
-		log_msg("save point 1: no saved game, starting level 1 after Combat Training");
-		return sp;
+		/* Level 1's save point 0 is Combat Training; 1 is the Warehouse, its beginning after
+		 * training. Its script places Konoko itself, so the continue is the one persist.dat
+		 * starts with: present, and ignored by restore_game (0x4fd8b0). */
+		memset(g_pendingContinue, 0, sizeof g_pendingContinue);
+		str_cpy((char *)g_pendingContinue, 64, "Syndicate Warehouse");
+		*(u32 *)(g_pendingContinue + 0x40) = CONTINUE_VALID | CONTINUE_IGNORE_RESTORE;
+		g_pendingSavePoint = 1;
+		g_pendingSet = 1;
+		log_msg("save point 1: the Warehouse, after Combat Training");
+		return 1;
 	}
-	log_msg("save point %d: no saved game in slot %d or level %d; starting from the beginning",
-	        (int)sp, (int)slot, (int)cl->source);
-	return 0;
+	if (g_saves.sp[sp][0x40] & CONTINUE_VALID) {
+		from = g_saves.sp[sp];
+		log_msg("save point %d: this level's saved game", (int)sp);
+	} else if (is_original(cl->source) && persist_valid(cl->source, sp)) {
+		from = persist_entry(cl->source, sp);
+		log_msg("save point %d: level %d's saved game", (int)sp, (int)cl->source);
+	} else {
+		log_msg("save point %d: no saved game here or in level %d; starting from the beginning",
+		        (int)sp, (int)cl->source);
+		return 0;
+	}
+	for (u32 i = 0; i < PERSIST_ENTRY; i++) g_pendingContinue[i] = from[i];
+	g_pendingSavePoint = sp;
+	g_pendingSet = 1;
+	return sp;
 }
 
 static void start_selection(WMtWindow *main_menu, u32 selection)
 {
-	u32 level, sp = 0;
+	u32 level, sp = 0, data = selection & 0xffff;
 
-	selection &= 0xffff;
-	if (selection >= ITEM_CUSTOM) {
-		const CustomLevel *cl = &g_custom[selection - ITEM_CUSTOM];
-		if (selection - ITEM_CUSTOM >= (u32)g_ncustom || !mount_custom_level(cl))
+	g_pendingSet = 0;
+	if (data >= ITEM_CUSTOM) {
+		u32 index = SEL_INDEX(data) - ITEM_CUSTOM, at = SEL_SP(data);
+		int want;
+		if (index >= (u32)g_ncustom) return;
+		const CustomLevel *cl = &g_custom[index];
+		if (!mount_custom_level(cl)) {
+			g_startSavePoint = -1;
 			return;
+		}
 		level = g_slot;
-		sp = prepare_save_point(cl, level, g_startSavePoint);
-		g_startSavePoint = 0;
+		if (g_startSavePoint >= 0) want = g_startSavePoint;   /* ARKLITE_SAVEPOINT */
+		else if (at) want = (int)at - 1;                       /* a save point's row */
+		/* The level's row: its beginning. A copy of level 1 alone starts in the Warehouse;
+		 * a network game at 0, the joiners' start. */
+		else want = cl->source == 1 && !(selection & (SEL_HOST | SEL_JOIN)) && !net_active() ? 1 : 0;
+		g_startSavePoint = -1;
+		sp = prepare_save_point(cl, (u32)want);
 	} else {
-		level = selection;
+		level = data;
 	}
 	log_msg("starting level %d at save point %d", level, (int)sp);
 
-	/* Same sequence the main menu uses for New Game / Load Game. */
+	/* Same sequence the main menu uses for New Game / Load Game. The save point goes through
+	 * the continue (start_continue_hook), not ONrGame_StartLevel's persist.dat lookup. */
 	ONiMainMenu_FadeOut();
 	WMrDialog_ModalEnd(main_menu, 0);
 	ONiMainMenu_Leave1();
 	ONiMainMenu_Leave2();
-	ONrGame_StartLevel(level | sp << 8);
+	ONrGame_StartLevel(level);
+	g_pendingSet = 0;
 }
 
 /* Custom Game: the New/Join popup until a level is picked or it's cancelled. Returns the item
@@ -876,7 +1099,7 @@ static u32 custom_game_menu(void)
 			choice = MPMENU_CANCEL;   /* Back: the popup */
 			continue;
 		}
-		if (!folder[0]) return level;   /* a numbered level: both have it in the same slot */
+		if (!folder[0]) return level | SEL_JOIN;   /* a numbered level: both have it in the same slot */
 		scan_custom_levels();
 		int i = find_folder(folder);
 		if (i < 0) {   /* the host's map isn't here: from the host first */
@@ -894,7 +1117,7 @@ static u32 custom_game_menu(void)
 			}
 		}
 		g_forceSlot = (int)level;
-		return ITEM_CUSTOM + i;
+		return (ITEM_CUSTOM + i) | SEL_JOIN;
 	}
 }
 
@@ -951,7 +1174,7 @@ void custom_game_install(void)
 		char sp[8];
 		if (GetEnvironmentVariableA("ARKLITE_SAVEPOINT", sp, sizeof sp) - 1 < sizeof sp - 1 &&
 		    sp[0] >= '0' && sp[0] <= '9')
-			g_autostartSavePoint = (u32)(sp[0] - '0');
+			g_autostartSavePoint = sp[0] - '0';
 	}
 
 	patch_push_imm32(ONcMainMenu_ProcPushAddr, ONcMainMenu_Proc, (u32)main_menu_proc);
@@ -959,5 +1182,8 @@ void custom_game_install(void)
 	patch_push_imm32(SLcIGMDPushAddr1, SLcIGMDFormat, (u32)g_igmdFormat);
 	patch_push_imm32(SLcIGMDPushAddr2, SLcIGMDFormat, (u32)g_igmdFormat);
 	patch_call(TMcLevel_OpenFileCallAddr, (u32)TMrLevel_OpenFile, (u32)open_level_file_hook);
+	patch_call(StartLevel_ClearCall, (u32)ONrGame_ClearContinue, (u32)start_continue_hook);
+	patch_call(SaveGame_SetContinueCall, (u32)ONrPersist_SetContinue, (u32)set_continue_hook);
+	patch_call(LoadList_ExistsCall, (u32)TMrLevel_Exists, (u32)load_list_exists_hook);
 	log_msg("custom game: patches applied");
 }

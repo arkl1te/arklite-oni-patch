@@ -372,7 +372,7 @@ static void draw_score(const NetHud *h, int local, int width)
 	char line[64];
 	int x = width - MARGIN, y = MARGIN, left = players_time_left();
 
-	for (int pass = 0; pass < 2; pass++) {   /* measured, then drawn */
+	for (int pass = 0; pass < 2 && !fx_menu_open(); pass++) {   /* measured, then drawn (the O menu has the corner: none) */
 		if (pass) {
 			g_right_shift = hud_center_shift(width, 0, MARGIN + g_right_width, MARGIN / 2);
 			x = width - MARGIN + g_right_shift;
@@ -432,6 +432,59 @@ static void draw_over(const NetHud *h, int width, int height)
 	text(line, x, y, CENTER, h->over_ready ? GREEN : YELLOW);
 }
 
+/* A vote (net.c "Votes"): what it's about, the count and the time left, how to answer; then
+ * "Vote passed" or "Vote failed" for a moment */
+static int draw_vote(int width, int y)
+{
+	NetVote v;
+	char what[160], line[224];
+	int x = width / 2;
+
+	if (!net_vote(&v)) return y;
+	if (v.kind == NET_VOTE_MAP) fmt(what, "change the map to %s", v.subject);
+	else if (v.reason[0]) fmt(what, "kick %s (%s)", v.subject, v.reason);
+	else fmt(what, "kick %s", v.subject);
+	if (v.state != NET_VOTE_OPEN) {
+		fmt(line, v.state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
+		text(line, x, y, CENTER, v.state == NET_VOTE_PASSED ? GREEN : RED);
+		y += g_line_height + GAP2;
+		fmt(line, "Yes %d   No %d   of %d player%s", v.yes, v.no, v.voters, v.voters == 1 ? "" : "s");
+		text(line, x, y, CENTER, WHITE);
+		return y + g_line_height + LINE_GAP;
+	}
+	fmt(line, "Vote: %s", what);
+	text(line, x, y, CENTER, WHITE);
+	y += g_line_height + GAP2;
+	fmt(line, "Yes %d   No %d   of %d player%s   %d s", v.yes, v.no, v.voters, v.voters == 1 ? "" : "s",
+	    (v.ms_left + 999) / 1000);
+	text(line, x, y, CENTER, YELLOW);
+	y += g_line_height + GAP2;
+	if (!v.may) text("Spectators don't vote", x, y, CENTER, HINT_GRAY);
+	else if (v.mine == 1) text("You voted Yes (N: No)", x, y, CENTER, GREEN);
+	else if (v.mine == 2) text("You voted No (Y: Yes)", x, y, CENTER, RED);
+	else text("Press Y for Yes, N for No (or F1)", x, y, CENTER, WHITE);
+	return y + g_line_height + LINE_GAP;
+}
+
+/* Jamming Guns (mutators.c): the gun in hand of the character this screen shows is jammed. Under
+ * the middle of the screen, near the crosshair, where a player looks while shooting. */
+static void draw_jam(int width, int height)
+{
+	static const char *const times[] = { "", "once", "twice" };
+	int drops, reloads;
+	char line[96], n[16];
+
+	if (!mutators_jammed(net_view_character(), &drops, &reloads)) return;
+	int y = height * 3 / 5;
+	text("Gun jammed!", width / 2, y, CENTER, RED);
+	if (drops < 3) str_cpy(n, sizeof n, times[drops]);
+	else fmt(n, "%d times", drops);
+	if (drops && reloads) fmt(line, "Drop it %s and reload it", n);
+	else if (drops) fmt(line, "Drop it %s", n);
+	else str_cpy(line, sizeof line, "Reload it");
+	text(line, width / 2, y + g_line_height + GAP2, CENTER, WHITE);
+}
+
 /* Another PC went quiet or is gone */
 static void draw_connection(const NetHud *h, int width, int y)
 {
@@ -465,13 +518,20 @@ static void ONI_FC timer_display(void *timer)
 	hud_timer_display(timer);   /* Oni's timer, scaled with the HUD */
 	if (!ctx || !ONgGameState || !ONrLevel_GetCurrent()) return;
 	net_hud(&h);
-	if (h.state == NETHUD_OFF && !(multiplayer_active() && multiplayer_map())) return;
+	int mp = h.state != NETHUD_OFF || (multiplayer_active() && multiplayer_map());
+	if (!mp && !char_menu_open()) return;
 
 	width = M3rScreen_Width();
 	height = M3rScreen_Height();
 	color = *(u32 *)((u8 *)ctx + 0xc);   /* the timer's color, put back after */
 	size = corner_begin(ctx);
 	y = height / 5;
+	if (!mp) {   /* F2 outside multiplayer (a map script's ark_characterscreen_enabled): the menu alone */
+		char_menu_draw(width, height);
+		corner_end(ctx, size);
+		TSrContext_SetColor(ctx, color);
+		return;
+	}
 
 	/* first, so the screen's messages (warm-up, joining, connection) go over the names */
 	if (h.state != NETHUD_LOBBY && h.state != NETHUD_STARTING) mp_names_draw(width, height);
@@ -500,6 +560,8 @@ static void ONI_FC timer_display(void *timer)
 		text(line, width / 2, y, CENTER, WHITE);
 		y += g_line_height + LINE_GAP;
 	}
+	if (!(h.state == NETHUD_MATCH && h.over)) y = draw_vote(width, y);
+	if (h.state == NETHUD_MATCH && !h.over) draw_jam(width, height);
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING || h.warmup) y = draw_problem(&h, width, y);
 	/* the warm-up's F2 hint at the very top, in the chat hint's style (F2 does nothing while the
 	 * chat or the pause menu has the keyboard) */
@@ -529,6 +591,18 @@ static void ONI_FC console_display(void)
 	void *ctx = ONgTextContext;
 
 	COrConsole_Display();
+	if (fx_menu_open() && ctx && ONgGameState && ONrLevel_GetCurrent()) {   /* the O key's cloak effect menu (fx_menu.c) */
+		u32 color = *(u32 *)((u8 *)ctx + 0xc), size = corner_begin(ctx);
+		fx_menu_draw(M3rScreen_Width(), M3rScreen_Height());
+		corner_end(ctx, size);
+		TSrContext_SetColor(ctx, color);
+	}
+	if (lagometer_on() && ctx && !photo_active()) {   /* the lag-o-meter (lagometer.c) */
+		u32 color = *(u32 *)((u8 *)ctx + 0xc), size = corner_begin(ctx);
+		lagometer_draw(M3rScreen_Width(), M3rScreen_Height());
+		corner_end(ctx, size);
+		TSrContext_SetColor(ctx, color);
+	}
 	if (photo_active() && ctx) {   /* its bars, grid and keys, with the HUD hidden or not */
 		u32 color = *(u32 *)((u8 *)ctx + 0xc), size = corner_begin(ctx);
 		photo_draw(M3rScreen_Width(), M3rScreen_Height());
@@ -546,7 +620,7 @@ static void ONI_FC console_display(void)
 		start = (u32)now;
 		frames = 0;
 	}
-	if (show_fps() && fps && ctx && ONgGameState && ONrLevel_GetCurrent()) {
+	if (show_fps() && fps && ctx && ONgGameState && ONrLevel_GetCurrent() && !fx_menu_open()) {
 		u32 color = *(u32 *)((u8 *)ctx + 0xc);
 		char line[16];
 		u32 size;

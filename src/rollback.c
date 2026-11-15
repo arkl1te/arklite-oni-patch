@@ -455,6 +455,7 @@ typedef struct {
 	u32 endc_ok;                   /* endc holds the last tick's end (no restore since) */
 	u32 amb_lo[RB_SLOTS], amb_hi[RB_SLOTS];   /* SS2 ambient play ids the slot's tick started: (lo, hi] */
 	u32 ex_lo[RB_MAX_EXCL], ex_hi[RB_MAX_EXCL], nex;
+	u32 os_learned;                /* pages of Oni's ambient table made known by rb_os_table_known */
 	u32 note_page[RB_MAX_NOTES], note_tid[RB_MAX_NOTES], nnotes, notes_logged;
 	u32 amb_stopped;
 	u32 acm_hits, acm_logs;        /* rb_acm_guard: ACM memory found in known pages */
@@ -487,6 +488,9 @@ static void rb_unprotect(void);
 static int rb_kept(u32 p);
 static void rb_globals_near(u32 p, char *out_buf);
 static void rb_sound_before_restore(u32 tick);
+static void rb_os_table_known(void);
+static void rb_os_handles_repair(u32 tick);
+static u32 e_os_repairs;   /* restores after which Oni's ambient handles were made again (rb_os_handles_repair) */
 
 /* Still committed and writable (a tick may have freed it) */
 static int page_writable(u32 p)
@@ -826,6 +830,9 @@ static void rb_start(void)
 		               "alone write)", n);
 	}
 	for (u32 s = 0; s < RB_SLOTS; s++) e->slot_valid[s] = 0;
+	e->os_learned = 0;
+	rb_os_table_known();   /* known from the start (see "The ambient table as one") */
+	if (e->os_learned) log_msg("rollback: Oni's ambient table (its array, entries and handles) is known from the start: %u page(s)", e->os_learned);
 	e->endc_ok = 0;
 	e->nnotes = e->notes_logged = 0;
 	e->amb_stopped = e->acm_hits = e->acm_logs = e->probe_faults = 0;
@@ -852,6 +859,8 @@ static void rb_reset(const char *why)
 	        "other heaps dropped, %d reads of memory freed under the lock test caught", why, g_e->npages, g_e->grown * 4,
 	        g_e->freed * 4, g_e->plist_cuts, g_e->acm_hits, g_e->reused, g_e->heap_pages * 4, g_e->probe_faults);
 	if (g_pool) log_msg("rollback: the pool for Oni's big blocks: at most %d of %d slots in use at once this match", g_pool_used_max, POOL_SLOTS);
+	if (e_os_repairs) log_msg("rollback: Oni's ambient handles were made again from its array after %u restores this match", e_os_repairs);
+	e_os_repairs = 0;
 	g_pool_used_max = 0;
 	g_e->active = 0;
 	if (g_e->vout && g_e->vout != INVALID_HANDLE_VALUE) CloseHandle(g_e->vout);
@@ -1274,33 +1283,144 @@ static void *side_alloc(u32 flags, u32 n)
 	return p;
 }
 
+/* (through heap_check.c's journal, which just passes them on when it's off) */
 static void *__cdecl rb_sbh_alloc(u32 n)
 {
-	return between_ticks() ? 0 : ((void *(__cdecl *)(u32))SBH_ALLOC_FN)(n);
+	return between_ticks() ? 0 : heap_sbh_alloc(n);
 }
 
 static int __cdecl rb_sbh_resize(void *header, void *block, u32 n)
 {
-	return between_ticks() ? 0 : ((int (__cdecl *)(void *, void *, u32))SBH_RESIZE_FN)(header, block, n);
+	return between_ticks() ? 0 : heap_sbh_resize(header, block, n);
+}
+
+/* The call at a calls fn itself or heap_check.c's wrapper of it: that target, else 0 */
+static u32 sbh_call(u32 a, u32 fn, u32 wrapper)
+{
+	u32 to;
+	if (!code_matches(a, (const u8[]){ 0xe8 }, 1)) return 0;
+	to = a + 5 + *(const u32 *)(a + 1);
+	return to == fn || to == wrapper ? to : 0;
 }
 
 static void rb_side_install(void)
 {
-	u32 ok = 0;
-	for (u32 i = 0; i < sizeof g_sbh_alloc_calls / sizeof g_sbh_alloc_calls[0]; i++)
-		if (code_matches(g_sbh_alloc_calls[i], (const u8[]){ 0xe8 }, 1) &&
-		    g_sbh_alloc_calls[i] + 5 + *(const u32 *)(g_sbh_alloc_calls[i] + 1) == SBH_ALLOC_FN) ok++;
-	if (code_matches(SBH_RESIZE_CALL, (const u8[]){ 0xe8 }, 1) &&
-	    SBH_RESIZE_CALL + 5 + *(const u32 *)(SBH_RESIZE_CALL + 1) == SBH_RESIZE_FN) ok++;
+	u32 ok = 0, to[4];
+	for (u32 i = 0; i < 3; i++)
+		if ((to[i] = sbh_call(g_sbh_alloc_calls[i], SBH_ALLOC_FN, (u32)heap_sbh_alloc))) ok++;
+	if ((to[3] = sbh_call(SBH_RESIZE_CALL, SBH_RESIZE_FN, (u32)heap_sbh_resize))) ok++;
 	if (ok != 4 || *(const HANDLE *)0x6d9200 == 0 || !(g_side = HeapCreate(0, 0, 0))) {
 		g_side = 0;
 		log_msg("rollback: Oni's allocator isn't as expected (%d of 4 calls): windows opened in a match stay in game memory", ok);
 		return;
 	}
-	for (u32 i = 0; i < sizeof g_sbh_alloc_calls / sizeof g_sbh_alloc_calls[0]; i++)
-		patch_call(g_sbh_alloc_calls[i], SBH_ALLOC_FN, (u32)rb_sbh_alloc);
-	patch_call(SBH_RESIZE_CALL, SBH_RESIZE_FN, (u32)rb_sbh_resize);
+	for (u32 i = 0; i < 3; i++) patch_call(g_sbh_alloc_calls[i], to[i], (u32)rb_sbh_alloc);
+	patch_call(SBH_RESIZE_CALL, to[3], (u32)rb_sbh_resize);
 	log_msg("rollback: what Oni allocates between ticks (windows, dialogs) comes from Arklite's heap: a rollback never puts it back");
+}
+
+/* ---- Body-surface caches outside the snapshots ---------------------------------------------- *
+ * A character class's body-surface cache (0x4f2550: 0x3a0 bytes from UUrMemory_Block_New
+ * 0x424ab0, its pointer at ONCC +0xc30) is made the first time a particle of one of the class's
+ * characters emits from the body: the Daodan glow (superglow_e01, murosuperglow_e01: emitter
+ * position BodyBones, P3iEmitParticle 0x45de78) or Mutant Muro's (muroglow_e01, w14_muro_e01:
+ * BodySurface, 0x45ddda). Konoko's and Muro's classes have the glow; with the Daodan mutator every
+ * class does. The class's dispose (0x4f2520) frees it: the level's unload, level0's at a level0
+ * swap, or Oni closing.
+ * On Windows Oni maps its level files copy-on-write (MapViewOfFile with FILE_MAP_COPY, 0x402485):
+ * the class, and +0xc30 with it, is in no snapshot (rb_candidate leaves mapped memory out; the
+ * snapshots cover ~47 MB there against ~330 MB under Wine, whose views are private memory), while
+ * the cache's block is in the small-block heap, which is in them. A rollback to before the tick
+ * that made a cache gave its block back to the heap and left the class pointing at it: later
+ * allocations took the block, and the class's dispose freed it once more at the unload. Windows
+ * players crashed so (v0.5.0, 2026-11-14): reading the block's header from a page the heap had
+ * given back (0x424b30 called from 0x4f2532, leaving a match to the main menu), and in the heap's
+ * free (0x523f1d, 0x523f2b) closing Oni or loading the next level; every such match had Konoko's
+ * or Muro's classes in play or the Daodan mutator on.
+ * So the cache's block comes from Arklite's slots (memory no snapshot holds), kept by class: a
+ * class that asks again (its +0xc30 put back to 0 by a rewind, as under Wine) gets its own slot
+ * again, and the class's dispose frees it. The cache's content only depends on the class's body,
+ * the same on every PC and in every re-run, and 0x4f2550 fills it again each time it asks. */
+#define BODY_CACHE_NEW_CALL     0x4f256d   /* call UUrMemory_Block_New (ECX 0x3a0, ESI the class) */
+#define BODY_CACHE_FREE_CALL    0x4f2532   /* call UUrMemory_Block_Delete (ECX the cache, ESI the class) */
+#define UUrMemory_Block_New_FN  0x424ab0
+#define UUrMemory_Block_Del_FN  0x424b30
+#define BODY_CACHE_SIZE         0x3a0
+#define BODY_CACHE_SLOTS        512        /* level0 has ~130 classes, a level a few more */
+static u8 *g_bc_mem;
+static u8 *g_bc_class[BODY_CACHE_SLOTS];   /* the slot's class, 0: free */
+static u32 g_bc_made, g_bc_again, g_bc_full_logs;
+
+__attribute__((used, noinline)) static void *__cdecl rb_body_cache_new(u8 *cls)
+{
+	int free_slot = -1;
+	for (u32 i = 0; i < BODY_CACHE_SLOTS; i++) {
+		if (g_bc_class[i] == cls) {   /* asked again: its +0xc30 was put back to 0 */
+			g_bc_again++;
+			return g_bc_mem + i * BODY_CACHE_SIZE;
+		}
+		if (!g_bc_class[i] && free_slot < 0) free_slot = (int)i;
+	}
+	if (free_slot < 0) {
+		if (g_bc_full_logs++ < 4)
+			log_msg("rollback: %d body-surface caches in use: the next one comes from Oni's heap (a rollback past it can break "
+			        "the heap)", BODY_CACHE_SLOTS);
+		return ((void *(ONI_FC *)(u32))UUrMemory_Block_New_FN)(BODY_CACHE_SIZE);
+	}
+	g_bc_class[free_slot] = cls;
+	g_bc_made++;
+	return g_bc_mem + free_slot * BODY_CACHE_SIZE;
+}
+
+__attribute__((used, noinline)) static void __cdecl rb_body_cache_free(u8 *cls, u8 *block)
+{
+	u32 o = (u32)(block - g_bc_mem);
+	if (g_bc_mem && block >= g_bc_mem && o < BODY_CACHE_SLOTS * BODY_CACHE_SIZE && !(o % BODY_CACHE_SIZE)) {
+		g_bc_class[o / BODY_CACHE_SIZE] = 0;
+		return;
+	}
+	((void (ONI_FC *)(void *))UUrMemory_Block_Del_FN)(block);
+}
+
+__attribute__((naked, used)) static void rb_body_cache_new_thunk(void)
+{
+	__asm__ volatile(
+		"pushl %esi\n\t"
+		"call _rb_body_cache_new\n\t"
+		"addl $4, %esp\n\t"
+		"ret");
+}
+
+__attribute__((naked, used)) static void rb_body_cache_free_thunk(void)
+{
+	__asm__ volatile(
+		"pushl %ecx\n\t"
+		"pushl %esi\n\t"
+		"call _rb_body_cache_free\n\t"
+		"addl $8, %esp\n\t"
+		"ret");
+}
+
+static u32 rb_call_target(u32 site)
+{
+	const u8 *p = (const u8 *)site;
+	return p[0] == 0xe8 ? site + 5 + *(const u32 *)(p + 1) : 0;
+}
+
+static void rb_body_cache_install(void)
+{
+	if (!code_matches(BODY_CACHE_NEW_CALL - 5, (const u8[]){ 0xb9, 0xa0, 0x03, 0x00, 0x00 }, 5) ||
+	    rb_call_target(BODY_CACHE_NEW_CALL) != UUrMemory_Block_New_FN || rb_call_target(BODY_CACHE_FREE_CALL) != UUrMemory_Block_Del_FN ||
+	    !code_matches(BODY_CACHE_FREE_CALL - 10, (const u8[]){ 0x8b, 0x8e, 0x30, 0x0c, 0x00, 0x00 }, 6) ||
+	    !(g_bc_mem = VirtualAlloc(0, BODY_CACHE_SLOTS * BODY_CACHE_SIZE, 0x3000, 4))) {
+		log_msg("rollback: the body-surface cache's calls (0x%x, 0x%x) aren't as expected: a rollback past the Daodan glow's "
+		        "first tick may break Oni's heap on Windows", BODY_CACHE_NEW_CALL, BODY_CACHE_FREE_CALL);
+		return;
+	}
+	patch_call(BODY_CACHE_NEW_CALL, UUrMemory_Block_New_FN, (u32)rb_body_cache_new_thunk);
+	patch_call(BODY_CACHE_FREE_CALL, UUrMemory_Block_Del_FN, (u32)rb_body_cache_free_thunk);
+	log_msg("rollback: characters' body-surface caches (the Daodan glow's) come from Arklite's memory: a rollback never takes "
+	        "them from a class");
 }
 
 static void rb_new_memory(const void *p, u32 n)
@@ -1870,6 +1990,7 @@ static void rb_rewind_test(u32 tick, void (*body)(void *))
 	if (SSgLock) SSrLock(SSgLock);
 	rb_sound_before_restore(back);
 	rb_restore(back % RB_SLOTS);
+	rb_os_handles_repair(back);
 	if (SSgLock) SSrUnlock(SSgLock);
 	for (u32 t = back; t < tick; t++) {
 		memcpy(e->tmp_action, e->action[t % RB_SLOTS], 0x30);
@@ -1942,6 +2063,7 @@ int rollback_test_tick(void *action, void (*body)(void *))
 		if (grew || !e->heap_walked || !(e->ticks_protected % 60)) rb_heaps_guard();
 	}
 	rb_particles_check(tick);
+	rb_os_table_known();   /* the entries moved if the array grew */
 	rb_snapshot(tick, action);
 	if (e->samples_done < e->samples_wanted && tick >= e->next_sample) {
 		e->next_sample = tick + SURVEY_EVERY;
@@ -2320,6 +2442,93 @@ static void rb_os_orphans(u32 tick)
 	}
 }
 
+/* The ambient table as one. Its array (*0x61fa2c, UUtMemory_Array: +4 used, +0xc allocated, +0x10
+ * data, 0x4c-byte entries: +0 index, +4 handle, +0xc SS2 play id) and its handles (*0x61fa34, 1024)
+ * change in ticks (a start: a new entry and handle) and between them (the frame's
+ * OSiAmbient_UpdateAll frees each entry whose sound ended: the count goes down, the entries move
+ * up, every handle is made again). Oni keeps them matching. v0.5.0, 2026-11-14: three Windows
+ * joiners crashed a second after coming into a match in progress (PowerPlant, a modded level0),
+ * each with the same registers: OSrAmbient_Stop's delete (0x425570) ran with the array's count at
+ * 0 (memmove's end, src + n, was the data's start: n = -(index + 1) * 0x4c), so it ran off the
+ * array (0x51f8f3): a handle led to an entry of an empty array. Before each crash: catching up
+ * (the sound driver off, so every PlayOnce line in hearing range stays in the table, never
+ * played), coming in (the first frames started them all: c18_79_05tanker eight times), and
+ * restores (rb_os_orphans stopped those plays). Only a restore that put back one part of the table
+ * and not the other can part them; which part wasn't shown, and 2400 rollbacks of a hidden test
+ * (Wine) didn't reproduce it. One way the code allows: a page is learned when a tick first writes
+ * it, and rb_learn copies it as it is then into every kept snapshot, the frames' writes since those
+ * ticks included. So: the table's three blocks are known pages from the snapshots' start (and
+ * checked at every tick's start: the data block moves when the array grows), and after every
+ * restore the handles are made again from the array if they don't match (rb_os_handles_repair). */
+#define OSgPlayingArray      (*(u32 **)0x61fa2c)
+#define OScPlayingEntrySize  0x4c
+
+static void rb_learn_range(u32 lo, u32 n)
+{
+	Engine *e = g_e;
+	for (u32 p = lo >> PAGE_SHIFT; n && p <= (lo + n - 1) >> PAGE_SHIFT && p < PAGES; p++) {
+		if (!(e->flag[p] & PF_CAND) || e->index[p] || (e->flag[p] & (PF_FOREIGN | PF_PROT))) continue;
+		if (e->npages >= RB_MAX_PAGES) return;
+		rb_lock();
+		rb_learn(p);
+		rb_unlock();
+		e->os_learned++;
+	}
+}
+
+static void rb_os_table_known(void)
+{
+	const u32 *a = OSgPlayingArray;
+	u8 **h = OSgPlayingHandles;
+	if (a && rb_readable((u32)a) && rb_readable((u32)a + 0x13)) {
+		rb_learn_range((u32)a, 0x14);
+		if (a[4] && a[0] == OScPlayingEntrySize && a[3] && a[3] <= OScPlayingHandles && rb_readable(a[4]))
+			rb_learn_range(a[4], a[0] * a[3]);
+	}
+	if (h && rb_readable((u32)h)) rb_learn_range((u32)h, OScPlayingHandles * 4);
+}
+
+/* After a restore: the handles made again from the array, as Oni does after every change
+ * (OSiPlayingAmbientHandles_Update, inline after 0x425570's calls: each entry gets its index at
+ * +0 and the handle at +4 points at it). Oni keeps the two matching; only a restore that put
+ * back one part and not the other parts them, and the crash above needed handles to entries
+ * past the array's count. Logged when they didn't match. */
+static void rb_os_handles_repair(u32 tick)
+{
+	static u32 logs;
+	u32 *a = OSgPlayingArray;
+	u8 **h = OSgPlayingHandles;
+	if (!a || !h || !rb_readable((u32)a) || !rb_readable((u32)a + 0x13) || !rb_readable((u32)h) ||
+	    !rb_readable((u32)h + OScPlayingHandles * 4 - 1))
+		return;
+	u32 n = a[1], data = a[4], bad = 0;
+	if (a[0] != OScPlayingEntrySize || n > a[3] || n > OScPlayingHandles || (n && (!data || !rb_readable(data) ||
+	    !rb_readable(data + n * OScPlayingEntrySize - 1)))) {
+		if (logs++ < 4) log_msg("rollback: tick %d: Oni's ambient array doesn't look right after the restore (entry size %u, count %u of %u): "
+		                        "left as it is", tick, a[0], a[1], a[3]);
+		return;
+	}
+	for (u32 i = 0; i < OScPlayingHandles; i++) {   /* a handle to anything but its entry in the array */
+		u32 p = (u32)h[i];
+		if (!p) continue;
+		if (p < data || p >= data + n * OScPlayingEntrySize || (p - data) % OScPlayingEntrySize || ((u32 *)p)[1] != i) bad++;
+	}
+	for (u32 i = 0; i < n; i++) {   /* an entry no handle points at */
+		u32 *ent = (u32 *)(data + i * OScPlayingEntrySize);
+		if (ent[1] >= OScPlayingHandles || h[ent[1]] != (u8 *)ent || ent[0] != i) bad++;
+	}
+	if (!bad) return;
+	e_os_repairs++;
+	if (logs++ < 8) log_msg("rollback: tick %d: Oni's ambient handles didn't match its array after the restore (%u differences, %u "
+	                        "entries): made again from the array", tick, bad, n);
+	memset(h, 0, OScPlayingHandles * 4);
+	for (u32 i = 0; i < n; i++) {
+		u32 *ent = (u32 *)(data + i * OScPlayingEntrySize);
+		ent[0] = i;
+		if (ent[1] < OScPlayingHandles && !h[ent[1]]) h[ent[1]] = (u8 *)ent;
+	}
+}
+
 u32 rollback_ambients_stopped(void) { return g_e ? g_e->amb_stopped : 0; }
 
 /* One-shot sounds while ticks run again (0), as usual after (1): lockstep.c's impulse_play then
@@ -2360,7 +2569,9 @@ int rollback_restore_tick(u32 tick)
 	u8 *lock = SSgLock;
 	if (lock) SSrLock(lock);
 	rb_sound_before_restore(tick);
+	heap_check_rewound(GS_TICK(ONgGameState), tick);   /* (its journal: blocks this rewind makes free again) */
 	rb_restore(s);
+	rb_os_handles_repair(tick);   /* (before the orphans: they read the handles) */
 	rb_os_orphans(tick);
 	if (lock) SSrUnlock(lock);
 	GS_TIME_BASE(ONgGameState) = base;
@@ -2474,6 +2685,7 @@ void rollback_install(void)
 	float n = 0;
 	u32 calls = 0;
 
+	rb_body_cache_install();
 	for (u32 i = 0; i < sizeof g_os_start_calls / sizeof g_os_start_calls[0]; i++)
 		calls += patch_call(g_os_start_calls[i], SSrAmbient_Start, (u32)os_ambient_start);
 	if (calls == 2) log_msg("rollback: the sounds Oni's ambient table starts are noted (a rollback stops the ones it loses)");

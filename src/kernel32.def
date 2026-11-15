@@ -70,3 +70,4 @@ EXPORTS
   CreateProcessA@40
   MultiByteToWideChar@24
   HeapCreate@12
+  GetWindowsDirectoryA@8

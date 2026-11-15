@@ -54,9 +54,9 @@ Fix F10 swallowing the next key.
 
 - Keep all three end lines, even for a list with no items.
 - **Short lines: about 60-80 characters, never much more.** Brief, concise, straight. When an
-  item needs more, split it into several items (one per aspect: the feature, its options, its
-  UI...) instead of packing lists of options, examples, parentheses or env vars into one line.
-  Details belong in the docs, not here.
+  item needs more, cut detail first: lists of options, examples, parentheses and env vars belong
+  in the docs, not here. Split an item only into parts that stand on their own, such as a feature
+  and a new setting it brings. Never split off its button, indicator, rename or edge cases.
 - **Changes**: existing behavior that now works differently, plus refactors, docs and the version.
 - **New**: features, options, shortcuts and tools that didn't exist before.
 - **Fixes**: anything that was broken and now isn't, whichever verb describes it best.
@@ -71,8 +71,10 @@ Fix F10 swallowing the next key.
   whether each action is a change, something new or a fix, and put it only there. Never describe
   the same action twice: not as a "Make ..." in Changes and again as its "Fix ..." in Fixes, and
   not as several items for its parts or its result (a bug and the mechanism that fixes it are one
-  item; so are a feature and its edge cases). Before writing the block, check every pair of items:
-  if two describe the same action or one is part of the other, merge them or drop the lesser.
+  item; so are a feature and its edge cases, its UI hints, and a rename it caused). Before
+  writing the block, check every pair of items: if two describe the same action, one is part of
+  the other, or one couldn't ship or be reverted without the other, merge them or drop the
+  lesser. Then check every item against the diff: what does it alone describe? If nothing, drop it.
 - Don't list patch/diff noise (whitespace, reordering) unless that's all there is.
 - Don't include `.claude/` in the summary.
 - After the code block, flag anything that shouldn't go into the commit unnoticed, such as leftover

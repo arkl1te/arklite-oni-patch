@@ -193,6 +193,61 @@ static u32 fpu_control_word(void)
 	return cw;
 }
 
+/* Network games: the x87 control word at the session's start (0: not watching). A tick that starts
+ * with another one is logged once a session: x87 precision and rounding come from it, so floats
+ * would round differently from the other PCs' (a desync of a few float steps, 2026-11-13 report:
+ * a hit's knockback one bit apart on two Windows PCs, cause not shown). */
+static u32 g_fpu_watch, g_fpu_told;
+static u32 g_sse, g_mxcsr_watch, g_mxcsr_told;   /* the same for SSE's control register (Daodan's or a driver's SSE code) */
+#define MXCSR_CONTROL 0xffc0   /* rounding, flush-to-zero, denormals-are-zero, the masks; not the sticky flags (bits 0-5) */
+
+static u32 mxcsr(void)
+{
+	u32 v = 0;
+	if (g_sse) __asm__ volatile("stmxcsr %0" : "=m"(v));
+	return v;
+}
+
+void lockstep_fpu_watch(u32 cw)
+{
+	if (!g_sse) {
+		u32 a = 1, b, c, d;
+		__asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+		g_sse = d >> 25 & 1;
+	}
+	g_fpu_watch = cw;
+	g_mxcsr_watch = cw ? (mxcsr() & MXCSR_CONTROL) | 0x80000000u : 0;   /* (bit 31: watching) */
+	g_fpu_told = g_mxcsr_told = 0;
+}
+
+/* The x87 results of this PC: sin, cos, tan, atan2, sqrt, log2 and 2^x of fixed numbers, large
+ * ones included, under the control word in place now, hashed. Two PCs of a session must show the
+ * same value, or the same code gives them different floats (a CPU's own x87 maths, or a
+ * different control word) */
+u32 lockstep_fpu_fingerprint(void)
+{
+	static const float in[] = { 0.1f, 0.5f, 0.7853982f, 1.0f, 1.5707964f, 2.0f, 3.1415927f, 4.712389f, 6.2831855f, 10.0f,
+	                            100.0f, 1000.0f, 12345.678f, 1e6f, 3e7f, -0.3f, -2.5f, -100.0f, 0.001f, 1e-6f };
+	u32 h = 0x811c9dc5u;
+	for (u32 i = 0; i < sizeof in / sizeof in[0]; i++) {
+		float x = in[i], r[7];
+		u8 ext[10];
+		__asm__ volatile("flds %1\n\tfsin\n\tfstps %0" : "=m"(r[0]) : "m"(x));
+		__asm__ volatile("flds %1\n\tfcos\n\tfstps %0" : "=m"(r[1]) : "m"(x));
+		__asm__ volatile("flds %1\n\tfptan\n\tfstp %%st(0)\n\tfstps %0" : "=m"(r[2]) : "m"(x));
+		__asm__ volatile("flds %1\n\tfld1\n\tfpatan\n\tfstps %0" : "=m"(r[3]) : "m"(x));
+		__asm__ volatile("flds %1\n\tfabs\n\tfsqrt\n\tfstps %0" : "=m"(r[4]) : "m"(x));
+		__asm__ volatile("fld1\n\tflds %1\n\tfabs\n\tfyl2x\n\tfstps %0" : "=m"(r[5]) : "m"(x));
+		__asm__ volatile("flds %1\n\tfsin\n\tf2xm1\n\tfstps %0" : "=m"(r[6]) : "m"(x));   /* (f2xm1 needs |x| <= 1) */
+		__asm__ volatile("flds %1\n\tfsin\n\tfstpt %0" : "=m"(ext) : "m"(x));   /* all 64 bits, before rounding to a float */
+		for (u32 k = 0; k < 7; k++) h = (h ^ *(u32 *)&r[k]) * 0x01000193u;
+		for (u32 k = 0; k < 10; k++) h = (h ^ ext[k]) * 0x01000193u;
+	}
+	return h;
+}
+
+u32 lockstep_mxcsr(void) { return mxcsr(); }
+
 /* ---- RNG ---------------------------------------------------------------------------------- */
 
 /* Each replaces a function that only touches EAX, so they keep every other register. */
@@ -860,6 +915,7 @@ static void col_install(void)
 #define P3cMaxClasses         0x800
 #define P3_DEF(c)             (*(u8 **)((c) + 0x48))
 #define P3_DEF_DECORATIVE(d)  (*(u32 *)((d) + 4) & 1)
+#define P3_DEF_FLAGS2(d)      (*(u32 *)((d) + 8))
 #define P3_NUM_ACTIONS(d)     (*(u16 *)((d) + 0x12))
 #define P3_NUM_EMITTERS(d)    (*(u16 *)((d) + 0x14))
 #define P3_ACTIONS(d)         (*(u8 **)((d) + 0x2fc))
@@ -943,9 +999,14 @@ static int decor_looks_only(const u8 *cls, int depth)
 /* The wrappers: the class decides while the call runs, then the caller's choice again */
 #define DECOR_CALL(cls, call) do { int was_ = g_decor; g_decor = decor_looks_only((cls), 0); call; g_decor = was_; } while (0)
 
+static u32 g_quality_mask;   /* network games: definition flags2 bits this PC's quality turns off (see "Particle quality") */
+
 static u8 *ONI_FC decor_create_particle(u8 *cls, u32 time)
 {
 	u8 *r;
+	/* what Oni's own test at P3rCreateParticle's top did for this PC's quality, now only for classes
+	 * whose particles only look (Oni's quality is High in network games: "Particle quality" below) */
+	if (g_quality_mask && decor_looks_only(cls, 0) && (P3_DEF_FLAGS2(P3_DEF(cls)) & g_quality_mask)) return 0;
 	DECOR_CALL(cls, r = ((u8 *(ONI_FC *)(u8 *, u32))P3rCreateParticle_)(cls, time));
 	return r;
 }
@@ -1042,6 +1103,8 @@ static u32 decor_patch(const u32 *sites, u32 n, u32 target, void *with)
 	return done;
 }
 
+static void quality_install(void);
+
 static void decor_install(void)
 {
 #define N(a) (sizeof a / sizeof a[0])
@@ -1073,7 +1136,124 @@ static void decor_install(void)
 	}
 	for (u32 k = 0; k < N(all); k++) got += decor_patch(all[k], counts[k], targets[k], with[k]);
 	log_msg("decorative particles: those that only look draw from this PC's effects stream (%u of %u calls)", got, want);
+	if (got == want) quality_install();   /* it refuses classes in decor_create_particle */
 #undef N
+}
+
+/* ---- Particle quality in network games ------------------------------------------------- *
+ * Particle quality (persist.dat, Options) turns classes off at the level's start: P3rLevelBegin
+ * (0x457e50) asks the quality callback (*0x6a85c4, Oni's 0x508ec0: 0 High, 1 Medium, 2 Low into
+ * P3gQuality 0x6a8704) and sets the Disabled flag (class +0x40, 0x40) on every class whose
+ * definition flags2 has MediumDetailDisable (0x40, at Medium and Low) or LowDetailDisable (0x20,
+ * at Low), decorative or not; P3rCreateParticle then makes nothing of them. P3gQuality also halves
+ * (Medium) or quarters (Low) every decal class's limit (0x45caea). So a class with those bits that
+ * isn't decorative, or is decorative but hurts, existed on one PC and not on another, and drew from
+ * the tick's effects stream where it existed. 2026-11-14 public matches (v0.5.0): dozens of
+ * sessions desynced at tick 120, the first hash check after 2 s, with every character equal and
+ * only the effects seed apart, always the same PCs; a hidden host at High and a joiner at Low on
+ * Condemned did the same, the host's update of such a class drawing 6 numbers a tick from tick 119
+ * that the joiner's never made (PENDING.md had it as "Condemned desyncs at tick 120 in the rig").
+ *
+ * In a network game every PC now runs the particle system at High: the level begins with Oni's
+ * quality High (the callback is swapped for P3rLevelBegin's call), so no class is disabled and the
+ * decal limits are whole everywhere. This PC's own quality still applies to classes whose
+ * particles only look (decor_looks_only: they draw from this PC's stream, so whether they exist
+ * changes no number of the game): decor_create_particle refuses them as Oni did. A quality changed
+ * in Options during the network game (0x50f115's jump to 0x508ef0, which runs P3rChangeDetail and
+ * kills the particles of every class it turns off, on this PC alone) only changes that refusal. */
+#define P3gQuality            (*(u32 *)0x6a8704)
+#define P3gQualityCallback    (*(void **)0x6a85c4)
+#define P3rLevelBegin         ((u32 (*)(void))0x457e50)
+#define P3cLevelBeginCall     0x505e9b
+#define ONiParticleQuality    0x508ec0   /* the callback: ECX the quality's address */
+#define ONrParticleQuality_Changed 0x508ef0   /* Options: reads the new quality, jumps to P3rChangeDetail */
+#define ONcParticleQuality_ChangedJmp 0x50f115
+#define P3cFlag2_DetailDisable 0x60
+#define P3gClassCount         (*(u16 *)0x6a8666)
+
+static void *g_quality_cb;       /* Oni's callback, while P3rLevelBegin runs */
+static u32 g_quality_pc;         /* this PC's quality (0 High, 1 Medium, 2 Low) */
+static int g_quality_same;       /* this level began with every PC's particles at High */
+
+static u32 quality_mask(u32 q) { return q == 2 ? 0x60 : q == 1 ? 0x40 : 0; }
+
+static void ONI_FC quality_high(u32 *q)
+{
+	*q = 0;
+	if (g_quality_cb) ((void (ONI_FC *)(u32 *))g_quality_cb)(q);
+	g_quality_pc = *q;
+	*q = 0;
+}
+
+static const char *const g_quality_names[] = { "High", "Medium", "Low" };
+
+static u32 particle_level_begin(void)
+{
+	u32 r;
+	if (!net_active()) {
+		g_quality_same = 0;
+		g_quality_mask = 0;
+		return P3rLevelBegin();
+	}
+	g_quality_cb = P3gQualityCallback;
+	P3gQualityCallback = (void *)quality_high;
+	r = P3rLevelBegin();
+	P3gQualityCallback = g_quality_cb;
+	g_quality_same = 1;
+	g_quality_mask = quality_mask(g_quality_pc);
+	/* the classes this PC's quality used to turn off although they can matter to the game */
+	u32 n = 0, looks = 0;
+	char names[256];
+	int k = 0;
+	names[0] = 0;
+	for (u32 i = 0; i < P3gClassCount && i < P3cMaxClasses; i++) {
+		u8 *cls = (u8 *)P3cClasses + i * P3cClassSize, *d = P3_DEF(cls);
+		if (!d || !(P3_DEF_FLAGS2(d) & g_quality_mask)) continue;
+		if (decor_looks_only(cls, 0)) { looks++; continue; }
+		if (n++ < 4) {
+			char w[80];
+			fmt(w, "%s%.60s", k ? ", " : "", (const char *)cls);
+			for (const char *c = w; *c && k < (int)sizeof names - 1; c++) names[k++] = *c;
+			names[k] = 0;
+		}
+	}
+	log_msg("particles: network game: every PC's particles run at High (this PC's quality %s leaves out %u classes that only look; "
+	        "it used to leave out %u that can matter%s%s%s)", g_quality_names[g_quality_pc > 2 ? 0 : g_quality_pc], looks, n,
+	        n ? ": " : "", names, n > 4 ? ", ..." : "");
+	return r;
+}
+
+static void particle_quality_changed(void)
+{
+	if (!g_quality_same || !net_active()) {
+		g_quality_same = 0;
+		g_quality_mask = 0;
+		((void (*)(void))ONrParticleQuality_Changed)();
+		return;
+	}
+	u32 q = 0;
+	((void (ONI_FC *)(u32 *))ONiParticleQuality)(&q);
+	g_quality_pc = q;
+	g_quality_mask = quality_mask(q);
+	log_msg("particles: quality %s in a network game: classes that only look follow it, the others stay at High",
+	        g_quality_names[q > 2 ? 0 : q]);
+}
+
+static void quality_install(void)
+{
+	const u8 *p = (const u8 *)P3cLevelBeginCall, *j = (const u8 *)ONcParticleQuality_ChangedJmp;
+	static const u8 cb[] = { 0xa1, 0xc4, 0x85, 0x6a, 0x00 };   /* P3rLevelBegin: mov eax,[0x6a85c4] */
+	if (p[0] != 0xe8 || P3cLevelBeginCall + 5 + *(const u32 *)(p + 1) != (u32)P3rLevelBegin || j[0] != 0xe9 ||
+	    ONcParticleQuality_ChangedJmp + 5 + *(const u32 *)(j + 1) != ONrParticleQuality_Changed ||
+	    !code_matches((u32)P3rLevelBegin, cb, sizeof cb)) {
+		log_msg("particles: 0x%x changed, each PC's particle quality decides its classes (network games can desync)", P3cLevelBeginCall);
+		return;
+	}
+	u8 jmp[5] = { 0xe9 };
+	*(u32 *)(jmp + 1) = (u32)particle_quality_changed - (ONcParticleQuality_ChangedJmp + 5);
+	patch_call(P3cLevelBeginCall, (u32)P3rLevelBegin, (u32)particle_level_begin);
+	patch_write(ONcParticleQuality_ChangedJmp, jmp, sizeof jmp);
+	log_msg("particles: network games run every class at High quality on every PC; this PC's quality leaves out only classes that look");
 }
 
 /* Logged once a level: how many classes were worked out so far, and how many only look */
@@ -1666,6 +1846,16 @@ static void ONI_FC tick_hook(void *action)
 {
 	rollback_tick_begin();
 	g_fpu_cw = fpu_control_word();
+	if (g_fpu_watch && g_fpu_cw != g_fpu_watch && !g_fpu_told) {
+		g_fpu_told = 1;
+		log_msg("net: the x87 control word is %04x at tick %u, %04x at the session's start: this PC's floats may now "
+		        "round differently from the other PCs'", g_fpu_cw, GS_TICK(ONgGameState), g_fpu_watch);
+	}
+	if (g_mxcsr_watch && !g_mxcsr_told && ((mxcsr() & MXCSR_CONTROL) | 0x80000000u) != g_mxcsr_watch) {
+		g_mxcsr_told = 1;
+		log_msg("net: SSE's control register (MXCSR) is %08x at tick %u, %08x at the session's start: SSE code (Daodan's, a "
+		        "driver's) may now round differently from the other PCs'", mxcsr(), GS_TICK(ONgGameState), g_mxcsr_watch & 0xffff);
+	}
 	g_in_tick = 1;
 	if (!rollback_test_tick(action, tick_body)) tick_body(action);
 	rollback_tick_end();
@@ -1688,6 +1878,8 @@ static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 	const u32 *p2;
 
 	rollback_frame();
+	sysinfo_frame();   /* the machine and setup dump when due (sysinfo.c) */
+	bug_frame();       /* a /bug report waiting for its screenshot (bug.c) */
 	char_menu_tag(count, actions);   /* this PC's F2 choice, in every record (a replay uses its own) */
 	if (photo_update(count, actions, ticks_run, &err)) return err;   /* single player only */
 	if (net_active()) return net_update(count, actions, ticks_run);
@@ -1755,6 +1947,45 @@ static u32 ONI_FC update_hook(u32 count, void *actions, u32 *ticks_run)
 	return err;
 }
 
+/* ---- Oni's frame state in frames with no tick -------------------------------------------- *
+ * Every frame Oni's main loop sets five draw states and commits them before the frame's clear
+ * (0x4d4783..0x4d47e5: 0x41e170 sets 3 and 4, depth test and write, 0xc and 0xd from 0x55600d and
+ * 0x55600c, 0x12 from 0x5ed304; 0x41e340 commits; then 0x41ab00, the clear at 0x405882 with
+ * colour and depth). A set only marks its state dirty when the stored value changes (the dirty
+ * bits at 0x6b8cb4), and the draw engine's update applies only dirty states (depth only with
+ * 0x18, the clear's enable with bit 0xc). 2D drawing at a frame's end (HUD, menus, text) turns
+ * GL's depth writes off and leaves the stored values back at "on", so the main loop's set changes
+ * nothing and the commit leaves GL as it was: depth writes off, and glClear doesn't clear depth
+ * while they're off. That frame drew over the previous frame's depth: wherever the camera had
+ * moved, surfaces failed the depth test and the clear colour (black) showed in jagged patches,
+ * floors went black, walls and parts of characters came and went. In a frame that ran a tick
+ * something marks those states dirty on the way, so stock Oni, where every frame runs a tick,
+ * never showed it. A network game has frames with no tick (a joiner waiting for late inputs):
+ * the Windows laptop with a 300 ms ping (2026-11-15) had them in bursts after the pause menu
+ * closed, 180 of 2400 frame clears with depth writes off, every one in a frame with no tick
+ * (a temporary wrapper on Oni's glClear and a log of gl_depth_mode_set 0x40ce20's callers).
+ * So the main loop's commit always applies its five states: they're marked dirty first. */
+#define ONcMainLoop_StateCommitCall  0x4d47e5   /* call M3rGeom_State_Commit */
+#define M3rGeom_State_Commit_FN      0x41e340
+#define ONgGeomStateDirty            0x6b8cb4
+#define MAIN_LOOP_STATES             ((1u << 3) | (1u << 4) | (1u << 0xc) | (1u << 0xd) | (1u << 0x12))
+
+__attribute__((naked, used)) static void main_loop_state_commit(void)
+{
+	__asm__ volatile(
+		"orl %0, 0x6b8cb4\n\t"
+		"pushl %1\n\t"   /* on to M3rGeom_State_Commit, which returns to the main loop */
+		"ret\n" :: "i"(MAIN_LOOP_STATES), "i"(M3rGeom_State_Commit_FN));
+}
+
+static void frame_state_install(void)
+{
+	if (patch_call(ONcMainLoop_StateCommitCall, M3rGeom_State_Commit_FN, (u32)main_loop_state_commit))
+		log_msg("frame state: the main loop's draw states reach GL every frame (no depth left from the last frame without a tick)");
+	else
+		log_msg("frame state: the main loop's state commit at 0x%x changed, skipped", ONcMainLoop_StateCommitCall);
+}
+
 void lockstep_install(void)
 {
 	u8 *u = (u8 *)ONcGameState_UpdateCall, *t = (u8 *)ONcGameState_TickCall;
@@ -1767,6 +1998,7 @@ void lockstep_install(void)
 	channel_unlock_install();
 	visited_install();
 	two_sided_install();
+	frame_state_install();
 	col_install();
 	/* the tick hook tells the local RNG when a tick is running, so it's always in */
 	if (tick_ok) {

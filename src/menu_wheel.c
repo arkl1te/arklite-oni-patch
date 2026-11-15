@@ -104,7 +104,7 @@ static long WINAPI window_proc(void *hwnd, u32 msg, u32 wp, long lp)
 {
 	if ((msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wp == VK_F10) return 0;
 	if (msg == WM_MOUSEWHEEL) {
-		if (char_menu_open()) g_hud_wheel += (short)(wp >> 16);
+		if (char_menu_open() || fx_menu_open()) g_hud_wheel += (short)(wp >> 16);
 		else if (photo_active() && LIrMode_Get() == LIcMode_Game) g_photo_wheel += (short)(wp >> 16);
 		else if (LIrMode_Get() != LIcMode_Game) g_wheel += (short)(wp >> 16);
 	}
@@ -119,7 +119,7 @@ int menu_wheel_hud_take(void)
 	if (!g_old_proc) install_proc();
 	int notches = g_hud_wheel / WHEEL_DELTA;
 	g_hud_wheel -= notches * WHEEL_DELTA;
-	if (!char_menu_open()) g_hud_wheel = 0;
+	if (!char_menu_open() && !fx_menu_open()) g_hud_wheel = 0;
 	return notches;
 }
 
@@ -277,6 +277,7 @@ static void ONI_FC modal_update(void)
 {
 	int notches;
 
+	wm_timers_check();   /* timers of windows that are gone (live_menu.c) */
 	WMrUpdate();
 	if (!g_old_proc) install_proc();
 	notches = g_wheel / WHEEL_DELTA;

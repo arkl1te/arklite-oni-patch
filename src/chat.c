@@ -303,6 +303,10 @@ void chat_server(const char *text)
 		bold(m, 0, i);
 	} else if ((i = find(m->line, " left the game")) > 0 && i + 14 == len) {
 		bold(m, 0, i);
+	} else if ((i = find(m->line, " called a vote: ")) > 0) {   /* net.c "Votes" */
+		bold(m, 0, i);
+	} else if (find(m->line, "Vote passed") == 0 || find(m->line, "Vote failed") == 0) {
+		bold(m, 0, 11);
 	} else if (find(m->line, "Server: ") == 0) {   /* the dedicated server's admin (net_server_say) */
 		bold(m, 0, 7);
 		if (!server_running()) mp_sound("autosave");
@@ -662,7 +666,7 @@ static void whisper(const char *args)
 	mp_sound("door_fail");
 }
 
-static void help(void)
+static int help(void)
 {
 	static const char *const rows[] = {
 		"/help\tthis list",
@@ -675,8 +679,14 @@ static void help(void)
 		"/idle, /i\ta special idle (most characters have one)",
 		"/spectate\twatch the game without playing (your score goes to 0)",
 		"/join\tplay again after /spectate (your score goes to 0)",
+		"/players\tthe players and their numbers (one per internet address, from 1)",
+		"/vote map Name\tvote to change the map (its folder or its name)",
+		"/vote kick Who [why]\tvote to kick a player (name or number from /players)",
+		"/yes, /no\tanswer the vote (or Y / N, or the F1 Scoreboard)",
 		"/ip\tyour internet address, for a host outside your network",
 		"/punch address\thost: let in a player outside whose host can't be reached (they tell you their /ip)",
+		"/bug what happened\tsend the developer this moment: your screen, words and the game so far",
+		"/lagometer, /lag\tthe Lag-o-meter: ping, rollbacks and late inputs as they happen",
 	};
 	bold_text(info("Commands (taunts, sneeze and idles while standing; any key stops them):", 0, INFO), "Commands");
 	for (unsigned i = 0; i < sizeof rows / sizeof rows[0]; i++) {
@@ -684,6 +694,56 @@ static void help(void)
 		bold(m, 0, m->tab);   /* the command */
 		m->ref_bold = 1;
 	}
+	return 1 + (int)(sizeof rows / sizeof rows[0]);
+}
+
+/* /players: everyone in this game with the number the host gave their internet address (net.c
+ * "Votes"); /vote kick takes it */
+static int players_list(void)
+{
+	NetHud h;
+	char line[CHAT_MAX + 64], id[16];
+	int n = 0;
+
+	net_hud(&h);
+	if (h.state == NETHUD_OFF) {
+		info("Only in a network game.", 0, INFO);
+		return 0;
+	}
+	bold_text(info("Players (number: the same for everyone at one internet address):", 0, INFO), "Players");
+	for (int w = 0; w < NET_SLOTS; w++) {
+		u32 pid;
+		Message *m;
+		if (!(h.present >> w & 1) || (w == 0 && net_dedicated())) continue;
+		pid = net_player_id(w);
+		if (pid) fmt(id, "%d", pid);
+		else str_cpy(id, sizeof id, "-");
+		fmt(line, "%s\t%s%s%s%s", id, mp_name(w)[0] ? mp_name(w) : "(no name yet)", w == 0 ? " (host)" : "",
+		    w == h.local_player ? " (you)" : "", h.state == NETHUD_MATCH && players_spectating(w) ? " (watching)" : "");
+		line[CHAT_MAX - 1] = 0;
+		m = info(line, "99", WHITE);
+		bold(m, 0, m->tab);
+		n++;
+	}
+	return n + 1;
+}
+
+/* /vote map Name, /vote kick Who [why]: the host runs it (net.c "Votes"), and says it to everyone */
+static void vote(const char *args)
+{
+	const char *err;
+	if (!*args) {
+		info("Usage: /vote map Name, or /vote kick Who [why] (Who: a name, or a number from /players)", 0, INFO);
+		return;
+	}
+	if ((err = net_vote_call(args))) info(err, 0, INFO);
+	else log_msg("chat: /vote %s", args);
+}
+
+static void answer(int yes)
+{
+	const char *err = net_vote_cast(yes);
+	if (err) info(err, 0, INFO);
 }
 
 /* A line starting with /: done here, never sent. Returns the lines a list printed (the chat
@@ -701,9 +761,24 @@ static int command(const char *t)
 	while (*args && *args != ' ') args++;
 	while (*args == ' ') args++;
 
-	if (ieq(cmd, "help") || ieq(cmd, "?")) {
-		help();
-		return 12;
+	if (ieq(cmd, "help") || ieq(cmd, "?")) return help();
+	if (ieq(cmd, "players")) return players_list();
+	if (ieq(cmd, "bug")) {   /* bug.c: the moment, sent to the developer */
+		info(bug_report(args), 0, INFO);
+		return 0;
+	}
+	if (ieq(cmd, "lagometer") || ieq(cmd, "lag")) {
+		lagometer_toggle();
+		info(lagometer_on() ? "Lag-o-meter on (/lagometer again turns it off)" : "Lag-o-meter off", 0, INFO);
+		return 0;
+	}
+	if (ieq(cmd, "vote")) {
+		vote(args);
+		return 0;
+	}
+	if (ieq(cmd, "yes") || ieq(cmd, "no")) {
+		answer(ieq(cmd, "yes"));
+		return 0;
 	}
 	if (ieq(cmd, "clear")) {
 		g_nmsg = 0;
@@ -793,7 +868,7 @@ static int send(void)
 static int allowed(void)
 {
 	NetHud h;
-	if (!ONgGameState || !ONrLevel_GetCurrent() || char_menu_open() || live_menu_open() || mp_name_editing()) return 0;
+	if (!ONgGameState || !ONrLevel_GetCurrent() || char_menu_open() || fx_menu_open() || live_menu_open() || mp_name_editing()) return 0;
 	net_hud(&h);
 	return h.state != NETHUD_OFF;
 }

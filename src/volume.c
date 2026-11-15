@@ -236,25 +236,44 @@ static int channel_category(u8 *channel)
 
 int volume_channel_is_music(u8 *channel) { return channel_category(channel) == CAT_MUSIC; }
 
+/* Music plays you can hear (a channel playing), but not the one with id except: the level's music
+ * kept under the pause menu, for the fade when leaving the level (arklite.c) */
+u32 volume_music_playing(u32 *ids, u32 max, u32 except)
+{
+	u32 n = 0;
+
+	if (!SSgEnabled || !SSgPlays) return 0;
+	SSrLock(SSgLock);
+	for (u32 i = 0; i < SSgPlayCount && n < max; i++) {
+		u8 *p = SSgPlays + i * SScPlaySize, *c1 = SSmPlay_Chan1(p), *c2 = SSmPlay_Chan2(p);
+		if (!SSmPlay_State(p) || SSmPlay_ID(p) == except || play_category(p) != CAT_MUSIC) continue;
+		if ((c1 && c1[0x1b] & 1) || (c2 && c2[0x1b] & 1)) ids[n++] = SSmPlay_ID(p);
+	}
+	SSrUnlock(SSgLock);
+	return n;
+}
+
 /* ---- Hooks -------------------------------------------------------------------------------- */
 
 /* net.c's one loading popup while joining: every channel silent until it ends (volume_hush) */
 static volatile int g_hush;
+/* Leaving the level: hundredths of a dB taken off every Music channel (volume_music_fade) */
+static volatile long g_musicFade;
 
 /* The engine's own dB for the channel, plus the slider's attenuation */
 static void ONI_FC channel_set_volume(u8 *channel, u32 unused, float volume)
 {
-	int v = g_hush ? 0 : g_volume[channel_category(channel)];
-	long db;
+	int cat = channel_category(channel), v = g_hush ? 0 : g_volume[cat];
+	long db, fade = cat == CAT_MUSIC ? g_musicFade : 0;
 
-	if (v >= 100) {
+	if (v >= 100 && !fade) {
 		SSrChannel_SetVolume(channel, unused, volume);
 		return;
 	}
 	if (v <= 0 || !(volume > SScChannel_MinVolume)) {
 		db = DSBVOLUME_MIN;
 	} else {
-		db = (long)(volume * 3333.0f) - 3333 + g_attenuation[v];
+		db = (long)(volume * 3333.0f) - 3333 + g_attenuation[v] + fade;
 		if (db < DSBVOLUME_MIN) db = DSBVOLUME_MIN;
 	}
 	DSrBuffer_SetVolume(SSmChannel_Buffer(channel))(SSmChannel_Buffer(channel), db);
@@ -355,6 +374,17 @@ void volume_hush(int on)
 	on = on != 0;
 	if (g_hush == on) return;
 	g_hush = on;
+	refresh_channels();
+}
+
+/* The fade when leaving the level (arklite.c): db (hundredths, <= 0) off every Music channel, on
+ * top of the engine's volume, and sent at once. The engine's own fades move its linear volume,
+ * which it turns into dB linearly over just 33 dB and cuts below 0.05: its music fades only got
+ * ~13 dB quieter and then stopped dead. 0 puts it back. */
+void volume_music_fade(long db)
+{
+	if (g_musicFade == db) return;
+	g_musicFade = db;
 	refresh_channels();
 }
 

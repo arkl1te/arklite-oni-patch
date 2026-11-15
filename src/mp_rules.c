@@ -32,9 +32,10 @@
  * characters are players (charType +0x1e8 == 0) and asks 0x48b2c0 otherwise, so the AIs keep
  * their teams.
  *
- * Taunts: the taunt check (0x4f80d0, ESI the character) lets the player (gs+0xac) taunt only
- * until gs+0x110, a time 0x4fdba0 moves later (after a kill); other characters always can. On a
- * multiplayer map the read of gs+0x110 (mov ecx,[eax+0x110] at 0x4f8249, then cmp ecx,edx with
+ * Taunts (on a multiplayer map, or where a map script sets ark_characters_alwaystaunt): the taunt
+ * check (0x4f80d0, ESI the character) lets the player (gs+0xac) taunt only
+ * until gs+0x110, a time 0x4fdba0 moves later (after a kill); other characters always can. Here
+ * the read of gs+0x110 (mov ecx,[eax+0x110] at 0x4f8249, then cmp ecx,edx with
  * the game tick in EDX) gives the last tick there is, so taunting is unlimited.
  *
  * Taunt lines: an animation's start (0x4e97a0) says its vocalization line with 0x48ba60 (ECX
@@ -362,6 +363,42 @@ __attribute__((naked)) static void drain_stub(void)
 
 #define ONcTaunt_UntilRead  0x4f8249
 
+/* ark_characters_alwaystaunt (BSL bool): the taunt rules below (unlimited taunts, a taunt line
+ * cuts off the last). At each level load it starts as "a multiplayer map", then main() runs: a
+ * single-player map turns them on with = true, a multiplayer map off with = false. The tick reads
+ * it, so it's tick state, and in a network game a change from outside the tick and the level load
+ * (the console, on one PC) is put back (bsl_tick_change_ok). */
+static u8 g_always_taunt TICK_STATE, g_taunt_kept TICK_STATE;
+static u8 g_taunt_due;   /* a level loads: the default comes when its spawns are counted */
+
+static int always_taunt(void) { return g_always_taunt; }
+
+static void taunt_assigned(void)
+{
+	if (g_always_taunt == g_taunt_kept) return;
+	if (!bsl_tick_change_ok()) {
+		log_msg("mp rules: ark_characters_alwaystaunt = %d ignored: in a network game only the map's scripts set it",
+		        g_always_taunt);
+		g_always_taunt = g_taunt_kept;
+		return;
+	}
+	g_always_taunt = g_always_taunt != 0;
+	g_taunt_kept = g_always_taunt;
+	log_msg("mp rules: ark_characters_alwaystaunt = %d", g_always_taunt);
+}
+
+void mp_rules_bsl_register(void)
+{
+	bsl_var_register("ark_characters_alwaystaunt", BSL_BOOL, &g_always_taunt, taunt_assigned);
+	log_msg("mp rules: map script variable ark_characters_alwaystaunt registered");
+}
+
+void mp_rules_level_begin(void)
+{
+	g_taunt_due = 1;
+	g_always_taunt = g_taunt_kept = 0;   /* (set from multiplayer_map() at the spawns) */
+}
+
 /* For mov ecx,[eax+0x110] (EAX the game state): every register but ECX kept */
 __attribute__((naked)) static void taunt_until(void)
 {
@@ -377,7 +414,7 @@ __attribute__((naked)) static void taunt_until(void)
 		"ret\n"
 		"1:\n\t"
 		"movl 0x110(%%eax), %%ecx\n\t"
-		"ret\n" :: "i"(multiplayer_map));
+		"ret\n" :: "i"(always_taunt));
 }
 
 static void taunt_install(void)
@@ -392,7 +429,7 @@ static void taunt_install(void)
 	}
 	memcpy(b + 1, &rel, 4);
 	patch_write(ONcTaunt_UntilRead, b, sizeof b);
-	log_msg("mp rules: unlimited taunts on multiplayer maps");
+	log_msg("mp rules: unlimited taunts on multiplayer maps (ark_characters_alwaystaunt)");
 }
 
 #define ONrCharacter_SayLine    ((u8 (ONI_FC *)(u8 *, u32, u32))0x48ba60)
@@ -408,7 +445,7 @@ static u8 ONI_FC say_anim_line(u8 *c, u32 type, u32 forced)
 	u8 r;
 
 	if (type != LINE_TAUNT || CHR_TYPE(c) != 0 || !CHR_SPEAKING(c) ||
-	    CHR_LINE_PRIORITY(c) > ONgLinePriority[type] || !multiplayer_map())
+	    CHR_LINE_PRIORITY(c) > ONgLinePriority[type] || !always_taunt())
 		return ONrCharacter_SayLine(c, type, forced);
 	was = CHR_LINE_PRIORITY(c);
 	CHR_LINE_PRIORITY(c) = 0;
@@ -425,7 +462,7 @@ static void taunt_line_install(void)
 		return;
 	}
 	patch_call(ONcAnimLine_SayCall, (u32)ONrCharacter_SayLine, (u32)say_anim_line);
-	log_msg("mp rules: a player's taunt line cuts off the one before on multiplayer maps");
+	log_msg("mp rules: a player's taunt line cuts off the one before on multiplayer maps (ark_characters_alwaystaunt)");
 }
 
 #define TRrAimingScreen_Clip    ((void (ONI_FC *)(const u8 *, float *, float *))0x4292f0)
@@ -603,6 +640,10 @@ void mp_rules_level(void)
 	static u8 stock;
 	u8 *p = 0;
 
+	if (g_taunt_due) {   /* the level's first walk: multiplayer_map() is known, main() hasn't run */
+		g_taunt_due = 0;
+		g_always_taunt = g_taunt_kept = multiplayer_map() != 0;
+	}
 	mp_rules_owners_reset();   /* a new level's particles start their references over */
 	daodan_level();
 	mutators_level();

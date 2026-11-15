@@ -1414,6 +1414,7 @@ static const Mutator g_mutatorList[] = {
 	{ NET_MUT_FAST_PLASMA, "Fast Plasma", "The Plasma Rifle fires twice as fast." },
 	{ NET_MUT_FAST_BALL, "Fast Ball", "The Super Ball Gun's ball flies twice as fast." },
 	{ NET_MUT_BOMBS, "Bombs For Days", "Everyone dies as the Mad Bomber does: a blast 3 seconds later." },
+	{ NET_MUT_JAMMING, "Jamming Guns", "A shot can jam the gun (5%): drop it 1-3 times, maybe reload too." },
 };
 #define MUTATORS ((int)(sizeof g_mutatorList / sizeof g_mutatorList[0]))
 enum { ID_MUT_OK = 1, ID_MUT_CANCEL = 2, ID_MUT_AVAILABLE = 100, ID_MUT_ENABLED = 101 };
@@ -1785,6 +1786,7 @@ static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32
 	WritePrivateProfileStringA("host", "fast_plasma", *rules & NET_MUT_FAST_PLASMA ? "1" : "0", ini_path());
 	WritePrivateProfileStringA("host", "bombs", *rules & NET_MUT_BOMBS ? "1" : "0", ini_path());
 	WritePrivateProfileStringA("host", "fast_ball", *rules & NET_MUT_FAST_BALL ? "1" : "0", ini_path());
+	WritePrivateProfileStringA("host", "jamming_guns", *rules & NET_MUT_JAMMING ? "1" : "0", ini_path());
 	{
 		char motd[NET_MOTD_MAX];
 		edit_text(WMrDialog_GetItemByID(dialog, ID_HOST_MOTD), motd, sizeof motd);

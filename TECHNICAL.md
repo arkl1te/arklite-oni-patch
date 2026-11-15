@@ -52,7 +52,7 @@ Without a path, the uninstaller looks in the same places as the installer.
 This removes `Arklite.dll`, puts the original `realbink.dll` back and removes
 `CustomLevels/` if it's empty. Your settings (`AE/Arklite.ini`) and logs (`AE/logs/`) are kept; pass
 `/purge` (Windows) or `--purge` (Linux/macOS), before any path, to remove them too. Custom
-levels, recordings (`*.akr`), `persist.dat` and
+levels, their saves (`AE/saves/`), recordings (`*.akr`), `persist.dat` and
 `persist.dat.before-arklite` are never removed.
 
 To uninstall by hand: close Oni, delete `AE/Arklite.dll` and `AE/realbink.dll`, then rename
@@ -68,7 +68,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | `[options]` | `hud_scale` | 100 | HUD scale in percent, 50–300 |
 | | `hud_center` | `4:3` | HUD Centering: `4:3` puts the rings where a 4:3 screen of the same height has them (no change on 4:3 or narrower screens), or a percentage, 0–100 in steps of 5: 0 leaves the rings in the bottom corners, 100 puts them side by side in the middle. The score, time, FPS, kill feed and chat move in too, each stopping short of the middle. On the slider, 4:3 is the step nearest to it, labelled "4:3" |
 | | `pause_background` | 33 | Opacity of the black behind the pause menu, 0–100 |
-| | `pause_music` | `keep` | `keep` (level music goes on), `theme` (original menu theme) or `silence` |
+| | `pause_music` | `keep` | `keep` (level music goes on, and fades out over 1.5 s when Quit, New Game, Load Game or Custom Game leaves the level), `theme` (original menu theme) or `silence` |
 | | `show_fps` | 0 | 1: FPS counter in the top right corner, refreshed every 6 frames |
 | | `mouse_sensitivity` | 1.000 | Multiplies the mouse's aiming and turning, 0.001–99.99 (the slider covers 0.10–4.00). Daodan's own `[windows] mousesensitivity` in `daodan.ini` multiplies on top when Daodan reads the mouse (raw input) |
 | `[volume]` | `sound`, `music`, `voice` | Overall Volume | 0–100 each; a missing key starts at your old Overall Volume |
@@ -99,6 +99,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `fast_plasma` | 0 | The Fast Plasma mutator: the Plasma Rifle fires twice as fast |
 | | `bombs` | 0 | The Bombs For Days mutator: everyone dies as the Mad Bomber does, a blast three seconds later. With or without it, a bomb's body vanishes when it goes off and leaves a black scorch |
 | | `fast_ball` | 0 | The Fast Ball mutator: the Super Ball Gun's ball flies twice as fast |
+| | `jamming_guns` | 0 | The Jamming Guns mutator: each shot a player fires has a 5% chance of jamming the gun (the round is lost). A jammed gun clicks instead of firing until it has been dropped 1 to 3 times (a drop counts when it lands) and reloaded 0 or 1 times, in any order; the screen says what's left. The jam stays with the gun, whoever picks it up |
 | | `motd` | (empty) | The message of the day: a server line in the chat ("Server MOTD: ...") for each player who enters the game, only them. The Host page's field saves it; up to 114 characters here, as many as fit in the field there. Empty: none |
 | `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by + and - |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
@@ -110,13 +111,15 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | `[photo]` | `speed` | 100 | Photo mode's flight speed in hundredths (100 = 1.00 times, 160 units a second), 10–2000 (the panel saves it) |
 | | `stop_at_walls`, `pause_sounds` | 1 | Photo mode's panel toggles (it saves them) |
 | | `show_hud`, `hide_player`, `thirds_grid`, `cinema_bars` | 0 | The same |
+| `[cloak_fx]` | `opacity`, `water_*`, `zoom*`, `stencil*`, `outline_*`, `fringe_*` | | The phase cloak's look on your own screen, as the **O** panel saves it (missing: the defaults) |
+| | `order` | `opacity,tones,zoom,water,outline,fringe` | The order its filters are applied in (the O panel's Up and Down) |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 
 | Variable | What |
 | --- | --- |
 | `ARKLITE_AUTOSTART=<folder>` | Opens Custom Game and plays `CustomLevels/<folder>` |
-| `ARKLITE_SAVEPOINT=<n>` | With `ARKLITE_AUTOSTART`, starts at save point n (1–9) |
+| `ARKLITE_SAVEPOINT=<n>` | With `ARKLITE_AUTOSTART`, starts at save point n (0–9) |
 | `ARKLITE_RECORD=<file>` | Records the first level played into `AE/<file>` |
 | `ARKLITE_REPLAY=<file>` | Replays `AE/<file>` and writes `MATCHED` or `DESYNCED` to the newest `AE/logs/Arklite_<date>_<time>.log` |
 | `ARKLITE_HOST=1` | Hosts a network game on UDP port 27777 (or `ARKLITE_HOST=<port>`) |
@@ -178,7 +181,25 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `/clear` | Empties the chat |
 | `/ip` | Your internet address and port, as the internet sees your game (for a host behind a shared address, see `/punch`) |
 | `/punch 1.2.3.4:5678` | Host: lets in a player from outside your network when they can't reach you. They tell you their address (shown under "Connecting to the host..." or by their `/ip`); your game knocks toward it for 2 minutes |
+| `/bug what happened` | Sends the developer this moment: what Oni drew on your screen, your words, every player's ping, the Lag-o-meter's last 128 frames and input packets, and the game's recording so far (with the log and the machine and setup dump, see "Problem reports"). Eight a game. With `[reports] send=0` it's only saved in `AE/logs` |
+| `/lagometer`, `/lag` | The Lag-o-meter, after Quake 3's: the upper graph is one bar a frame (blue up: how many ticks the game runs ahead of every player's known input, yellow past 6; red down: a rollback and its depth; gray: a frame that waited for inputs), the lower one a bar per input packet (how many ticks late it came: green up to 2, yellow up to 6, red past that), with each player's ping and the rollbacks a second above. On again at the next start: `[hud] lagometer=1` |
+| `/players` | Everyone in the game with their number: the host gives each internet address a number, from 1, in the order players first come, and keeps it while it hosts (a listen host is 1). Players on one PC or behind one router share it |
+| `/vote map Name` | Calls a vote to change the map: its folder in `CustomLevels` or its name, on the host's PC (no quotes needed, a start of it is enough when only one map fits). The map needs a spawn point for everyone here |
+| `/vote kick Who [reason]` | Calls a vote to kick a player: their name (or a start of it), or their number from `/players`. A number shared by more than one player asks for the name. The host can't be kicked |
+| `/yes`, `/no` | Answers the vote (as Y and N do) |
 | `\/text` | Sends "/text" as a message, not a command |
+
+**Votes**: `/vote map` and `/vote kick` start a 30-second vote on every screen, with a soft
+prompt sound: what it's about, the Yes and No counts, the seconds left. Answer with **Y** or
+**N** (while the chat is closed), `/yes` or `/no`, or the Yes and No buttons under the F1
+Scoreboard; you can change your answer while it's on, and calling a vote counts as your Yes. Only
+players vote, never spectators. It ends after 30 seconds, or as soon as everyone answered, and
+passes when at least half of the players answered Yes: "Vote passed" with the objective-complete
+sound, its command 3 seconds later; or "Vote failed" with the locked-door sound. One vote at a
+time. A passed map vote changes the map for everyone without hosting again: every PC reloads
+into the new map (a player without it, or with another version, downloads the files that
+differ), and the warm-up starts once they're all back. A passed kick keeps the player out for 5
+minutes ("Voted out for 5 min: reason").
 
 A taunt first puts your character in its fighting stance (taunts belong to it, as with the taunt key). Taunts, the sneeze and idles play only while you stand, every player sees them, and any key stops
 them.
@@ -189,7 +210,8 @@ gets a free number (31 or lower) when you pick it (a joiner takes the host's). P
 ```
 CustomLevels/<AnyFolderName>/
     level.ini              [level] name=Shown in the list (optional; otherwise the folder name)
-                                   source=N, the original level whose save points it may use
+                                   source=N, the original level whose saved games a start at a
+                                   save point may use when the level has none of its own
                            [textures] levels=4,3,10: the game levels whose textures the map names
     levelN_Final.dat/.raw  any N; other level*.dat files (plugins) in the folder are loaded too,
                            up to 8, except *_tools* files
@@ -222,12 +244,16 @@ at once. It marks the player that `chr_is_player` was last asked about, so the s
 first, as Level 3's vat does. That player's camera then stays where it is while they're dead, and
 cuts to them again when they respawn. The other players' cameras are unaffected.
 
-Known gaps: save points made in a custom level go to the persist.dat slot it was mounted in (when that
-slot has no save for a save point, the `source` level's is used); and what happens when a
-custom level ends (its "next level") isn't handled yet.
+**Save points**: a custom level's save points are its own, kept in `AE/saves/<folder>.sav`, not in
+`persist.dat` (where every custom level would share the same few level numbers). Custom Game lists
+them under the level, and Load Game doesn't show them. A copy of level 1 starts in the Warehouse
+(save point 1); its Combat Training is listed under it. Saves made in a network game aren't kept.
+
+Known gap: what happens when a custom level ends (its "next level") isn't handled yet.
 
 For testing, `ARKLITE_AUTOSTART=<folder>` opens Custom Game and plays that folder as if
-clicked, and `ARKLITE_SAVEPOINT=<n>` (1–9) starts it at save point n.
+clicked, and `ARKLITE_SAVEPOINT=<n>` starts it at save point n (0–9, the level script's
+`save_point`): the level's own saved game for it, else the `source` level's from `persist.dat`.
 
 ### Dedicated server
 
@@ -277,12 +303,13 @@ console window comes instead; `ARKLITE_SERVER_CONSOLE=wine` asks for that from t
 |---|---|
 | `help` | Lists the commands |
 | `say <text>` | A server message to every player (plain text does the same) |
-| `players` | Each player's number, name, state (playing, watching, joining, left), score, ping and address |
+| `players` | Each player's number, name, id (the `/players` number: one per address, as `/vote kick` takes it), state (playing, watching, joining, left), score, ping and address |
 | `status` | Map, warm-up or match (and the time left), players, limits, port |
 | `kick <player> [reason]` | Out for 5 minutes. The player is its number from `players`, or its name. They see "Kicked for 5 min: reason" |
 | `ban <player> [reason]` | Out until the server closes |
 | `bans` | Who is kicked or banned, numbered, with the address and the time left |
 | `unban [who]` | Lets them back in: the number from `bans`, the player's name, the address, or `all`. Nothing needed when only one is out. A player still waiting in the warm-up comes in by itself |
+| `map <map>` | Changes the map now, without a vote (its folder or name, as `/vote map`); the players stay connected and come along |
 | `start` | Starts the match now, from the warm-up |
 | `warmup` | Ends the match and goes back to a warm-up |
 | `timelimit <minutes>`, `scorelimit <points>` | From the next match (0: none; a negative score limit is reached by suicides) |
@@ -391,14 +418,58 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
   (up to 23 letters), and press Enter to keep it (Esc puts the old one back). It's saved, so
   you keep it next time. The score shows everyone's name, and when you look straight at
   another player, their name appears over their head.
+- **Map scripts control the character menu and taunts**: a level's BSL scripts (in `main()`, or any function)
+  can set four variables. They start over at every level load, before `main()` runs.
+
+  ```
+  ark_characterscreen_enabled = true
+  ark_characterscreen_instant_swap = true
+  ark_characterscreen_flags = 5
+  ```
+
+  | Variable | Type | At level load | What it does |
+  |---|---|---|---|
+  | `ark_characterscreen_enabled` | bool | true on a multiplayer map, false otherwise | F2 works on this map. A single-player map turns it on (a choice changes you at once, there are no respawns); a multiplayer map can turn it off. Off, the player is the map's character |
+  | `ark_characterscreen_instant_swap` | bool | false | In a network match, a new choice changes a living player at once instead of at the next respawn |
+  | `ark_characters_alwaystaunt` | bool | true on a multiplayer map, false otherwise | Taunts as in multiplayer: the player can taunt any time (not only after a kill), and a new taunt line cuts off the one being said |
+  | `ark_characterscreen_flags` | int | -1 (every character) | Which characters F2 offers: add up their numbers below. 0 offers none. Only in a game alone: in a network game the host's Mutators decide |
+
+  The numbers follow the order F2 shows when every character is installed (a missing one doesn't
+  change the others'): Konoko 1, Griffin 2, Muro 4, Barabas 8, Shinatama 16, Hasegawa 32, Ninja 64,
+  Striker 128, Tanker 256, Comguy 512, Elite 1024, Red 2048, TCTF SWAT 4096, TCTF Trooper 8192,
+  Cop 16384, Female Cop 32768, Thug 65536, Mad Bomber 131072, Ninjabot 262144, Sniper 524288,
+  Security Guard 1048576, Scientist 2097152, Female Scientist 4194304, Civilian 8388608,
+  Female Civilian 16777216, Mutant Muro 33554432, Hanako 67108864, Naomi 134217728,
+  Janice 268435456, BGI Sarai 536870912, Kit Ballard 1073741824, Lara the sign bit (make the sum
+  negative: subtract 2147483648). Shinatama Evolved, RAYMAN, Dragon Unit and other mods'
+  characters have no number: only -1 offers them. So `5` is Konoko and Muro.
 - **Phase cloak**: a player who picks up invisibility sees themselves half see-through (50%,
-  without the shimmer), but everyone else sees nothing of them: no body, shadow or name, not even
+  without the shimmer): only the body's near side, in its own colors with the white parts still
+  white, and players or items behind it show through; a slow turbulence (a 20-second loop)
+  makes it waver and ripple, as if seen under water, what's behind it seen through it slightly
+  zoomed in (as through a narrower field of view, only inside the body), its shading
+  cut to a few flat tones, a thin pale-blue outline around it and red and blue color fringes at
+  its edges. **O** opens a panel on the right of the screen (in any level) with a slider and a
+  number field for each of these: drag a slider, click a number and type one (Enter keeps it, Esc
+  puts it back), or turn the wheel over a row for a fine step. Each filter's Up and Down change
+  the order they're applied in, opacity included (faded first, the outline and fringes keep their
+  strength; faded last, they fade too). While it's open your own character shows the look
+  (Preview), cloaked or not, and the game gets no input; **Cloak me** gives you a 30-second phase
+  cloak outside network games; **Reset** puts every value and the order back. O or Esc closes it
+  and saves the values in `[cloak_fx]`. O is also stock Oni's second key for swapping weapons
+  (`key_config.txt`: `bind o to swap`), so opening the panel may swap your weapon once. The look
+  needs a graphics driver with OpenGL 2.0 shaders and framebuffer objects; without them the body
+  is simply half see-through. Everyone else sees nothing of them: no body, shadow or name, not even
   when they're hit. Only when they land a blow does their shimmer flash up for a moment and fade.
   Spectators (/spectate) see every cloaked player as Oni shows them, the fading body and the
   shimmer, with their name. When the cloak wears off the character is back to normal: in stock
   Oni it never fully ended, so motion blur (the ninja's dash afterimages) never came back.
   A force field's shell and the Daodan glow don't give a cloaked player away either: the shell
   isn't drawn for others and the glow stops until the cloak wears off.
+- **Force fields** (and the Daodan shield's look), in any game: only the shell's front surface is
+  drawn, once, where Oni drew every part's shell front and back, all glowing through each other.
+  Needs the same OpenGL 2.0 shaders and framebuffer objects as the cloak's look (without them,
+  the shell is drawn as in Oni).
 - **Free for all**: players can hit, shoot and throw each other, though they're all on Konoko's
   team. AI characters keep their usual teams.
 - **Damage is x1.25**: every hit on a character does a quarter more (rounded).
@@ -442,6 +513,25 @@ for a desync it gives the first tick that differs and, for the first 3 ticks tha
 fields that differ (up to 16 per character) with their exact bits.
 
 Recordings are large (roughly 10–80 MB a minute with a few characters fighting).
+
+## Match recordings
+
+Every PC records every network game it plays (warm-up or match, 30 s or more) to
+`AE/logs/<log>.<game ID>.akn` when it ends: every player's final input of every tick, the state hash of every
+60th tick, the game's settings, and this PC's frames (ticks run, rollbacks, frames that waited for inputs).
+A few KB a minute. The recordings of every PC of one game hold the same inputs. One plays again on any PC
+with the same game files:
+
+```sh
+cd "/path/to/Oni/AE"
+ARKLITE_AUTOSTART=<the map> ARKLITE_PLAYBACK=<file>.akn wine Oni.exe   # as fast as it can, then the game stands
+# ARKLITE_PLAYBACK_REALTIME=1: at the game's speed;  ARKLITE_PLAYBACK_QUIT=1: Oni closes at the end
+```
+
+It runs the game the way a player joining a game in progress catches up, with no network at all, and the log
+ends with `playback: played to the end ... N hashes compared, 0 differed`, or `came apart at tick T` with the
+characters that differ. `tools/akn.py FILE` shows a recording; `tools/akn.py A B` compares two PCs' recordings
+of one game.
 
 ## Network test
 
@@ -605,16 +695,35 @@ seconds after it stops hosting, and logs only counts.
 - **Player 2 doesn't move**: the newest `AE/logs/Arklite_<date>_<time>.log` says `XInput didn't load` when no XInput DLL was
   found, and `player 2 is #...` once a level has a second player. Check `p2_pad` in `[players]`.
 - **Oni crashes**: the end of the newest `AE/logs/Arklite_<date>_<time>.log` has the crash registers and stack. Include
-  it, and the version on its first line, when you report the problem.
+  it, and the version on its first line, when you report the problem. A register that points into one of Oni's small
+  blocks gets a line saying when and from where that block was allocated and freed.
+- **Memory guard**: every free of Oni's small blocks (up to 1016 bytes) is checked first. A block that is already free,
+  or whose end was written over, isn't freed: the log gets `heap: ... can't be freed: ...` with the code freeing it and
+  the block's last allocation and free (the tick, and whether it was a tick, a rollback's re-run, outside a tick or
+  another thread), and a problem report goes out. At each level's end the log counts that level's small blocks
+  (`heap: this level's small blocks: ...`). `ARKLITE_HEAP_CHECK=0` turns the guard off.
+- **Floats in network games**: each session's start logs `net: floats: x87 results <hash> under control word <cw>, MXCSR
+  <m>` and, when the list changed, `net: modules in Oni: ...` (the DLLs loaded from outside the Windows folder, such as
+  overlays). Two PCs of one game must show the same floats line, or the same code gives them different results. A tick
+  that starts with another x87 control word or MXCSR than the session's start is logged once.
 - **Problem reports**: Arklite sends one by itself, once per game for each kind, when a network game goes out of sync
   (the log, `Arklite-desync-*.bin`, `Arklite-desyncticks-*.bin` and `Arklite-rollbackcheck_*.txt`), when a player stops
-  answering or the host is lost (the log), and after a crash (that run's log, at the next start). It goes to the Arklite
+  answering or the host is lost (the log), when the memory guard stops a bad free (the log), and after a crash (that
+  run's log, at the next start). It goes to the Arklite
   helper (`[net] helper`, TCP on the same port), packed (LZ4): a desync's is about 1 MB. Before anything leaves your PC,
-  internet addresses become `[address]`, player names `player N`, the server's name `[server name]`, chat messages are
-  left out, and paths are cut to the game's folder (`<Oni>\`) and Arklite.dll's (`<Arklite>\`): any other folder
-  becomes `[path]\`. The dumps hold only game state. The helper keeps no address and deletes reports after 30 days.
-  Every PC of one game tags its report with the same game ID, so a desync's reports from both sides are read together.
-  The log says `report: sent an anonymous ... report` each time. `[reports] send=0` turns them off.
+  internet addresses become `[address]`, the server's name `[server name]`, and paths are cut to the game's folder
+  (`<Oni>\`) and Arklite.dll's (`<Arklite>\`): any other folder becomes `[path]\`. Players' names and chat stay, so the
+  reports of one game can be found by who played it and what they said. Every report also carries the machine and setup
+  dump (`AE/logs/<log>.profile.txt`, written at a level's first frame, each network game and every 10 minutes): Windows
+  or Wine and their versions, the CPU and memory, every display adapter and its driver, the one OpenGL draws with, the
+  display mode, fullscreen or windowed, DPI, the timer resolution, the MD5 of Oni.exe, Daodan, Arklite and level0, AE's
+  installed packages and their versions, `daodan.ini`, `Arklite.ini` (addresses masked), `persist.dat`, and every module
+  loaded in Oni, with overlays and hooks named (Steam, Discord, RivaTuner, ReShade...). After every network game of 30 s
+  or more (warm-up or match) each PC also sends its recording of it (see "Match recordings"), and `/bug` sends a
+  report of its own. The dumps hold only game state. The helper
+  keeps no address and deletes reports after 30 days. Every PC of one game tags its report with the same game ID, so a
+  desync's reports from both sides are read together.
+  The log says `report: sent a ... report` each time. `[reports] send=0` turns them off.
 
 ## Building from source
 

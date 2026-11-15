@@ -649,6 +649,7 @@ static void player_tick(int s, int tick)
 
 static void respawn_tick(const u32 *p1_input);
 static void score_tick(void);
+static void change_class(int who, u8 *c);
 
 static void ONI_FC set_input(u8 *chr, u32 *input)
 {
@@ -665,6 +666,10 @@ static void ONI_FC set_input(u8 *chr, u32 *input)
 		if (multiplayer_map()) score_tick();
 		respawn_tick(input);
 		items_tick();
+	} else {
+		/* no multiplayer rules (a game alone, a single-player map whose script turned F2 on):
+		 * a choice changes Konoko at once; with F2 off her record says the map's class */
+		change_class(0, GS_PLAYER(ONgGameState));
 	}
 }
 
@@ -734,7 +739,12 @@ u32 players_spawn_seed(void) { return g_spawn_seed; }
 
 /* Only a level load picks a new seed: the game's walk at 0x4f6200 spawns a player in a tick
  * when there's none, and a seed from the clock there would differ on every PC */
-void players_level_begin(void) { g_spawn_seed_due = 1; }
+void players_level_begin(void)
+{
+	g_spawn_seed_due = 1;
+	char_menu_level_begin();   /* the map scripts' F2 settings start over, before main() */
+	mp_rules_level_begin();    /* and ark_characters_alwaystaunt */
+}
 
 static u8 ONI_FC collect_spawn(u8 *obj, u32 unused)
 {
@@ -851,6 +861,7 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 	if (g_spawn_seed_due || g_next_spawn_seed_set) g_spawn_seed = choose_spawn_seed();
 	OBJrEnumerate(OBJcType_CHAR, collect_spawn, 0);
 	mp_rules_level();   /* multiplayer_map() is known now, and no character is made yet */
+	char_menu_level_spawns();   /* F2 on by default on a multiplayer map */
 	g_ntaken = 0;
 	for (int s = 1; s < PL; s++) g_pl[s] = -1;
 	if (multiplayer_map()) {
@@ -966,7 +977,8 @@ static int alive(u8 *c)
 
 /* In a match a living player's new choice waits for the respawn (make_player), apart from their
  * first (see g_settled) */
-static int waits_for_respawn(int who) { return g_limits_on && g_settled[who]; }
+/* (a map script's ark_characterscreen_instant_swap: never; tick state, the same on every PC) */
+static int waits_for_respawn(int who) { return g_limits_on && g_settled[who] && !char_menu_instant(); }
 
 /* A new choice while alive: the class changes in place, as the shapeshifter cheat does it */
 static void change_class(int who, u8 *c)
@@ -1011,6 +1023,9 @@ static int placement_of(int who) { return who < g_nspawn ? who : 0; }
 
 int players_can_join(int who) { return who > 0 && who < PL && multiplayer_map() && who < g_nspawn + g_dedicated; }
 
+static u32 g_came_in_tick[PL];         /* the tick each player came into the game (net.c recordings) */
+static char g_came_in_session[PL][40];  /* in which session */
+
 static void join_player(int who)
 {
 	const float *avoid[PL];
@@ -1041,6 +1056,16 @@ static void join_player(int who)
 	if (index < 0) return;
 	items_player_respawned(CHR_POS(character(index)));
 	log_msg("players: player %d came into the game at spawn point %d (tick %u)", who + 1, point, GS_TICK(ONgGameState));
+	g_came_in_tick[who] = GS_TICK(ONgGameState);
+	str_cpy(g_came_in_session[who], sizeof g_came_in_session[who], net_session_id());
+}
+
+/* net.c's recordings: the tick player who came into this session's game (its input counts from there),
+ * 0xffffffff if not in this session */
+u32 players_came_in_tick(int who)
+{
+	if (who < 0 || who >= PL || !str_ieq_n(g_came_in_session[who], net_session_id(), sizeof g_came_in_session[who])) return 0xffffffffu;
+	return g_came_in_tick[who];
 }
 
 static void leave_player(int who)
@@ -1341,7 +1366,7 @@ void players_note_hit(u8 *victim, u8 *attacker, u32 owner)
 
 int players_can_change(int who)
 {
-	return who >= 0 && who < PL && multiplayer_map() && alive(player_char(who)) && !waits_for_respawn(who);
+	return who >= 0 && who < PL && alive(player_char(who)) && !waits_for_respawn(who);
 }
 
 int players_score(int who) { return who >= 0 && who < PL ? g_score[who] : 0; }
@@ -1465,7 +1490,10 @@ static void respawn_tick(const u32 *p1_input)
 {
 	u8 *gs = ONgGameState, *p1 = GS_PLAYER(gs);
 
-	if (!multiplayer_map()) return;
+	if (!multiplayer_map()) {   /* no respawns: only a map script's F2 changes Konoko, at once */
+		change_class(0, p1);
+		return;
+	}
 	if (g_spect & 1) ;   /* watching: Konoko stays parked (see "Spectating") */
 	else if (p1 && wants_respawn(p1, p1_input)) respawn(p1, 0);
 	else change_class(0, p1);

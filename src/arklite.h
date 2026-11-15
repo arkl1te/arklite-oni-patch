@@ -115,11 +115,17 @@ int  custom_game_folder_path(const char *folder, char *out, u32 size);   /* Cust
 const char *custom_game_level_name(u32 level);   /* the custom level's name (level.ini), or 0 */
 int  custom_game_has_folder(const char *folder);  /* CustomLevels\<folder> holds a level */
 int  custom_game_folder_dir(const char *folder, char *out, u32 size);   /* its folder (ends with '\\'), 1 if it holds a level */
+/* The map a /vote names (folder or level.ini name, whole, else a unique start): 1 found, 0 none,
+ * -1 more than one (name and name2: two of them) */
+int  custom_game_find_map(const char *what, char *folder, u32 fsize, char *name, u32 nsize, char *name2, u32 n2size,
+                          int *spawns);
 
 /* ---- volume.c ----------------------------------------------------------------------------- */
 
 void volume_install(void);
 int  volume_channel_is_music(u8 *channel);   /* channel owned by a Music play (call under the sound lock) */
+u32  volume_music_playing(u32 *ids, u32 max, u32 except);   /* audible Music plays' ids, except that one */
+void volume_music_fade(long db);              /* hundredths of a dB off every Music channel (0: none) */
 void volume_hush(int on);                   /* every channel silent while on (net.c: a joiner's loading popup) */
 /* arklite.c: stop every playing channel as the pause menu does (0x483660 plays them again), the
  * level's music on unless keep_music is 0 */
@@ -214,6 +220,9 @@ void rollback_keep(const void *p, u32 n); /* memory a rewind never puts back (HU
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
 int  lockstep_replay_spawn_seed(u32 *seed);   /* replaying: the recording's spawn seed (1), else 0 */
+void lockstep_fpu_watch(u32 cw);        /* net.c: the session's x87 control word, logged if a tick starts with another (0: off); MXCSR too */
+u32  lockstep_fpu_fingerprint(void);    /* this PC's x87 results under the control word now, hashed (equal on every PC of a session) */
+u32  lockstep_mxcsr(void);              /* SSE's control register (0 without SSE) */
 int lockstep_impulses_mute(int muted);    /* rollback re-runs ticks: only new one-shot sounds play (1), else off (0) */
 /* net.c's recording of a networked game (same format, player 2's record per tick) */
 int  lockstep_net_record_begin(u32 level, const char *path);
@@ -247,7 +256,8 @@ void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, 
 #define NET_MUT_FAST_PLASMA   64  /* the Plasma Rifle fires twice as fast */
 #define NET_MUT_BOMBS         128 /* everyone dies as the Mad Bomber: a blast 3 s later */
 #define NET_MUT_FAST_BALL     256 /* the Super Ball Gun's ball flies twice as fast */
-#define NET_MUTATORS_ALL      511
+#define NET_MUT_JAMMING       512 /* each shot may jam the gun: drops and a reload fix it (mutators.c) */
+#define NET_MUTATORS_ALL      1023
 int  net_mutator(u32 bit);             /* the game has that mutator (never when not networked) */
 u32  net_char_rules(void);             /* NET_CHARS_*: the game's (every one when not networked) */
 int  net_mutator_daodan(void);         /* the game has the Daodan mutator (never when not networked) */
@@ -370,9 +380,31 @@ enum {
 };
 #define NETBAD_LAST NETBAD_KICKED
 const char *net_kick_note(void);   /* joiner: why the server removed this PC, and for how long ("" none) */
+/* Votes (net.c "Votes"): /vote map <name>, /vote kick <player> [reason]; the host runs them. A
+ * vote lasts NET_VOTE_SECONDS; it passes when at least half of the players answered Yes, and its
+ * command follows 3 s later. Only players vote, never spectators. */
+#define NET_VOTE_SECONDS 30
+enum { NET_VOTE_NONE, NET_VOTE_OPEN, NET_VOTE_PASSED, NET_VOTE_FAILED };
+enum { NET_VOTE_MAP = 1, NET_VOTE_KICK };
+typedef struct {
+	int state, kind;           /* NET_VOTE_* (NONE: nothing to show) */
+	int yes, no, voters;       /* voters: the players who may vote now */
+	int ms_left;               /* open: until it ends */
+	int mine;                  /* this PC's player's answer: 0 none, 1 yes, 2 no */
+	int may;                   /* this PC's player may vote */
+	char caller[24];           /* MP_NAME_MAX */
+	char subject[64];          /* the map's name, or the player's */
+	char reason[64];           /* kick: why ("" none) */
+} NetVote;
+int  net_vote(NetVote *v);                 /* 1: a vote to show (open, or its result for a moment) */
+const char *net_vote_call(const char *args);   /* "map <name>" / "kick <player> [reason]": 0 asked, else why not */
+const char *net_vote_cast(int yes);        /* 0: answered, else why not */
+u32  net_player_id(int slot);              /* the player's number (/players): by internet address, from 1; 0 none */
+const char *net_server_map(const char *what);   /* the console's map <name>: changes it now */
 void net_hud(NetHud *h);
 void net_fly_move(float *pos, float *vel, float dt);   /* pos moves by vel * dt, stopped and slid along the level's walls */
 int  net_watching(void);         /* this PC's player watches: the player it shows, -2 free flight; -1 not watching */
+u8  *net_view_character(void);  /* the character this PC's screen shows: its player's, or the watched one */
 u8  *net_swapped_konoko(void);   /* Konoko while the joiner's display runs with player 2 in gs+0xac, else 0 */
 const char *net_problem_text(u32 bit);   /* what one NETBAD_* bit names */
 
@@ -623,6 +655,15 @@ void char_menu_frame(void);    /* every frame, after the update: keys and mouse 
 void char_menu_draw(int width, int height);   /* from the HUD */
 u32  char_menu_record_word(void);             /* this PC's choice, for word 11 of its records */
 void char_menu_tag(u32 count, void *actions); /* writes it into this PC's records of the frame */
+/* The map scripts' settings (BSL ark_characterscreen_*, see "Map scripts" in char_menu.c) */
+void char_menu_level_begin(void);    /* players.c: a level loads, before its spawns and main() */
+void char_menu_level_spawns(void);   /* players.c: its spawns are counted (multiplayer_map() known) */
+int  char_menu_instant(void);        /* tick state: a choice changes a living player at once, even in a match */
+/* Arklite's BSL variables (char_menu.c "Map scripts"): registered when the game registers its own */
+#define BSL_INT  0
+#define BSL_BOOL 3
+void bsl_var_register(const char *name, u32 type, void *address, void (*assigned)(void));   /* name: a static string */
+int  bsl_tick_change_ok(void);       /* a tick-state variable may change now (not the console in a network game) */
 
 /* ---- players.c --------------------------------------------------------------------------- */
 
@@ -677,14 +718,19 @@ int  obit_width(void);                          /* the feed's widest line, for H
 void mp_rules_install(void);   /* multiplayer maps: free for all, damage x1.25, overhealing drains 1.25x faster */
 void mp_rules_level(void);     /* a level's characters are about to be made: Ninjabot's weapon hand, the Daodan mutator */
 void mp_rules_level_end(void); /* a level unloads: the classes the Daodan mutator changed are put back */
+void mp_rules_level_begin(void);  /* a level loads: ark_characters_alwaystaunt starts over */
+void mp_rules_bsl_register(void); /* ark_characters_alwaystaunt (char_menu.c registers Arklite's variables) */
 /* mutators.c: the gameplay mutators' data, set at a level's load and put back at its unload; bombs going off */
 void mutators_level(void);
 void mutators_level_end(void);
 void mutators_tick(void);
+void mutators_install(void);   /* Jamming Guns' calls (they do nothing without the mutator) */
+int  mutators_jammed(const u8 *c, int *drops, int *reloads);   /* c's gun in hand is jammed: drops and reloads still needed */
 /* lockstep.c: the particle calls that pick the effects stream for decorative particles */
 u8 *ONI_FC lockstep_p3_create_particle(u8 *cls, u32 time);
 u8 *ONI_FC lockstep_p3_create_effect(void *spec, void *data);
 u8 ONI_FC lockstep_p3_send_event(u8 *cls, u8 *particle, u32 event, float time);
+void wm_timers_check(void);                         /* live_menu.c: before every WMrUpdate */
 void lockstep_decor_level_log(void);                  /* every tick (lockstep.c), after the game's */
 int  mutators_body_gone(const u8 *c);      /* a player whose bomb went off: not drawn */
 void players_spawn_weapons(int blank);     /* players.c: the spawn placements' weapons blanked (1) or back (0) */
@@ -733,15 +779,44 @@ void spin_particle_level_end(void);   /* from any level unload (particle_table.c
 
 void crash_log_install(void *instance);   /* log faults with registers and stack */
 void crash_log_exit(void);                /* log the stack when the process exits */
+int  modules_changed(char *out, u32 size);   /* the DLLs in Oni outside the Windows folder, by name: 1 if changed since last asked */
+
+/* ---- heap_check.c: Oni's small-block heap checked at every free, with a journal ------------- */
+void heap_check_install(void);
+void *__cdecl heap_sbh_alloc(u32 n);                        /* rollback.c's allocation hook goes through these */
+int __cdecl heap_sbh_resize(u8 *header, void *block, u32 n);
+void heap_check_rewound(u32 from, u32 to);                  /* rollback.c: the game put back from tick from to to */
+void heap_check_fault(const char *reg, u32 v);              /* crash_log.c: the journal on the block v points into */
+void heap_check_level_end(void);                            /* particle_table.c: logs the level's counts */
+int  net_rerun(void);                  /* net.c: ticks run now are a rollback's re-run (1) or a rollback check's (2), else 0 */
 
 
-/* ---- report.c: anonymous problem reports --------------------------------------------------- */
-enum { REPORT_DESYNC = 1, REPORT_CRASH = 2, REPORT_DROP = 3 };
+/* ---- report.c: problem reports ------------------------------------------------------------ */
+enum { REPORT_DESYNC = 1, REPORT_CRASH = 2, REPORT_DROP = 3, REPORT_HEAP = 4, REPORT_MATCH = 5, REPORT_BUG = 6 };
+int  lagometer_on(void);               /* lagometer.c: the Lag-o-meter ([hud] lagometer, /lagometer) */
+void lagometer_toggle(void);
+void lagometer_frame(u32 ran, u32 guessed, u32 depth, int waited);   /* net.c, every rolling frame */
+void lagometer_packet(int player, int late);                        /* net.c, an input stream came in */
+void lagometer_draw(int width, int height);                         /* mp_hud.c */
+void net_ping_text(char *out, u32 size);   /* net.c: each other player's ping, for the Lag-o-meter */
+const char *bug_report(const char *text);   /* bug.c: /bug <text>; returns what the chat says */
+void bug_frame(void);                     /* lockstep.c, every level frame */
+void lagometer_note(char *out, u32 size); /* lagometer.c: its last samples as text (bug.c) */
+int  net_rec_snapshot(const char *path);  /* net.c: the session's recording so far, 0 if none */
+void screenshot_request_to(const char *stem);   /* screenshot.c: the next frame as stem.png */
+int  screenshot_written(char *out, u32 size);   /* that shot is on disk: 1 once, its path */
+void report_bug(const char *session, int slot, u32 tick, const char *note, const char *shot, const char *rec);
+int  report_on(void);                     /* report.c: reports are sent */
+void sysinfo_frame(void);              /* lockstep.c, every level frame: the machine and setup dump when due */
+void sysinfo_write(const char *why);   /* the dump now (main thread, GL current) */
+const char *sysinfo_path(void);        /* this run's dump: <log>.profile.txt */
+void sysinfo_path_for_log(const char *log, char *out, u32 size);
 void report_install(void *instance);   /* [reports] send; sends a crash's log left by the last run */
 void report_net(u32 reason, const char *session, int slot, u32 tick, const char *dump1, const char *dump2, const char *extra);
 void report_crash(void);               /* the fault handler: this log goes at the next start */
 const char *net_session_id(void);      /* net.c: the session's ID, "none" outside one */
-int  net_local_slot(void);             /* net.c: this PC's player slot, -1 off the network */
+int  net_local_slot(void);
+u32  players_came_in_tick(int who);   /* players.c: the tick who came into this session's game, 0xffffffff: not in it */             /* net.c: this PC's player slot, -1 off the network */
 
 /* ---- flare_depth.c: lens flare depth tests ---------------------------------------------------- */
 void flare_depth_install(void);
@@ -750,6 +825,34 @@ int  screenshot_hooked(void);          /* screenshot.c: both SwapBuffers calls a
 
 /* ---- invis.c: the phase cloak in network games ----------------------------------------------- */
 void motion_blur_install(void);        /* motion_blur.c: afterimages without depth writes */
-void invis_install(void);              /* the cloaked player sees themselves at 50% */
+void invis_install(void);
+/* The cloaked player's own look (invis.c): the knobs the O key's menu (fx_menu.c) changes */
+enum { FX_OPACITY, FX_WATER_PERIOD, FX_WATER_RADIUS, FX_WATER_VERTEX, FX_WATER_VCELLS, FX_WATER_TEXTURE, FX_WATER_TCELLS,
+       FX_STENCIL, FX_STENCIL_LEVELS, FX_STENCIL_SOFT, FX_OUTLINE_PX, FX_OUTLINE_R, FX_OUTLINE_G, FX_OUTLINE_B,
+       FX_OUTLINE_ALPHA, FX_FRINGE_PX, FX_FRINGE_ANGLE, FX_ZOOM, FX_ZOOM_PULSE, FX_COUNT };
+/* The filters, applied to the body in the order the menu sets (invis.c "The filter chain") */
+enum { FXF_OPACITY, FXF_WATER, FXF_TONES, FXF_OUTLINE, FXF_FRINGE, FXF_ZOOM, FXF_COUNT };
+typedef struct {
+	const char *key, *label;   /* key: Arklite.ini [cloak_fx] */
+	int filter;                /* FXF_* */
+	float def, min, max;
+	int decimals;
+	float value;
+} InvisFx;
+const char *invis_fx_filter_name(int filter);
+int  invis_fx_order(int k);             /* the filter at place k of the chain (0: first) */
+void invis_fx_move(int k, int dir);     /* the filter at place k moves earlier (-1) or later (1) */
+int  invis_fx_count(void);
+InvisFx *invis_fx(int i);
+void invis_fx_reset(void);              /* every knob and the order back to the defaults */
+void invis_fx_save(void);               /* into Arklite.ini [cloak_fx] and the log */
+void invis_fx_preview(int on);          /* this PC's player shows the look, cloaked or not (drawing only) */
+int  invis_cloak_me(void);              /* off the network: this PC's player cloaked for 30 s (0: can't) */
+int  float_parse(const char *s, float *out);           /* 1 if s is a number */
+void float_text(char *out, u32 size, float v, int decimals);
+/* fx_menu.c: O opens the cloak effect's menu on the right of the screen */
+void fx_menu_frame(void);               /* every frame after the update (live_menu.c) */
+void fx_menu_draw(int width, int height);   /* inside mp_hud.c's text setup */
+int  fx_menu_open(void);              /* the cloaked player sees themselves at 50% */
 void sprite_aspect_install(void);      /* sprite_aspect.c: screen-facing sprites keep their shape on wide screens */
 int  invis_hidden(u8 *c);              /* cloaked (or still fading back in): no name tag over it */

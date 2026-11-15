@@ -41,7 +41,10 @@
  *     view, 2.5 degrees a notch, 0.5 with the walk key or Ctrl).
  * Field of view: the renderer's camera (*0x63112c: +0x38 vertical field of view in radians, +0x3c
  * aspect, +0x40 near, +0x44 far), set with 0x41b3b0 as the gs_fov_set command does, but without
- * touching that command's global (0x556010), and put back on the way out.
+ * touching that command's global (0x556010), and put back on the way out. Past Oni's 45 degrees
+ * the near plane (2, really cutting at depth ~4) shrinks with the field of view's half-height,
+ * down to 0.25, so wide shots close to walls aren't cut open; fog start/end (*0x560600 +0x5d8,
+ * projected z) are converted to keep their distances, and both are put back on leaving.
  *
  * What the picture shows: the HUD (gs_show_ui, 0x5533e0), the crosshair (0x4f1fa0, called at
  * 0x4fbb0a), the laser sight (0x4e1900, called at 0x4e1836), the subtitles (hud_scale.c's call of
@@ -108,6 +111,8 @@ __declspec(dllimport) int   WINAPI QueryPerformanceFrequency(unsigned long long 
 #define M3_NEAR(m)              (*(float *)((m) + 0x40))
 #define M3_FAR(m)               (*(float *)((m) + 0x44))
 #define M3rCamera_SetStaticData ((void (ONI_FC *)(u8 *, u32, float, float, float, float))0x41b3b0)
+#define GLgEngine               (*(u8 **)0x560600)
+#define GL_FOG(g)               ((float *)((g) + 0x5d8))    /* start, end: projected z (-1..1) */
 
 #define SSgPaused               (*(u8 *)0x6200a0)
 #define SSrSetPaused            ((void (ONI_FC *)(u32))0x514e60)
@@ -149,6 +154,8 @@ __declspec(dllimport) int   WINAPI QueryPerformanceFrequency(unsigned long long 
 #define FOV_MIN         5         /* degrees, vertical */
 #define FOV_MAX         120
 #define FOV_NOTCH       2.5f
+#define FOV_STOCK       45.0f     /* degrees: Oni's own (Oni_Motoko.c), the one its near plane suits */
+#define NEAR_MIN        0.25f     /* the near plane never comes closer (depth precision) */
 #define DIST_MIN        4.0f
 #define DIST_MAX        2000.0f
 #define SPEED_MIN       10        /* hundredths */
@@ -193,6 +200,7 @@ static void settings_save(void)
 static float fsin(float x) { float r; __asm__("fsin" : "=t"(r) : "0"(x)); return r; }
 static float fcos(float x) { float r; __asm__("fcos" : "=t"(r) : "0"(x)); return r; }
 static float fsqrt(float x) { float r; __asm__("fsqrt" : "=t"(r) : "0"(x)); return r; }
+static float ftan(float x) { float r; __asm__("fptan\n\tfstp %%st(0)" : "=t"(r) : "0"(x)); return r; }
 static float fatan2(float y, float x) { float r; __asm__("fpatan" : "=t"(r) : "0"(x), "u"(y) : "st(1)"); return r; }
 static float dot3(const float *a, const float *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -204,6 +212,9 @@ static u32 g_level, g_startTick;
 static u8 *g_cam;                   /* Oni's camera (gs+0x80) when photo mode began */
 static u8 g_savedCam[CAM_SIZE];
 static float g_savedFov;            /* radians */
+static float g_savedNear;
+static float g_fogBase[2], g_fogSet[2];   /* the game's fog start/end, and what photo mode wrote */
+static int g_fogOwned;
 static u8 g_savedShowUi, g_savedPaused;
 static int g_soundPaused;
 
@@ -319,10 +330,56 @@ static void look_at(const float *from, const float *to)
 	g_pitch = clampf(fatan2(d[1], fsqrt(d[0] * d[0] + d[2] * d[2])), -1.55f, 1.55f);
 }
 
-static void set_fov(float rad)
+static void set_lens(float rad, float near)
 {
 	u8 *m = M3gCamera;
-	if (m && M3_FOVY(m) != rad) M3rCamera_SetStaticData(m, 0, rad, M3_ASPECT(m), M3_NEAR(m), M3_FAR(m));
+	if (m && (M3_FOVY(m) != rad || M3_NEAR(m) != near))
+		M3rCamera_SetStaticData(m, 0, rad, M3_ASPECT(m), near, M3_FAR(m));
+}
+
+/* The near plane for a field of view: the game's at Oni's 45 degrees or less, then shrinking as
+ * the near plane's half-height (tan of half the field of view) grows, so a wide view doesn't cut
+ * walls and characters it gets close to; never under NEAR_MIN. */
+static float near_for(float fov)
+{
+	float t = ftan(fov * 0.5f), t0 = ftan(FOV_STOCK * DEG * 0.5f), n = g_savedNear;
+	if (t > t0) n = g_savedNear * t0 / t;
+	return n < NEAR_MIN && g_savedNear > NEAR_MIN ? NEAR_MIN : n;
+}
+
+/* Fog goes by projected z (d = 2fn / ((f + n) - z (f - n))), which moves with the near plane:
+ * the same z under a smaller near is nearer. This is the z that keeps the distance. */
+static float fog_move(float z, float n0, float n1, float f)
+{
+	float den = (f + n0) - z * (f - n0), d;
+	if (n0 == n1 || z >= 1.0f || den <= 0.0f || f <= n1) return z;
+	d = 2.0f * f * n0 / den;
+	return ((f + n1) - 2.0f * f * n1 / d) / (f - n1);
+}
+
+/* Every frame: fog values the game changed since the last write become the base */
+static void fog_follow(float near)
+{
+	u8 *gl = GLgEngine, *m = M3gCamera;
+	if (!gl || !m) return;
+	float *fog = GL_FOG(gl);
+	for (int k = 0; k < 2; k++) {
+		if (!g_fogOwned || fog[k] != g_fogSet[k]) g_fogBase[k] = fog[k];
+		g_fogSet[k] = fog_move(g_fogBase[k], g_savedNear, near, M3_FAR(m));
+		fog[k] = g_fogSet[k];
+	}
+	g_fogOwned = 1;
+}
+
+/* Back to the game's values, unless something (a level load) has set its own since */
+static void fog_restore(void)
+{
+	u8 *gl = GLgEngine;
+	if (g_fogOwned && gl) {
+		float *fog = GL_FOG(gl);
+		for (int k = 0; k < 2; k++) if (fog[k] == g_fogSet[k]) fog[k] = g_fogBase[k];
+	}
+	g_fogOwned = 0;
 }
 
 /* The camera's position, view and up (tilted), handed to the renderer with the field of view */
@@ -344,7 +401,9 @@ static void apply_view(void)
 	}
 	CAM_ALPHA(cam) = 1.0f;
 	ONrCamera_Activate(cam);
-	set_fov(g_fov);
+	float near = near_for(g_fov);
+	set_lens(g_fov, near);
+	fog_follow(near);
 }
 
 /* ---- Sound and HUD -------------------------------------------------------------------------- */
@@ -436,6 +495,8 @@ static void enter(void)
 	g_cam = cam;
 	memcpy(g_savedCam, cam, CAM_SIZE);
 	g_savedFov = M3_FOVY(m);
+	g_savedNear = M3_NEAR(m) > 0.0f ? M3_NEAR(m) : 2.0f;
+	g_fogOwned = 0;
 	g_savedShowUi = ONgShowUI;
 	g_soundPaused = 0;
 	g_level = ONrLevel_GetCurrent();
@@ -465,7 +526,8 @@ static void leave(int same_level)
 		memcpy(g_cam, g_savedCam, CAM_SIZE);
 		ONrCamera_Activate(g_cam);
 	}
-	set_fov(g_savedFov);
+	set_lens(g_savedFov, g_savedNear);
+	fog_restore();
 	ONgShowUI = g_savedShowUi;
 	if (same_level) sound_pause(0);
 	else if (g_soundPaused && !g_savedPaused) SSrSetPaused(0), g_soundPaused = 0;

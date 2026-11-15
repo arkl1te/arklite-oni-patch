@@ -261,6 +261,17 @@ static int g_count, g_resolved, g_any_vars, g_auto;
 static int g_choice = -1;       /* roster index chosen, -1: the map's class */
 static int g_choice_var;        /* its variation */
 static char g_choice_name[64];  /* its class, to find it again after level0 changes */
+/* The map scripts' settings (see "Map scripts"): the BSL variables point at these */
+static u8 g_bsl_enabled;                 /* ark_characterscreen_enabled */
+static u8 g_bsl_instant TICK_STATE;      /* ark_characterscreen_instant_swap */
+static u8 g_instant_kept TICK_STATE;     /* its last accepted value (a console change is put back) */
+static int g_bsl_flags = -1;             /* ark_characterscreen_flags: a bit per g_families entry, -1 every one */
+static int g_flags_applied = -1;         /* the roster was resolved with these */
+static u8 g_level_loading;               /* from the level's start to its first update: main() runs */
+static u8 g_enabled_due;                 /* the level's spawns aren't counted yet */
+static int screen_on(void) { return g_bsl_enabled; }
+/* Host wins: in a network game the Host dialog's checkboxes decide alone */
+static int flags_now(void) { return net_active() ? -1 : g_bsl_flags; }
 static int g_name_x, g_name_y = -1, g_name_w, g_name_h;   /* the name's label and field, from the last draw */
 static u8 g_mute[256];          /* keys that typing used: no press or release until they're up */
 static int g_was_editing;
@@ -652,6 +663,18 @@ static void roster_resolve(void)
 			Entry *e = &g_roster[i];
 			if (entry_resolve(e)) g_roster[n++] = *e;
 		}
+		g_count = n;
+	}
+	/* the map script's ark_characterscreen_flags: bit f keeps g_families[f]; a class in no
+	 * family (an unknown mod's) has no bit, so only "every one" (-1) keeps it */
+	g_flags_applied = flags_now();
+	if (g_flags_applied != -1) {
+		n = 0;
+		for (int i = 0; i < g_count; i++) {
+			int f = family_of(g_roster[i].cls);
+			if (f >= 0 && f < 32 && ((u32)g_flags_applied >> f & 1)) g_roster[n++] = g_roster[i];
+		}
+		log_msg("char menu: the map's ark_characterscreen_flags %d keep %d of %d characters", g_flags_applied, n, g_count);
 		g_count = n;
 	}
 	for (int i = 0; i < g_count; i++)
@@ -1118,22 +1141,35 @@ static u8 *preview(int i)
 
 int char_menu_open(void) { return g_open; }
 
+/* With the character screen off (a map script's ark_characterscreen_enabled = false, or no
+ * multiplayer map) the records carry the map's class: the player is what the map makes them,
+ * even with a choice kept from another level */
+static int choice_kept(void)
+{
+	int f, flags = flags_now();
+	if (g_choice < 0 || g_choice >= g_count || !screen_on()) return 0;
+	if (flags == -1) return 1;
+	/* a choice from before the map's flags (the roster is resolved again only when F2 opens) */
+	f = family_of(g_roster[g_choice].cls);
+	return f >= 0 && f < 32 && ((u32)flags >> f & 1);
+}
+
 u32 char_menu_record_word(void)
 {
-	return PLAYERS_CHOICE_TAG | (g_choice >= 0 ? g_roster[g_choice].vnumber[g_choice_var] + 1 : 0);
+	return PLAYERS_CHOICE_TAG | (choice_kept() ? g_roster[g_choice].vnumber[g_choice_var] + 1 : 0);
 }
 
 void char_menu_tag(u32 count, void *actions)
 {
 	u32 *rec = actions, word = char_menu_record_word();
+	g_level_loading = 0;   /* the level's first update: main() has run */
 	if (!rec) return;
 	for (u32 i = 0; i < (count & 0xffff); i++) rec[i * 12 + 11] = word;
 }
 
 static int allowed(void)
 {
-	return ONgGameState && ONrLevel_GetCurrent() && multiplayer_active() && multiplayer_map() &&
-	       !live_menu_open() && !chat_blocking();
+	return ONgGameState && ONrLevel_GetCurrent() && screen_on() && !live_menu_open() && !chat_blocking() && !fx_menu_open();
 }
 
 static void close_menu(void)
@@ -1647,7 +1683,7 @@ void char_menu_rules_changed(void)
 /* Resolved with the rules in force (a game's end puts every character back) */
 static void roster_ready(void)
 {
-	if (g_resolved && g_rules_applied != net_char_rules()) char_menu_level0_changed();
+	if (g_resolved && (g_rules_applied != net_char_rules() || g_flags_applied != flags_now())) char_menu_level0_changed();
 	if (!g_resolved) roster_resolve();
 }
 
@@ -1662,9 +1698,111 @@ void char_menu_level0_changed(void)
 	pictures_forget();
 }
 
+/* ---- Map scripts ---------------------------------------------------------------------------- *
+ * Three BSL variables a level's scripts set (in main(), or any function), registered as the
+ * game registers its own engine variables (SLrScript_Database_Var_Engine_Add, 0x4794a0: ECX the
+ * name, EDX the description (unused), [error context: file, function, line], [1 read-write],
+ * [type: 0 int, 3 bool], [address], [called after each assignment, or 0]; ret 0x14). The symbol
+ * keeps the name and file pointers, so they're static strings. Registered right after the game's
+ * own command table (ONrGameState_Initialize 0x4fbf10, its call at 0x4fc402 to 0x4777d0, ECX the
+ * table), when the script database exists; Arklite itself loads before it does.
+ *
+ *   ark_characterscreen_enabled (bool): F2 works on this map. At each level load it starts as
+ *     "a multiplayer map" (two or more Player-flagged placements, players.c), then main() runs:
+ *     a single-player map turns it on with = true, a multiplayer map off with = false. Off, the
+ *     player is the map's class (char_menu_record_word).
+ *   ark_characterscreen_instant_swap (bool, false at each level load): in a network match a new
+ *     choice changes a living player at once instead of at the next respawn (players.c
+ *     waits_for_respawn). The warm-up and a game alone change at once anyway. The tick reads it,
+ *     so every PC must have the same: it's tick state (rollback puts it back with the tick), and
+ *     in a network game a change from outside the tick and the level load (the console, on one
+ *     PC) is put back.
+ *   ark_characterscreen_flags (int, -1 at each level load): which characters F2 offers, bit f
+ *     for g_families[f], the order F2 shows them when every one is loaded (1 Konoko, 2 Griffin,
+ *     4 Muro, 8 Barabas...; a missing character doesn't move the others' bits). 0 offers none
+ *     (F2 doesn't open), -1 every one, also the mods' characters Arklite doesn't know (they have
+ *     no bit). Only in a game alone: in a network game the host's Host dialog decides. */
+typedef struct { const char *file, *func; u16 line; } SLtErrorContext;
+#define SLrScript_Database_Var_Engine_Add ((u16 (ONI_FC *)(const char *, const char *, SLtErrorContext *, \
+                                          u32, u32, void *, void (*)(void)))0x4794a0)
+#define SLrScript_Command_Register_Table  ((u16 (ONI_FC *)(void *))0x4777d0)
+#define ONcGameState_CommandTableCall     0x4fc402
+#define SLcReadWrite                      1
+
+/* A tick-state variable may change now: not in a network game from outside the tick and the
+ * level load (the console, on one PC; the other PCs would play on with the old value) */
+int bsl_tick_change_ok(void)
+{
+	return !net_active() || lockstep_in_tick() || g_level_loading;
+}
+
+void bsl_var_register(const char *name, u32 type, void *address, void (*assigned)(void))
+{
+	static SLtErrorContext where = { "(Arklite)", "(Arklite)", 0 };
+	SLrScript_Database_Var_Engine_Add(name, "", &where, SLcReadWrite, type, address, assigned);
+}
+
+static void instant_assigned(void)
+{
+	if (g_bsl_instant == g_instant_kept) return;
+	if (!bsl_tick_change_ok()) {
+		log_msg("char menu: ark_characterscreen_instant_swap = %d ignored: in a network game only the map's scripts set it",
+		        g_bsl_instant);
+		g_bsl_instant = g_instant_kept;
+		return;
+	}
+	g_bsl_instant = g_bsl_instant != 0;
+	g_instant_kept = g_bsl_instant;
+	log_msg("char menu: ark_characterscreen_instant_swap = %d", g_bsl_instant);
+}
+
+static void enabled_assigned(void)
+{
+	log_msg("char menu: ark_characterscreen_enabled = %d", g_bsl_enabled != 0);
+}
+
+static void flags_assigned(void)
+{
+	log_msg("char menu: ark_characterscreen_flags = %d%s", g_bsl_flags,
+	        net_active() ? " (a network game: the host's Host dialog decides)" : "");
+}
+
+static u16 ONI_FC command_table_hook(void *table)
+{
+	u16 r = SLrScript_Command_Register_Table(table);
+	bsl_var_register("ark_characterscreen_enabled", BSL_BOOL, &g_bsl_enabled, enabled_assigned);
+	bsl_var_register("ark_characterscreen_instant_swap", BSL_BOOL, &g_bsl_instant, instant_assigned);
+	bsl_var_register("ark_characterscreen_flags", BSL_INT, &g_bsl_flags, flags_assigned);
+	log_msg("char menu: map script variables ark_characterscreen_enabled, _instant_swap, _flags registered");
+	mp_rules_bsl_register();
+	return r;
+}
+
+void char_menu_level_begin(void)
+{
+	g_level_loading = 1;
+	g_enabled_due = 1;
+	g_bsl_enabled = 0;
+	g_bsl_instant = g_instant_kept = 0;
+	g_bsl_flags = -1;
+}
+
+void char_menu_level_spawns(void)
+{
+	if (!g_enabled_due) return;   /* a later walk of the same level (main() may have set it) */
+	g_enabled_due = 0;
+	g_bsl_enabled = multiplayer_map() != 0;
+}
+
+int char_menu_instant(void) { return g_bsl_instant; }
+
 void char_menu_install(void)
 {
 	roster_load();
-	log_msg("char menu: F2 changes the character in multiplayer games (%s)",
-	        g_auto ? "every loaded character" : "the ini's list");
+	if (patch_call(ONcGameState_CommandTableCall, (u32)SLrScript_Command_Register_Table, (u32)command_table_hook))
+		log_msg("char menu: F2 changes the character on multiplayer maps, and where a map's script says (%s)",
+		        g_auto ? "every loaded character" : "the ini's list");
+	else
+		log_msg("char menu: 0x%x changed, no map script variables; F2 on multiplayer maps (%s)",
+		        ONcGameState_CommandTableCall, g_auto ? "every loaded character" : "the ini's list");
 }

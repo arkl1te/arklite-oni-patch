@@ -321,11 +321,12 @@ static void main_loop_sound(void)
 {
 	/* before chat_frame and char_menu_frame: the Esc that closes them isn't a pause (the chat
 	 * blocks until it's up again, the F2 menu closes when it's let go) */
-	if (esc_pressed() && net_active() && live_wanted() && !g_open && !chat_blocking() && !char_menu_open())
+	if (esc_pressed() && net_active() && live_wanted() && !g_open && !chat_blocking() && !char_menu_open() && !fx_menu_open())
 		g_pending = 1;   /* the action records may not be coming: the game stands waiting */
 	SSrUpdate();
 	if (multiplayer_active()) *gs_field(GS_PAUSED) = 0;
 	char_menu_frame();
+	fx_menu_frame();
 	chat_frame();
 	text_frame();
 	vertex_light_frame();
@@ -476,13 +477,55 @@ static void console_ui_leave(void)
 
 static void ONI_FC utility_input(void *action)
 {
-	if (!g_open && !char_menu_open() && !chat_blocking()) g_utility_input(action);
+	if (!g_open && !char_menu_open() && !fx_menu_open() && !chat_blocking()) g_utility_input(action);
 }
 
 /* The help screen's volume down: kept in multiplayer games */
 static float __stdcall help_volume_down(float volume)
 {
 	return multiplayer_active() ? SSgMasterVolumeNow : SSrSetMasterVolume(volume);
+}
+
+/* ---- Timers of windows that are gone ------------------------------------------------------ *
+ * WMrUpdate (0x477070, the UI's frame: every dialog's modal loop at 0x468ad4, the main loop at
+ * 0x4d4688, the pause menu's 0x4d2dff and 0x4d2ee1) first runs the window timers: the array at
+ * *0x5e9768 (UUtMemory_Array, 16-byte entries {window, id, interval, next time}), and for each
+ * due one reads the window's number (+0x24) to check the window table (0x5e99b0) before sending
+ * it message 0x1b. A timer whose window is gone holds freed memory there: v0.5.0, 2026-11-14, a
+ * Windows joiner faulted at 0x4770c3 reading +0x24 of 26d01e40 about 8 s after coming into a
+ * match in progress (the session's one rollback right as it came in; not reproduced in 2400
+ * rollbacks with 18 pause menus under Wine, cause not shown). Before each WMrUpdate, a timer whose
+ * window isn't in the window table is taken out (UUrMemory_Array_DeleteElement 0x425570), the
+ * window's address compared, never read; logged with what's known, so a report says when. */
+#define WMgTimers               (*(u32 **)0x5e9768)
+#define WMgWindowTable          ((const u32 *)0x5e99b0)    /* {in use (bit 0), window} per number */
+#define WMcMaxWindows           256
+#define UUrMemory_Array_DeleteElement ((void (ONI_FC *)(void *, u32))0x425570)
+#define WMrUpdate_              0x477070
+static const u32 g_wm_update_calls[] = { 0x4d4688, 0x4d2dff, 0x4d2ee1 };   /* (0x468ad4: menu_wheel.c's modal_update) */
+
+void wm_timers_check(void)
+{
+	static u32 logs;
+	u32 *t = WMgTimers;
+	if (!t || t[0] != 16 || t[1] > t[3] || !t[4]) return;
+	for (u32 i = t[1]; i-- > 0;) {
+		const u32 *ent = (const u32 *)(t[4] + i * 16);
+		u32 w = ent[0], live = 0;
+		if (!w) continue;
+		for (u32 k = 0; k < WMcMaxWindows && !live; k++) live = (WMgWindowTable[k * 2] & 1) && WMgWindowTable[k * 2 + 1] == w;
+		if (live) continue;
+		if (logs++ < 8)
+			log_msg("live menu: a window timer (id %u, every %u ms) belongs to no window (%08x is gone)%s: taken out", ent[1], ent[2], w,
+			        net_active() ? (lockstep_in_tick() ? " in a tick" : " in a network game") : "");
+		UUrMemory_Array_DeleteElement(t, i);
+	}
+}
+
+static void ONI_FC wm_update_checked(void)
+{
+	wm_timers_check();
+	((void (ONI_FC *)(void))WMrUpdate_)();
 }
 
 void live_menu_install(void)
@@ -528,5 +571,11 @@ void live_menu_install(void)
 	rollback_keep((void *)0x52ecf4, 4);   /* what game input on/off sets beside it */
 	if (!patch_call(ONcHelp_VolumeDownCall, (u32)SSrSetMasterVolume, (u32)help_volume_down))
 		log_msg("live menu: help screen code changed, it turns the sound down in multiplayer too");
+	{
+		u32 i, n = sizeof g_wm_update_calls / sizeof *g_wm_update_calls;
+		for (i = 0; i < n && call_target(g_wm_update_calls[i]) == WMrUpdate_; i++) {}
+		if (i < n) log_msg("live menu: UI update call 0x%x changed: timers of gone windows aren't checked", g_wm_update_calls[i]);
+		else for (i = 0; i < n; i++) patch_call(g_wm_update_calls[i], WMrUpdate_, (u32)wm_update_checked);
+	}
 	log_msg("live menu: in multiplayer games the game keeps running behind the pause menu");
 }

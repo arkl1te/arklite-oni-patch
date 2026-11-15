@@ -30,7 +30,12 @@
  * player of a network game; players who left in blue with "(left)" after the name, no ping and no Mute box (their
  * score stays on the board); under them, when anyone watches
  * (/spectate), a Spectator list with Ping and Chat (no score); then the result once the match is
- * over. This PC's player in white, the others orange. */
+ * over. This PC's player in white, the others orange.
+ *
+ * A vote (net.c "Votes"): while one is on, or its result for a moment, the stock sub area (111,
+ * with its outline 120; hidden on the Scoreboard otherwise) shows it in two lines, and Yes / No
+ * buttons (copies of the stock Previous, 130x40) stand where Previous and Next are on the stock
+ * pages, while this PC's player may vote. */
 #include "arklite.h"
 
 void *memset(void *, int, unsigned);
@@ -53,7 +58,8 @@ void *memcpy(void *, const void *, unsigned);
 #define WMcMessage_Paint        0x2b
 #define WMcMessage_OwnerDraw    0x36
 enum { ID_BOARD = 100, ID_OBJECTIVE, ID_ITEMS, ID_WEAPONS, ID_DIARY, ID_HELP, ID_MAIN_PREV, ID_MAIN_NEXT,
-       ID_MAIN_AREA = 110, ID_SUB_AREA, ID_SUB_PREV, ID_SUB_NEXT, ID_SUB_OUTLINE = 120, ID_MUTE = 200 };
+       ID_MAIN_AREA = 110, ID_SUB_AREA, ID_SUB_PREV, ID_SUB_NEXT, ID_SUB_OUTLINE = 120, ID_VOTE_YES = 130, ID_VOTE_NO,
+       ID_MUTE = 200 };
 #define TAB_STEP        60
 #define AREA_X          175        /* the main area, in the dialog */
 #define AREA_Y          30
@@ -71,6 +77,8 @@ enum { ID_BOARD = 100, ID_OBJECTIVE, ID_ITEMS, ID_WEAPONS, ID_DIARY, ID_HELP, ID
 static WMtDialogProc g_stock;
 static int g_board;                /* the Scoreboard tab is up */
 static WMtWindow *g_mute[PLAYERS_MAX];
+static WMtWindow *g_vote_yes, *g_vote_no;
+static void tab_shade(WMtWindow *w, u32 shade);
 
 static int board_wanted(void)
 {
@@ -269,6 +277,47 @@ static void draw_board(void)
 	}
 }
 
+/* The vote in the sub area (310x60, from its top left) */
+static void draw_vote(void)
+{
+	NetVote v;
+	char what[160], line[224];
+
+	if (!net_vote(&v)) return;
+	if (v.kind == NET_VOTE_MAP) fmt(what, "change the map to %s", v.subject);
+	else if (v.reason[0]) fmt(what, "kick %s (%s)", v.subject, v.reason);
+	else fmt(what, "kick %s", v.subject);
+	if (v.state == NET_VOTE_OPEN) fmt(line, "Vote: %s", what);
+	else fmt(line, v.state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
+	text_at(line, 0, 8, UI_LEFT, v.state == NET_VOTE_OPEN ? WHITE : v.state == NET_VOTE_PASSED ? 0xff40ff40u : 0xffff4040u, AREA_W);
+	if (v.state == NET_VOTE_OPEN)
+		fmt(line, "Yes %d   No %d   of %d   %d s%s", v.yes, v.no, v.voters, (v.ms_left + 999) / 1000,
+		    !v.may ? "   (spectators don't vote)" : v.mine == 1 ? "   You: Yes" : v.mine == 2 ? "   You: No" : "");
+	else
+		fmt(line, "Yes %d   No %d   of %d player%s", v.yes, v.no, v.voters, v.voters == 1 ? "" : "s");
+	text_at(line, 0, 32, UI_LEFT, UI_ORANGE, AREA_W);
+}
+
+/* The vote's parts shown or not, every frame (paint) */
+static void vote_parts(WMtWindow *dialog)
+{
+	NetVote v;
+	int show = g_board && net_vote(&v), buttons = show && v.state == NET_VOTE_OPEN && v.may;
+	WMtWindow *w;
+
+	if (g_board) {   /* (on the stock pages the stock proc has the sub area) */
+		static const u32 ids[] = { ID_SUB_AREA, ID_SUB_OUTLINE };
+		for (u32 i = 0; i < 2; i++)
+			if ((w = WMrDialog_GetItemByID(dialog, ids[i])) && (WIN_VISIBLE(w) != 0) != show) WMrWindow_SetVisible(w, show);
+	}
+	if (g_vote_yes && (WIN_VISIBLE(g_vote_yes) != 0) != buttons) WMrWindow_SetVisible(g_vote_yes, buttons);
+	if (g_vote_no && (WIN_VISIBLE(g_vote_no) != 0) != buttons) WMrWindow_SetVisible(g_vote_no, buttons);
+	if (buttons) {   /* this PC's answer in white */
+		tab_shade(g_vote_yes, v.mine == 1 || WMrButton_IsHighlighted(g_vote_yes) ? WHITE : UI_ORANGE);
+		tab_shade(g_vote_no, v.mine == 2 || WMrButton_IsHighlighted(g_vote_no) ? WHITE : UI_ORANGE);
+	}
+}
+
 static void draw_goal(void)
 {
 	NetHud h;
@@ -337,6 +386,12 @@ static void board_init(WMtWindow *dialog)
 	/* after Objective, which comes before the frames in the child list (a window after a frame is
 	 * drawn under its dark fill) */
 	ui_add(dialog, objective, objective, 0, ~0u, "Scoreboard", ID_BOARD, 25, 15, 130, 40);
+	if ((w = WMrDialog_GetItemByID(dialog, ID_MAIN_PREV))) {   /* where Previous and Next are, the same size */
+		g_vote_yes = ui_add(dialog, objective, w, 0, ~0u, "Yes", ID_VOTE_YES, 165, 420, 130, 40);
+		g_vote_no = ui_add(dialog, objective, w, 0, ~0u, "No", ID_VOTE_NO, 365, 420, 130, 40);
+		if (g_vote_yes) WMrWindow_SetVisible(g_vote_yes, 0);
+		if (g_vote_no) WMrWindow_SetVisible(g_vote_no, 0);
+	}
 	for (int who = 0; who < PLAYERS_MAX; who++) {
 		g_mute[who] = ui_add(dialog, objective, objective, WMcClass_CheckBox, 0x10000, "Mute", ID_MUTE + who,
 		                     AREA_X + COL_MUTE, AREA_Y + ROWS_Y, MUTE_W, 20);
@@ -359,6 +414,7 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	if (msg == WMcMessage_InitDialog) {
 		g_board = 0;
 		memset(g_mute, 0, sizeof g_mute);
+		g_vote_yes = g_vote_no = 0;
 		r = g_stock(dialog, msg, p1, p2);
 		if (board_wanted()) board_init(dialog);
 		return r;
@@ -366,11 +422,17 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	if (msg == WMcMessage_Destroy) {
 		g_board = 0;
 		memset(g_mute, 0, sizeof g_mute);
+		g_vote_yes = g_vote_no = 0;
 		return g_stock(dialog, msg, p1, p2);
 	}
 	if (msg == WMcMessage_Command && code == WMcNotify_Click) {
 		if (id == ID_BOARD) {
 			board_show(dialog);
+			return 1;
+		}
+		if (id == ID_VOTE_YES || id == ID_VOTE_NO) {
+			const char *err = net_vote_cast(id == ID_VOTE_YES);
+			if (err) log_msg("F1 screen: %s", err);
 			return 1;
 		}
 		if (id >= ID_MUTE && id < ID_MUTE + PLAYERS_MAX) {
@@ -387,8 +449,19 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	}
 	if (msg == WMcMessage_Paint) {
 		r = g_stock(dialog, msg, p1, p2);
-		if (board_wanted()) board_tab_colors(dialog);
+		if (board_wanted()) board_tab_colors(dialog), vote_parts(dialog);
 		return r;
+	}
+	if (msg == WMcMessage_OwnerDraw && p2 && *(const u16 *)(p2 + 8) == ID_SUB_AREA && g_board && board_wanted()) {
+		WMtWindow *area = *(WMtWindow *const *)(p2 + 4);
+		g_dc = *(void *const *)p2;
+		DCrSetFont(WIN_FONTINFO(area));
+		DCrSetTextAlign(1);
+		g_ascent = (int)(DCrFont_Ascent() & 0xffff);
+		text_multibyte_begin();
+		draw_vote();
+		text_multibyte_end();
+		return 1;
 	}
 	if (msg == WMcMessage_OwnerDraw && p2 && *(const u16 *)(p2 + 8) == ID_MAIN_AREA && board_wanted()) {
 		WMtWindow *area = *(WMtWindow *const *)(p2 + 4);

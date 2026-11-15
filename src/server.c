@@ -422,13 +422,14 @@ static void help(void)
 {
 	say_back("Commands (anything else you type is said to every player as the server):\n"
 	         "  say <text>            a server message to every player\n"
-	         "  players               who's here: number, name, state, score, ping, address\n"
+	         "  players               who's here: number, name, id (one per address, /vote kick's), state, score, ping, address\n"
 	         "  status                map, warm-up or match, players, limits\n"
 	         "  kick <player> [why]   out for " "5" " minutes (player: its number from 'players', or its name)\n"
 	         "  ban <player> [why]    out until the server closes\n"
 	         "  bans                  who is kicked or banned, numbered\n"
 	         "  unban [who]           lets them back: number from 'bans', name, address or all\n"
 	         "                        (nothing needed when only one is out)\n"
+	         "  map <map>             change the map now (its folder or name); players stay connected\n"
 	         "  start                 the match now (from the warm-up)\n"
 	         "  warmup                back to a warm-up now (ends the match)\n"
 	         "  timelimit <minutes>   0: none; from the next match\n"
@@ -453,7 +454,7 @@ static void players_cmd(void)
 		char ping[16];
 		if (r->ping >= 0) fmt(ping, "%d ms", r->ping);
 		else str_cpy(ping, sizeof ping, "-");
-		fmt(line, "  %d  %-24s %-9s score %-4d ping %-7s %s", r->slot + 1, r->name,
+		fmt(line, "  %d  %-24s id %-3d %-9s score %-4d ping %-7s %s", r->slot + 1, r->name, net_player_id(r->slot),
 		    r->gone ? "left" : r->joining ? "joining" : r->watching ? "watching" : "playing", r->score, ping, r->addr);
 		say_back(line);
 	}
@@ -522,6 +523,7 @@ static void command(const char *text)
 	else if (ieq(cmd, "bans")) say_back(net_server_bans(buf, sizeof buf));
 	else if (ieq(cmd, "unban")) say_back(net_server_unban(args));
 	else if (ieq(cmd, "start")) say_back(net_server_start());
+	else if (ieq(cmd, "map")) say_back(*args ? net_server_map(args) : "Usage: map <the map's folder or name>");
 	else if (ieq(cmd, "warmup")) say_back(net_server_warmup());
 	else if (ieq(cmd, "timelimit")) {
 		if (!number(args, &v) || v < 0 || v > NET_TIME_LIMIT_MAX) say_back("Usage: timelimit <minutes, 0 to 999>");

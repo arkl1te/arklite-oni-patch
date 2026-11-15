@@ -25,7 +25,7 @@ Safety:
 
 Problem reports (TCP, the same port number; --reports DIR, off without it):
 - Arklite sends one when a network game goes out of sync, a player drops, or Oni crashed: the log
-  and the dumps, made anonymous on the player's PC (no addresses, names, chat or absolute paths),
+  and the dumps, cleaned on the player's PC (no addresses, chat or absolute paths; names stay),
   each file an LZ4 block. One report per connection: "AKRP", version, body length, the body
   (Arklite version, source hash, reason, player slot, tick, session ID, the files), answered "OK".
 - Kept in DIR/<day>/<session>/<slot>-<reason>-<time>-<n>/: info.json and each file as <name>.lz4.
@@ -78,7 +78,7 @@ REPORT_BURST = 12.0         # ...with this many at once
 REPORT_CONNS = 6            # connections at once (each holds up to REPORT_MAX in memory)
 REPORT_TIMEOUT_S = 60       # a connection that hasn't sent its report by then is closed
 REPORT_KEEP_DAYS = 30
-REASONS = {1: "desync", 2: "crash", 3: "drop"}
+REASONS = {1: "desync", 2: "crash", 3: "drop", 4: "heap"}
 
 
 class Bucket:
@@ -106,7 +106,7 @@ class Game:
 
 
 class Reports:
-    """The TCP side: one anonymous problem report per connection (see the top)."""
+    """The TCP side: one problem report per connection (see the top)."""
 
     def __init__(self, sock, folder, max_bytes, count):
         self.sock = sock
@@ -404,7 +404,7 @@ def main():
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=27780)
     p.add_argument("--games-per-ip", type=int, default=MAX_GAMES_PER_IP, help="for tests on one PC")
-    p.add_argument("--reports", help="folder for anonymous problem reports (TCP on the same port); none: off")
+    p.add_argument("--reports", help="folder for problem reports (TCP on the same port); none: off")
     p.add_argument("--reports-max-mb", type=int, default=4000, help="the reports folder's size limit")
     a = p.parse_args()
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

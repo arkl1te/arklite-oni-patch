@@ -66,6 +66,9 @@ static u32  (WINAPI *gl_GetError)(void);
 static volatile int g_request;   /* F12 went down: save the next frame */
 static volatile int g_busy;      /* a shot is being written (one at a time) */
 static volatile int g_done;      /* written: play the sound */
+static char g_to[MAX_PATH];      /* screenshot_request_to: the next shot's name (without .png), "" for the usual */
+static char g_to_written[MAX_PATH];   /* that shot, written (screenshot_written) */
+static volatile int g_to_ready;
 static int g_gl_state;           /* 0 not looked up, 1 ok, 2 missing */
 
 typedef struct { u8 *pixels; int w, h, stride; } Shot;
@@ -194,13 +197,18 @@ static u32 WINAPI write_thread(void *unused)
 	}
 
 	CreateDirectoryA(SHOT_DIR, 0);
+	char to[MAX_PATH];
+	str_cpy(to, sizeof to, g_to);
+	g_to[0] = 0;
+	if (to[0]) fmt(path, "%s.png", to);
 	if (gdiplus_ready()) {
-		shot_name(path, ".png");
+		if (!to[0]) shot_name(path, ".png");
 		ok = save_png(s, path);
 		if (!ok) DeleteFileA(path);
 	} else ok = 0;
 	if (!ok) {
-		shot_name(path, ".bmp");
+		if (to[0]) fmt(path, "%s.bmp", to);
+		else shot_name(path, ".bmp");
 		ok = save_bmp(s, path);
 	}
 	if (!GetFullPathNameA(path, sizeof full, full, 0)) str_cpy(full, sizeof full, path);
@@ -210,6 +218,10 @@ static u32 WINAPI write_thread(void *unused)
 	VirtualFree(s->pixels, 0, 0x8000 /* MEM_RELEASE */);
 	s->pixels = 0;
 	if (ok) g_done = 1;
+	if (to[0]) {   /* screenshot_request_to's: its file, for screenshot_written */
+		str_cpy(g_to_written, sizeof g_to_written, ok ? path : "");
+		g_to_ready = 1;
+	}
 	g_busy = 0;
 	return 0;
 }
@@ -309,6 +321,23 @@ static int WINAPI swap_buffers(void *dc)
 /* photo.c's Screenshot button, and whether a frame is about to be saved (it leaves its hints and
  * grid out) */
 void screenshot_request(void) { g_request = 1; }
+
+/* the next frame drawn, saved as stem.png (stem.bmp without GDI+) */
+void screenshot_request_to(const char *stem)
+{
+	str_cpy(g_to, sizeof g_to, stem);
+	g_to_ready = 0;
+	g_request = 1;
+}
+
+/* that shot is written: 1 once, with its path in out ("" if it couldn't be written) */
+int screenshot_written(char *out, u32 size)
+{
+	if (!g_to_ready) return 0;
+	g_to_ready = 0;
+	str_cpy(out, size, g_to_written);
+	return 1;
+}
 int  screenshot_pending(void) { return g_request; }
 
 void screenshot_install(void)

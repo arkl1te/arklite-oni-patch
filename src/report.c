@@ -1,22 +1,22 @@
-/* Anonymous problem reports: when a network game goes out of sync, a player drops or Oni crashes,
+/* Problem reports: when a network game goes out of sync, a player drops or Oni crashes,
  * Arklite sends what the developer needs to find out why to the Arklite helper (TCP, the
  * helper's port): this PC's log and, for a desync, the dumps net.c wrote (Arklite-desync-*.bin,
  * Arklite-desyncticks-*.bin) and the rollback check (Arklite-rollbackcheck_*.txt). Every PC of a
  * session tags its report with the same session ID (the level and the session's starting seeds,
  * net_session_id), so the host's and each joiner's reports of one desync end up side by side.
  *
- * Anonymous, made so on this PC before anything is sent (anonymize):
+ * Cleaned on this PC before anything is sent (anonymize):
  *   - internet addresses (a.b.c.d, with any :port) become [address];
- *   - players' names become "player N" (N from net.c, from the log's own "names:" lines, or
- *     "[name]" when the player isn't known); the server's name becomes [server name];
- *   - chat messages are left out (the line stays, its text doesn't);
+ *   - the server's name becomes [server name]; players' nicknames stay (since 0.5.1: the
+ *     developer sorts a game's reports by its players, mp-logs/decode_reports.py);
+ *   - chat stays as typed (since 0.6.0: the developer reads it with the bug);
  *   - paths: the game's folder (Oni.exe's) becomes <Oni>\, Arklite.dll's folder <Arklite>\, and
  *     anything else absolute (a drive, \\server, /home...) is cut to [path]\ and the last part.
  * The dumps hold game memory only (the characters, inputs, RNG), no names or addresses. The helper
  * keeps no sender address. Arklite.ini [reports] send=0 turns reports off.
  *
- * When: the first DESYNC of a session, a player who stopped answering or the host lost (once a
- * session each), and a crash: the fault handler can't send, so it leaves logs\report-pending.txt
+ * When: the first DESYNC of a session, a player who stopped answering or the host lost, a bad
+ * free heap_check.c caught (once a session each), and a crash: the fault handler can't send, so it leaves logs\report-pending.txt
  * and the next start of Oni sends that log. Sending runs on its own thread; a failure is logged
  * and dropped (no retries, nothing piles up).
  *
@@ -53,12 +53,11 @@ __declspec(dllimport) int  WINAPI DeleteFileA(const char *);
 
 #define REPORT_MAGIC    0x50524b41u   /* "AKRP" */
 #define REPORT_VERSION  1
-#define MAX_FILES       6
+#define MAX_FILES       7
 #define FILE_MAX        (64u << 20)   /* bigger files aren't sent */
 #define SEND_MAX        (12u << 20)   /* the packed report, at most */
 #define DEFAULT_HELPER  "51.20.130.46:27780"
 #define PENDING         LOG_DIR "\\report-pending.txt"
-#define NAMES           8
 
 static int g_on;
 static char g_helper[96];
@@ -71,11 +70,6 @@ typedef struct {
 	char session[40];
 	int nfiles;
 	char files[MAX_FILES][MAX_PATH];
-	char names[NAMES][40];   /* nickname of player i+1 ("" unknown) */
-	char local[40];          /* this PC's player's nickname */
-	int local_slot;
-	char lnames[24][40];     /* nicknames the log itself names (players who left or renamed too) */
-	int lslot[24], nl;       /* their slots, -1 unknown */
 } Job;
 
 /* ---- LZ4 block ------------------------------------------------------------------------------ */
@@ -124,7 +118,7 @@ static u32 lz4_pack(const u8 *src, u32 n, u8 *dst, u32 *table)
 	return (u32)(o - dst);
 }
 
-/* ---- Anonymizing a log ------------------------------------------------------------------------ */
+/* ---- Cleaning a log --------------------------------------------------------------------------- */
 
 static int alnum(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
 static int digit(char c) { return c >= '0' && c <= '9'; }
@@ -199,91 +193,27 @@ static void put(Out *w, const char *s, u32 n)
 
 static void puts_(Out *w, const char *s) { put(w, s, str_len(s)); }
 
-/* A name of names[] (or the local one) whole at s: its replacement, and its length in *n */
-static const char *name_at(const Job *j, const char *s, const char *line, u32 *n, char *buf)
+/* One line (without its CRLF) into w, cleaned */
+static void anonymize_line(const char *line, u32 len, Out *w)
 {
-	if (s > line && alnum(s[-1])) return 0;
-	for (int i = -1; i < NAMES + j->nl; i++) {
-		const char *name = i < 0 ? j->local : i < NAMES ? j->names[i] : j->lnames[i - NAMES];
-		u32 len = str_len(name);
-		if (!len || !starts(s, name) || alnum(s[len])) continue;
-		*n = len;
-		int slot = i < 0 ? j->local_slot : i < NAMES ? i : j->lslot[i - NAMES];
-		if (slot < 0) return "[name]";
-		fmt(buf, "player %d", slot + 1);
-		return buf;
-	}
-	return 0;
-}
-
-/* Learns names from the log's own lines: "names: player N is X", "net: X (player N) ..." */
-static void learn_names(Job *j, const char *line)
-{
-	const char *p;
-	char name[40];
-	u32 n = 0;
-	int slot = -1;
-
-	if (starts(line, "names: player ") && digit(line[14])) {
-		slot = line[14] - '1';
-		p = find_str(line, " is ");
-		if (!p) return;
-		p += 4;
-		while (p[n] && p[n] != '\r' && p[n] != '\n' && n < sizeof name - 1) { name[n] = p[n]; n++; }
-	} else if (starts(line, "names: this PC's player is ")) {
-		p = line + 27;
-		if (starts(p, "now ")) p += 4;
-		while (p[n] && p[n] != '\r' && p[n] != '\n' && n < sizeof name - 1) { name[n] = p[n]; n++; }
-		name[n] = 0;
-		{
-			const char *cut = find_str(name, " (saved in Arklite.ini)");
-			if (cut) name[cut - name] = 0, n = (u32)(cut - name);
-		}
-		slot = j->local_slot;
-	} else if (starts(line, "net: ") && (p = find_str(line, " (player ")) && digit(p[9]) && p[10] == ')') {
-		slot = p[9] - '1';
-		n = (u32)(p - (line + 5));
-		if (n >= sizeof name) return;
-		memcpy(name, line + 5, n);
-	} else {
-		return;
-	}
-	name[n] = 0;
-	if (!n || j->nl >= 24) return;
-	for (u32 i = 0; i < n; i++) if (name[i] == '"' || name[i] == ':') return;
-	if (starts(name, "Player ") || starts(name, "player ")) return;   /* the placeholders: no one's name */
-	for (int i = 0; i < j->nl; i++) if (str_len(j->lnames[i]) == n && starts(j->lnames[i], name)) return;
-	str_cpy(j->lnames[j->nl], sizeof j->lnames[j->nl], name);
-	j->lslot[j->nl++] = slot;
-}
-
-/* One line (without its CRLF) into w, anonymized */
-static void anonymize_line(const Job *j, const char *line, u32 len, Out *w)
-{
-	char l[1200], buf[24];
+	char l[1200];
 	u32 n = len < sizeof l - 1 ? len : sizeof l - 1;
 	memcpy(l, line, n);
 	l[n] = 0;
 
-	/* chat: the messages players typed stay out (Arklite's own chat notices stay) */
-	if (starts(l, "chat: (server) ")) {
-		if (find_str(l, "Server: ")) { puts_(w, "chat: (server) [message left out]"); return; }
-	} else if (starts(l, "chat: ")) {
-		if (find_str(l + 6, ": ") || find_str(l, " whispers")) { puts_(w, "chat: [message left out]"); return; }
-	}
+	/* chat stays as it was typed (players asked for feedback to be easy; addresses in it are still masked) */
 	/* the server's name */
 	if (starts(l, "net: hosting \"")) {
 		const char *end = find_str(l + 14, "\" on ");
 		if (end) {
 			puts_(w, "net: hosting [server name]");
 			const char *rest = end + 1;   /* " on UDP port ...": through the rules below */
-			anonymize_line(j, rest, str_len(rest), w);
+			anonymize_line(rest, str_len(rest), w);
 			return;
 		}
 	}
 	for (const char *s = l; *s; ) {
 		u32 k;
-		const char *rep;
 		if ((k = ip_at(s)) && (s == l || (!alnum(s[-1]) && s[-1] != '.'))) {
 			puts_(w, "[address]");
 			s += k;
@@ -306,37 +236,21 @@ static void anonymize_line(const Job *j, const char *line, u32 len, Out *w)
 			s = last ? last + 1 : s + str_len(s);
 			continue;
 		}
-		if ((rep = name_at(j, s, l, &k, buf))) {
-			puts_(w, rep);
-			s += k;
-			continue;
-		}
 		put(w, s, 1);
 		s++;
 	}
 }
 
 /* The whole text: returns its new length in out (size cap) */
-static u32 anonymize(Job *j, const char *in, u32 n, char *out, u32 cap)
+static u32 anonymize(const char *in, u32 n, char *out, u32 cap)
 {
 	Out w = { out, cap };
-	/* the log's own names first: they hold players who left, too */
-	for (u32 i = 0; i < n; ) {
-		u32 e = i;
-		while (e < n && in[e] != '\n') e++;
-		char l[200];
-		u32 m = e - i < sizeof l - 1 ? e - i : sizeof l - 1;
-		memcpy(l, in + i, m);
-		l[m] = 0;
-		learn_names(j, l);
-		i = e + 1;
-	}
 	for (u32 i = 0; i < n; ) {
 		u32 e = i, end;
 		while (e < n && in[e] != '\n') e++;
 		end = e;
 		if (end > i && in[end - 1] == '\r') end--;
-		anonymize_line(j, in + i, end - i, &w);
+		anonymize_line(in + i, end - i, &w);
 		put(&w, "\r\n", 2);
 		i = e + 1;
 	}
@@ -392,7 +306,8 @@ static const char *base_name(const char *p)
 
 static const char *reason_name(u32 r)
 {
-	return r == REPORT_DESYNC ? "desync" : r == REPORT_CRASH ? "crash" : r == REPORT_DROP ? "drop" : "?";
+	return r == REPORT_DESYNC ? "desync" : r == REPORT_CRASH ? "crash" : r == REPORT_DROP ? "drop" : r == REPORT_HEAP ? "heap" :
+	       r == REPORT_MATCH ? "match" : r == REPORT_BUG ? "bug" : "?";
 }
 
 static u32 WINAPI report_thread(void *arg)
@@ -421,11 +336,11 @@ static u32 WINAPI report_thread(void *arg)
 		if (!raw) continue;
 		u8 *src = raw;
 		u32 sn = got;
-		if (text_file(j->files[f])) {   /* anonymized; may grow a little ([address], player N) */
+		if (text_file(j->files[f])) {   /* cleaned; may grow a little ([address]) */
 			u32 cap = got * 2 + 4096;
 			txt = VirtualAlloc(0, cap, 0x3000, 4);
 			if (!txt) goto next;
-			sn = anonymize(j, (const char *)raw, got, (char *)txt, cap);
+			sn = anonymize((const char *)raw, got, (char *)txt, cap);
 			src = txt;
 		}
 		u32 bound = sn + sn / 255 + 16, packed;
@@ -480,7 +395,7 @@ static u32 WINAPI report_thread(void *arg)
 		    recv(s, ok, 4, 0) < 2 || ok[0] != 'O' || ok[1] != 'K')
 			log_msg("report: the %s report (%d files, %d KB) couldn't be sent", reason_name(j->reason), files, len / 1024);
 		else
-			log_msg("report: sent an anonymous %s report: %d file(s), %d KB packed from %d KB", reason_name(j->reason), files,
+			log_msg("report: sent a %s report: %d file(s), %d KB packed from %d KB", reason_name(j->reason), files,
 			        (packed_all + 1023) / 1024, (raw_all + 1023) / 1024);
 		closesocket(s);
 	}
@@ -500,12 +415,6 @@ static Job *job_new(u32 reason)
 	j = VirtualAlloc(0, sizeof *j, 0x3000, 4);
 	if (!j) return 0;
 	j->reason = reason;
-	j->local_slot = -1;
-	for (int i = 0; i < NAMES && i < PLAYERS_MAX; i++) {
-		const char *n = mp_name(i);
-		if (n) text_to_utf8(j->names[i], sizeof j->names[i], n);   /* as the log has them (common.c log_msg) */
-	}
-	if (mp_name_local()) text_to_utf8(j->local, sizeof j->local, mp_name_local());
 	return j;
 }
 
@@ -535,14 +444,32 @@ void report_net(u32 reason, const char *session, int slot, u32 tick, const char 
 	if (!(j = job_new(reason))) return;
 	j->slot = (u32)slot;
 	j->tick = tick;
-	j->local_slot = slot;
 	str_cpy(j->session, sizeof j->session, session);
 	job_add(j, log_path());
+	job_add(j, sysinfo_path());   /* the machine and setup dump (sysinfo.c) */
 	job_add(j, dump1);
 	job_add(j, dump2);
 	job_add(j, extra);
 	job_go(j);
 }
+
+/* bug.c: a /bug report, with its note, screenshot and recording so far (every one: bug.c limits them) */
+void report_bug(const char *session, int slot, u32 tick, const char *note, const char *shot, const char *rec)
+{
+	Job *j;
+	if (!(j = job_new(REPORT_BUG))) return;
+	j->slot = (u32)slot;
+	j->tick = tick;
+	str_cpy(j->session, sizeof j->session, session);
+	job_add(j, log_path());
+	job_add(j, sysinfo_path());
+	job_add(j, note);
+	job_add(j, shot);
+	job_add(j, rec);
+	job_go(j);
+}
+
+int report_on(void) { return g_on; }
 
 /* crash_log.c's fault handler: this log is sent at the next start (no threads or sockets now) */
 void report_crash(void)
@@ -577,11 +504,15 @@ static void send_pending(void)
 	{
 		int v = 0, neg = lines[2][0] == '-';
 		for (const char *c = lines[2] + neg; digit(*c); c++) v = v * 10 + (*c - '0');
-		j->local_slot = neg ? -1 : v;
-		j->slot = (u32)j->local_slot;
+		j->slot = neg ? 0xffffffffu : (u32)v;
 	}
 	str_cpy(j->session, sizeof j->session, lines[1]);
 	job_add(j, lines[0]);
+	{
+		char prof[MAX_PATH];
+		sysinfo_path_for_log(lines[0], prof, sizeof prof);
+		job_add(j, prof);
+	}
 	log_msg("report: the last run crashed: sending its log (%s)", lines[0]);
 	job_go(j);
 }
@@ -594,6 +525,10 @@ void report_install(void *instance)
 	g_on = GetPrivateProfileIntA("reports", "send", 1, ini_path()) != 0;
 	GetPrivateProfileStringA("net", "helper", DEFAULT_HELPER, g_helper, sizeof g_helper, ini_path());
 	if (!g_helper[0]) g_on = 0;
+	{   /* a recording playing (net.c "Playback") sends nothing */
+		char v[4];
+		if (GetEnvironmentVariableA("ARKLITE_PLAYBACK", v, sizeof v)) g_on = 0;
+	}
 	for (int i = 0; i < 2; i++) {   /* Oni.exe's folder and Arklite.dll's */
 		n = GetModuleFileNameA(i ? instance : 0, path, sizeof path);
 		while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
@@ -614,6 +549,6 @@ void report_install(void *instance)
 		log_msg("report: problem reports off (Arklite.ini [reports] send=0, or no helper)");
 		return;
 	}
-	log_msg("report: anonymous problem reports on (desyncs, dropped players, crashes; [reports] send=0 turns them off)");
+	log_msg("report: problem reports on (desyncs, dropped players, crashes, heap damage; with the players' names, chat and the machine and setup dump; [reports] send=0 turns them off)");
 	send_pending();
 }

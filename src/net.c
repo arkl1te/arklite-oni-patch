@@ -154,7 +154,7 @@ typedef unsigned long long u64;
 #define IMG_CHARS       64        /* characters kept per state hash for the desync dump */
 
 #define DEFAULT_PORT    NET_DEFAULT_PORT
-#define PROTO           22
+#define PROTO           23
 #define MAGIC           0x544e4b41   /* "AKNT" */
 #define RING            512          /* input slots, by tick */
 #define MAX_SEND        24           /* inputs per packet */
@@ -263,7 +263,7 @@ __declspec(dllimport) u32  WINAPI GetCurrentThreadId(void);
 enum { PKT_HELLO = 1, PKT_START, PKT_INPUT, PKT_BYE, PKT_LOBBY, PKT_NAME,
        PKT_MAP_LIST_REQ, PKT_MAP_LIST, PKT_MAP_REQ, PKT_MAP_DATA, PKT_INFO_REQ, PKT_INFO,
        PKT_CHAT, PKT_CHAT_ACK, PKT_END, PKT_NAMES, PKT_HIST_REQ, PKT_HIST, PKT_COOKIE,
-       PKT_L0_REQ, PKT_L0_DATA };
+       PKT_L0_REQ, PKT_L0_DATA, PKT_VOTE };
 
 #define NPL             NET_SLOTS
 
@@ -350,6 +350,7 @@ typedef struct {
 typedef struct {
 	PktHead h;
 	char name[NPL][MP_NAME_MAX];   /* host: every player's ("" none) */
+	u32 id[NPL];                   /* host: every player's number (/players, /vote kick; 0 none) */
 } PktNames;
 /* Chat (chat.c): only shown, never game state. Each link (host and one joiner) numbers its
  * messages in a stream (random per link); the receiver shows them in order and acknowledges the
@@ -367,6 +368,19 @@ typedef struct {
 } PktChat;
 #define CHAT_SERVER     0x100
 #define CHAT_ALL        0xffffffffu
+#define CHAT_VOTE       0xfffffffeu   /* to: a joiner's /vote call or answer, for the host alone ("Votes") */
+/* A vote, as the host has it (see "Votes"): sent to every player's PC every VOTE_SEND_MS while it's
+ * on, and for a moment after its end, so a lost one is never missed for long. A joiner's calls and
+ * answers go the other way on the chat's stream (CHAT_VOTE), which is resent until acknowledged. */
+typedef struct {
+	PktHead h;
+	u32 id, state, kind;   /* NET_VOTE_*; id: new for each vote */
+	u32 acted;             /* a passed map vote: the host is changing the map now */
+	u32 yes, no, voters, ms_left;
+	u32 mine, may;         /* the receiver's player's answer (1 yes, 2 no), and whether it may vote */
+	char caller[MP_NAME_MAX], subject[64], reason[64];
+	char folder[64];       /* map: the CustomLevels folder */
+} PktVote;
 typedef struct {
 	PktHead h;
 	u32 stream, seq;       /* the sender's stream: every message up to seq was shown */
@@ -447,6 +461,8 @@ typedef struct {
 	int held_logged;       /* host, joining 2: "hitched, comes in once it keeps up" said */
 	u32 knows;             /* host: the players whose inputs it acknowledged from their first tick (g_base) */
 	char name[MP_NAME_MAX];   /* host: the joiner's player's */
+	u32 vote_id;           /* host: the vote its player answered ("Votes"), and how: 1 yes, 2 no */
+	int vote_ans;
 	int entered;           /* host: "Name entered the game" was said (its first PKT_NAME) */
 	u32 ack[NPL];          /* it has player p's inputs for ticks < ack[p] */
 	int adv, adv_known;    /* time sync: its ticks past its inputs of our player, as it sent */
@@ -573,6 +589,16 @@ static u32 g_npackets_sent, g_npackets_recv, g_ninputs_recv, g_last_status, g_se
 /* The lobby */
 static int g_match_pending;            /* the level was reloaded for the match: start synced */
 static int g_warm;                     /* this synced session (or the one being reloaded) is a warm-up */
+static int g_rec_warm;                 /* the session being recorded is a warm-up (g_warm may be the next one's by its end) */
+static u32 g_rec_mseed[2];             /* the seeds its level loaded with (g_match_seed may be the next one's by its end) */
+#define JOURNAL_MAX (60u * 60u * 120u)   /* frames kept for the recording: two hours at 60 a second */
+static u8 *g_journal;                 /* per rolling frame: ticks run, rollback depth, flags (1 waited) */
+static u32 g_journal_n;
+static int g_playback;                 /* ARKLITE_PLAYBACK: a recording plays, no network (see "Playback") */
+static void pb_start(void);
+static void pb_fill(void);
+static void pb_end(const char *how);
+static int pb_load(const char *path);
 static u32 g_fight_at;                 /* GetTickCount when this PC's match began (begin_run), 0: none */
 #define FIGHT_MS 2000                  /* how long "FIGHT!" is on screen (mp_hud.c) */
 static int g_lobby_match;              /* joiner: a match is on at the host, without this PC */
@@ -617,6 +643,16 @@ static u32 g_end_players, g_end_ready_count, g_end_left_ms, g_end_rx;   /* joine
 static u32 g_reload;                   /* level + 1, 0: none */
 static const char *g_load_step;        /* why net.c loads the level next: the loading popup's first line (level_load) */
 static int g_reload_seeds;             /* load it with g_match_seed / g_match_local_seed */
+static char g_next_folder[64];         /* the next level load mounts this CustomLevels folder first (a voted map) */
+/* host, after a map change: its lobby waits for the players who were there (CHANGE_WAIT_MS at most),
+ * so the warm-up starts with all of them instead of alone, with each catching up and one more reload */
+#define CHANGE_WAIT_MS  20000
+static u32 g_change_players, g_change_until;
+static int vote_frame(u32 now);
+static void vote_received(const u8 *buf, u32 n);
+static void vote_message(int l, const char *text);
+static void vote_keys(void);
+static void vote_reset(void);
 
 /* The server, as the Host dialog (or Arklite.ini [host]) has it */
 static char g_server_name[NET_SERVER_NAME_MAX] = "New Oni multiplayer game";
@@ -632,6 +668,34 @@ static char g_kick_note[64];           /* joiner: the server removed this PC: wh
 /* host: addresses its admin removed (kick: for some minutes, ban: until the server closes) */
 #define BANS 16
 static struct { u32 addr, until; int on; char note[64], name[MP_NAME_MAX]; } g_ban[BANS];   /* until: GetTickCount, 0: no end */
+
+/* Votes and player numbers (see "Votes"): the host's table of internet addresses and their
+ * numbers, kept for as long as it hosts; a listen host's own player is 1 */
+#define PIDS 64
+static struct { u32 addr, id; } g_pid[PIDS];
+static u32 g_npid, g_pid_next = 1, g_pid_host;
+static u32 g_slot_pid[NPL];            /* joiner: each player's number, as the host's NAMES said */
+
+static void pid_start(void)
+{
+	memset(g_pid, 0, sizeof g_pid);
+	memset(g_slot_pid, 0, sizeof g_slot_pid);
+	g_npid = 0;
+	g_pid_next = 1;
+	g_pid_host = g_dedicated ? 0 : g_pid_next++;   /* a dedicated server's own player isn't one of the players */
+}
+
+/* host: the number of the players at that address; make: a new one gets the next */
+static u32 pid_of(u32 addr, int make)
+{
+	for (u32 i = 0; i < g_npid; i++)
+		if (g_pid[i].addr == addr) return g_pid[i].id;
+	if (!make || g_npid == PIDS) return 0;
+	g_pid[g_npid].addr = addr;
+	g_pid[g_npid].id = g_pid_next++;
+	g_names_serial++;   /* the joiners' /players */
+	return g_pid[g_npid++].id;
+}
 
 static const char *ban_note(u32 addr)
 {
@@ -750,6 +814,7 @@ static int add_link(const SOCKADDR_IN *a)
 		link_reset(&g_link[l]);
 		g_link[l].last_recv = g_last_join = GetTickCount();
 		g_names_serial++;
+		pid_of(a->addr, 1);
 		return l;
 	}
 	return -1;
@@ -954,12 +1019,12 @@ static void set_char_rules(u32 rules, const char *whose)
 	if (rules == g_char_rules) return;
 	g_char_rules = rules;
 	log_msg("net: %s mutators %03x: Mutant Muro %s, Shinatama and Hasegawa %s, Mini Striker %s, Daodan %s, No Weapons %s, "
-	        "Fast Screamer %s, Fast Plasma %s, Fast Ball %s, Bombs For Days %s", whose, rules,
+	        "Fast Screamer %s, Fast Plasma %s, Fast Ball %s, Bombs For Days %s, Jamming Guns %s", whose, rules,
 	        rules & NET_CHARS_MUTANT_MURO ? "on" : "off", rules & NET_CHARS_SHINATAMA ? "on" : "off",
 	        rules & NET_CHARS_MINI_STRIKER ? "on" : "off", rules & NET_MUT_DAODAN ? "on" : "off",
 	        rules & NET_MUT_NO_WEAPONS ? "on" : "off", rules & NET_MUT_FAST_SCREAMER ? "on" : "off",
 	        rules & NET_MUT_FAST_PLASMA ? "on" : "off", rules & NET_MUT_FAST_BALL ? "on" : "off",
-	        rules & NET_MUT_BOMBS ? "on" : "off");
+	        rules & NET_MUT_BOMBS ? "on" : "off", rules & NET_MUT_JAMMING ? "on" : "off");
 	char_menu_rules_changed();
 }
 
@@ -1254,14 +1319,14 @@ static void hist_reset(void)
 
 static void hist_hash_put(u32 tick, u32 hash)
 {
-	if (g_mode == NET_HOST && g_hist_ok && tick < g_hist_cap) g_hist_hash[tick / HASH_EVERY] = hash;
+	if (g_hist_ok && tick < g_hist_cap) g_hist_hash[tick / HASH_EVERY] = hash;
 }
 
-/* host: the ticks whose inputs are all final now */
+/* the ticks whose inputs are all final now (the host's history for joiners; every PC's recording) */
 static void hist_append(void)
 {
 	u32 upto = remote_min();
-	if (g_mode != NET_HOST || !g_hist_ok || g_state != S_RUN) return;
+	if (!g_hist_ok || g_state != S_RUN) return;
 	if (g_gen < upto) upto = g_gen;
 	while (g_hist_n < upto) {
 		u32 t = g_hist_n, *row;
@@ -1971,6 +2036,7 @@ static void send_names(u32 now)
 		str_cpy(p.name[0], MP_NAME_MAX, mp_name_local());
 		for (int q = 1; q < NPL; q++)
 			if (g_link[q].used) str_cpy(p.name[q], MP_NAME_MAX, g_link[q].name);
+		for (int q = 0; q < NPL; q++) p.id[q] = net_player_id(q);
 		send_link(l, &p, sizeof p);
 		k->last_names = g_names_serial;
 		k->names_at = now;
@@ -2064,7 +2130,9 @@ static void chat_received(int l, const PktChat *p)
 		text[sizeof text - 1] = 0;
 		clean_text(text, sizeof text);
 		k->chat_in_seq = p->seq;
-		if (g_mode == NET_JOIN && p->from == CHAT_SERVER) {
+		if (p->to == CHAT_VOTE) {
+			if (g_mode == NET_HOST) vote_message(l, text);
+		} else if (g_mode == NET_JOIN && p->from == CHAT_SERVER) {
 			chat_server(text);
 		} else if (p->to != CHAT_ALL) {   /* a whisper: this PC's player's, or (host) a joiner's to pass on */
 			if (who < 0 || who >= NPL || who == g_slot) {
@@ -2328,6 +2396,7 @@ static void on_input(int l, const PktInput *p, u32 size)
 				g_in_at[q][slot] = t + 1;
 			}
 			while (g_in_at[q][g_have[q] % RING] == g_have[q] + 1) g_have[q]++;
+			if (st->count && g_rb_started) lagometer_packet(q, (int)g_ticks - (int)(st->first + st->count - 1));
 		}
 		data += st->count * 0x30;
 	}
@@ -4072,6 +4141,16 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 	u32 l = g_dl_level;
 	u16 r;
 
+	if (g_next_folder[0]) {   /* a voted map (see "Votes"), in the custom level's slot before its files open */
+		char f[64];
+		const char *now_on = custom_game_level_folder(level & 0xff);
+		str_cpy(f, sizeof f, g_next_folder);
+		g_next_folder[0] = 0;
+		if (now_on && !(str_len(now_on) == str_len(f) && str_ieq_n(now_on, f, str_len(f)))) {
+			if (custom_game_mount_folder(level & 0xff, f)) log_msg("net: the map is now CustomLevels\\%s", f);
+			else log_msg("net: couldn't put CustomLevels\\%s in place: the map stays %s", f, now_on);
+		}
+	}
 	g_load_a = 0;
 	g_load_files = 0;
 	g_load_count_on = g_load_quit = 0;
@@ -4841,6 +4920,7 @@ static int free_place(const SOCKADDR_IN *from)
 	g_link[l].last_recv = g_last_join = GetTickCount();
 	g_names_serial++;
 	names_push();
+	pid_of(from->addr, 1);
 	return l;
 }
 
@@ -5252,6 +5332,8 @@ static void receive(void)
 			joiner_lobby((const PktLobby *)buf);
 		} else if (h->type == PKT_START && g_mode == NET_JOIN && (u32)n >= sizeof(PktStart)) {
 			joiner_start((const PktStart *)buf);
+		} else if (h->type == PKT_VOTE && g_mode == NET_JOIN && (u32)n >= sizeof(PktVote)) {
+			vote_received(buf, (u32)n);
 		} else if (h->type == PKT_END && (u32)n >= sizeof(PktEnd)) {
 			end_received(l, (const PktEnd *)buf);
 		} else if (h->type == PKT_INPUT && (g_state == S_RUN || g_state == S_OVER)) {
@@ -5286,6 +5368,7 @@ static void receive(void)
 			}
 		} else if (h->type == PKT_NAMES && g_mode == NET_JOIN && (u32)n >= sizeof(PktNames)) {
 			const PktNames *p = (const PktNames *)buf;
+			for (int q = 0; q < NPL; q++) g_slot_pid[q] = p->id[q];
 			for (int q = 0; q < NPL; q++) {
 				char name[MP_NAME_MAX];
 				if (q == g_slot) continue;
@@ -5326,6 +5409,16 @@ static void receive(void)
 /* ---- Session ------------------------------------------------------------------------------ */
 
 static void catchup_begin(void);
+
+/* What every PC of a session must have the same of for its floats to come out the same; compare
+ * the PCs' lines when they desync by a few float steps (see "Problem reports of 2026-11-13") */
+static void log_floats(void)
+{
+	char mods[700];
+	log_msg("net: floats: x87 results %08x under control word %04x, MXCSR %04x (the same on every PC of a session, or floats come "
+	        "out differently)", lockstep_fpu_fingerprint(), fpu_control_word(), lockstep_mxcsr() & 0xffc0);
+	if (modules_changed(mods, sizeof mods)) log_msg("net: modules in Oni: %s", mods);
+}
 
 static void session_begin(u32 level)
 {
@@ -5372,6 +5465,7 @@ static void session_begin(u32 level)
 	g_gen = g_delay;   /* ticks 0..delay-1: no input from any PC */
 	g_start_tick = GS_TICK(ONgGameState);
 	g_start_fpu = fpu_control_word();
+	lockstep_fpu_watch(g_start_fpu);
 	g_start_hash = summarize_with(c, &n, 0);
 	if (!g_match_pending) {   /* F3 pressed before a reload into a warm-up still counts */
 		g_ready = 0;
@@ -5417,7 +5511,7 @@ static void begin_run(void)
 	g_state = S_RUN;
 	g_match_pending = 0;
 	g_load_players = g_nplayers;
-	if (g_mode == NET_HOST && ROLLING) hist_reset();
+	if (ROLLING) hist_reset();   /* the host serves it to joiners; every PC records it (rec_write) */
 	else g_hist_ok = 0;
 	if (!g_warm) g_ready = 0;
 	g_gen = g_delay;   /* ticks 0..delay-1: no input from any PC */
@@ -5435,8 +5529,14 @@ static void begin_run(void)
 		g_fight_at = GetTickCount() | 1;
 	}
 	fmt(g_session, "L%d-%08x%08x", g_level, g_seed, g_local_seed);
+	g_rec_warm = g_warm;
+	g_rec_mseed[0] = g_match_seed;
+	g_rec_mseed[1] = g_match_local_seed;
+	g_live_from = 0;   /* (set again only by a catch-up)*/
+	g_journal_n = 0;
 	log_msg("net: %s on (%s, player %d of %d), RNG %08x/%08x, input delay %d ticks; limits: %d min, %d points",
 	        g_warm ? "warm-up" : "game", mode_name(), g_slot + 1, g_nplayers, g_seed, g_local_seed, g_delay, g_time_limit, g_score_limit);
+	log_floats();
 }
 
 /* ---- Joining a game in progress: the joiner ------------------------------------------------- *
@@ -5463,6 +5563,11 @@ static void catchup_begin(void)
 	g_match_pending = 0;
 	g_catchup = 0;
 	g_joining = 1;
+	g_rec_warm = g_warm;          /* (the recording's header: catching up skips begin_run) */
+	g_journal_n = 0;
+	g_rec_mseed[0] = g_match_seed;
+	g_rec_mseed[1] = g_match_local_seed;
+	g_load_players = g_nplayers;
 	g_ready = 0;
 	g_cu_abort = 0;
 	g_cu_began = now;
@@ -5471,6 +5576,7 @@ static void catchup_begin(void)
 		back_to_lobby("no memory to catch up with");
 		return;
 	}
+	if (g_playback) pb_fill();   /* the recording as the session's history */
 	for (int l = 0; l < NPL; l++) {
 		g_link[l].last_recv = now;
 		g_link[l].ping = -1;
@@ -5486,6 +5592,7 @@ static void catchup_begin(void)
 	fmt(g_session, "L%d-%08x%08x", g_level, g_seed, g_local_seed);
 	log_msg("net: catching up with the host's %s (player %d), RNG %08x/%08x", g_warm ? "warm-up" : "match", g_slot + 1, g_seed,
 	        g_local_seed);
+	log_floats();
 }
 
 /* Caught up: the session's live inputs from tick g_ticks on */
@@ -5520,20 +5627,31 @@ static void catchup_live(u32 now)
 	send_hello();
 }
 
+static u32 g_pb_realtime_n;
+
 static u32 catchup_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
 {
 	u32 t0 = counter(), total = 0, err = 0, ran;
 
-	if ((int)(now - g_link[0].last_recv) > LOST_MS) {
-		back_to_lobby("nothing from the host while catching up");
-		if (ticks_run) *ticks_run = 0;
-		return 0;
+	if (!g_playback) {
+		if ((int)(now - g_link[0].last_recv) > LOST_MS) {
+			back_to_lobby("nothing from the host while catching up");
+			if (ticks_run) *ticks_run = 0;
+			return 0;
+		}
+		if (now - g_last_hello >= HELLO_MS) send_hello();
+		hist_request(now);
 	}
-	if (now - g_last_hello >= HELLO_MS) send_hello();
-	hist_request(now);
-	while (g_ticks < g_hist_n && us(counter() - t0) < CATCHUP_US) {
+	{
+		static int realtime = -1;
+		if (realtime < 0) { char v[4]; realtime = GetEnvironmentVariableA("ARKLITE_PLAYBACK_REALTIME", v, sizeof v) ? 1 : 0; }
+		g_pb_realtime_n = g_playback && realtime ? (count & 0xffff) : 0xffffffffu;
+	}
+	while (g_ticks < g_hist_n && us(counter() - t0) < CATCHUP_US && g_pb_realtime_n) {
 		u32 n = g_hist_n - g_ticks, before = g_ticks;
 		if (n > 6) n = 6;
+		if (n > g_pb_realtime_n) n = g_pb_realtime_n;
+		g_pb_realtime_n = g_pb_realtime_n == 0xffffffffu ? g_pb_realtime_n : g_pb_realtime_n - n;
 		memset(g_frames, 0, sizeof g_frames);
 		for (u32 k = 0; k < n; k++)
 			for (int p = 0; p < NPL; p++) memcpy(g_frames[p][k], g_hist + (g_ticks + k) * HIST_TICK + p * 12, 0x30);
@@ -5542,6 +5660,13 @@ static u32 catchup_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
 		err = run_update(n, &ran);
 		total += ran;
 		if (g_ticks == before || g_cu_abort) break;
+	}
+	if (g_playback && (g_cu_abort || g_ticks >= g_hist_n)) {   /* came apart, or played to the end: the game stands */
+		pb_end(g_cu_abort ? "came apart" : "played to the end");
+		players_net_frame(0, 0);
+		err = run_update(0, ticks_run);
+		if (ticks_run) *ticks_run = 0;
+		return err;
 	}
 	if (g_cu_abort) {   /* the replay came out differently: in the old way, at the next reload */
 		g_cu_failed = g_go_taken;
@@ -5579,6 +5704,319 @@ static void host_begin(void)
 		if (!gone(l)) send_start(l);
 }
 
+/* ---- Match recordings ------------------------------------------------------------------------ *
+ * Every PC writes each network session it played (warm-up or match, 30 s or more) to
+ * <log>.<session>.akn when it ends, and sends it with its log and its machine and setup dump
+ * (report.c, reason "match"): every player's final input of every tick (the session's history,
+ * which every PC keeps now, see hist_append) and this PC's state hash of every HASH_EVERY-th tick,
+ * so ARKLITE_PLAYBACK plays the session again on another PC and says where it comes apart.
+ *
+ * File (little-endian): "AKRN", version 1, the header's length, the header (text, "key: value"
+ * lines: versions, session, level and map, this PC's Compat record, seeds, mode, slot, players and
+ * names, rules and limits), the ticks, the players a tick holds (NPL), the encoded ticks' length
+ * and bytes (hist_encode's way: per tick a byte of the players whose input changed since the tick
+ * before, then each one's 16-bit mask of the words that changed and those words), the hashes'
+ * count and {tick, hash} pairs (0: not known); version 2 adds the frame journal: the count of this PC's
+ * rolling frames and 3 bytes each (ticks run, the rollback's depth, 1 when it waited for inputs): the
+ * frame structure visual bugs live in (the frames without a tick of 2026-11-15). */
+#define REC_MAGIC     0x4e524b41u   /* "AKRN" */
+#define REC_VERSION   2   /* 2: the frame journal after the hashes */
+#define REC_MIN_TICKS (30 * 60)
+
+static void rec_line(char *text, u32 size, const char *line)
+{
+	u32 n = str_len(text);
+	if (n + str_len(line) + 3 < size) { str_cpy(text + n, size - n, line); n = str_len(text); text[n] = '\r'; text[n + 1] = '\n'; text[n + 2] = 0; }
+}
+
+static void rec_write_to(const char *given, const char *why, int send);
+
+static void rec_write(const char *why) { rec_write_to(0, why, 1); }
+
+/* bug.c: this session's recording so far (the session goes on), 0 if there is none */
+int net_rec_snapshot(const char *path)
+{
+	if (!g_hist_ok || !g_hist || !g_hist_n || !g_session[0] || (g_state != S_RUN && g_state != S_LOST && g_state != S_OVER)) return 0;
+	rec_write_to(path, "a /bug report (the session went on)", 0);
+	return 1;
+}
+
+static void rec_write_to(const char *given, const char *why, int send)
+{
+	char path[MAX_PATH], line[256], name[MAX_PATH];
+	static char text[8192];
+	Compat c;
+	u32 ticks = g_hist_n, cap, used = 0, w, nh, hdr[3], tail[3];
+	u8 *enc;
+	HANDLE f;
+
+	if (!g_hist_ok || !g_hist || (!given && ticks < REC_MIN_TICKS) || !g_session[0]) return;
+	str_cpy(name, sizeof name, log_path());
+	{
+		u32 n = str_len(name);
+		if (n > 4 && str_ieq_n(name + n - 4, ".log", 4)) name[n - 4] = 0;
+	}
+	if (given) str_cpy(path, sizeof path, given);
+	else fmt(path, "%s.%s.akn", name, g_session);
+	cap = ticks * (1 + NPL * (2 + 0x30)) + 64;
+	enc = VirtualAlloc(0, cap, 0x3000, 4);
+	if (!enc) { log_msg("net: no memory to write this session's recording"); return; }
+	if (g_mode == NET_JOIN && g_live_from && g_slot > 0 && g_slot < NPL) {
+		/* a session this PC caught up with: its own input before its player came into the game (never,
+		 * if it only watched) the host never took (its history has none there), and the game didn't use
+		 * it either: out, so every PC's recording is the same. (A session it was in from the start: its
+		 * player is there from the level's load, every input counts.) */
+		u32 in = players_came_in_tick(g_slot);
+		for (u32 t = 0; t < ticks && t < in; t++) memset(g_hist + t * HIST_TICK + g_slot * 12, 0, 0x30);
+	}
+	{   /* the ticks */
+		static const u32 zero[HIST_TICK];
+		for (u32 t = 0; t < ticks; t++) {
+			const u32 *row = g_hist + t * HIST_TICK, *prev = t ? row - HIST_TICK : zero;
+			u32 k = used + 1;
+			enc[used] = 0;
+			for (int p = 0; p < NPL; p++) {
+				u16 words = 0;
+				for (int x = 0; x < 12; x++)
+					if (row[p * 12 + x] != prev[p * 12 + x]) words |= (u16)(1 << x);
+				if (!words) continue;
+				enc[used] |= (u8)(1 << p);
+				memcpy(enc + k, &words, 2);
+				k += 2;
+				for (int x = 0; x < 12; x++)
+					if (words >> x & 1) { memcpy(enc + k, &row[p * 12 + x], 4); k += 4; }
+			}
+			used = k;
+		}
+	}
+	text[0] = 0;
+	compat_mine(&c);
+	fmt(line, "arklite: %s, source %08x", ARKLITE_VERSION, (u32)ARKLITE_SRC_HASH); rec_line(text, sizeof text, line);
+	fmt(line, "session: %s (%s)", g_session, g_rec_warm ? "warm-up" : "match"); rec_line(text, sizeof text, line);
+	fmt(line, "ended: %s", why); rec_line(text, sizeof text, line);
+	fmt(line, "level: %d, map %s (%s), files %08x", g_level, custom_game_level_name(g_level), custom_game_level_folder(g_level), g_map_hash);
+	rec_line(text, sizeof text, line);
+	fmt(line, "compat: version %s, files %08x %08x %08x %08x, source %08x, map %08x, players %u", c.version, c.files[0], c.files[1],
+	    c.files[2], c.files[3], c.dll, c.map, c.players);
+	rec_line(text, sizeof text, line);
+	fmt(line, "seeds: %08x %08x", g_seed, g_local_seed); rec_line(text, sizeof text, line);
+	fmt(line, "mode: %s, slot %d, players %u, ticks %u, live from %u", g_mode == NET_HOST ? "host" : "join", g_slot, g_nplayers, ticks, g_live_from);
+	rec_line(text, sizeof text, line);
+	fmt(line, "rules: %08x, limits %u min %d points, respawn %u ticks, items %u ticks", g_char_rules, g_time_limit, g_score_limit,
+	    players_respawn_ticks(), items_default_ticks());
+	rec_line(text, sizeof text, line);
+	fmt(line, "load: players %u, match seeds %08x %08x, start tick %u, start state %08x, dedicated host %d", g_load_players,
+	    g_rec_mseed[0], g_rec_mseed[1], g_start_tick, g_start_hash, g_mode == NET_HOST ? g_dedicated != 0 : g_ded_host != 0);
+	rec_line(text, sizeof text, line);
+	for (int p = 0; p < (int)g_nplayers && p < NPL; p++) { fmt(line, "player %d: %s", p + 1, mp_name(p)); rec_line(text, sizeof text, line); }
+	nh = ticks / HASH_EVERY + 1;
+	f = CreateFileA(path, 0x40000000, 1, 0, 2 /* CREATE_ALWAYS */, 0x80, 0);
+	if (f == INVALID_HANDLE_VALUE) { VirtualFree(enc, 0, 0x8000); return; }
+	hdr[0] = REC_MAGIC; hdr[1] = REC_VERSION; hdr[2] = str_len(text);
+	WriteFile(f, hdr, sizeof hdr, &w, 0);
+	WriteFile(f, text, hdr[2], &w, 0);
+	tail[0] = ticks; tail[1] = NPL; tail[2] = used;
+	WriteFile(f, tail, sizeof tail, &w, 0);
+	WriteFile(f, enc, used, &w, 0);
+	WriteFile(f, &nh, 4, &w, 0);
+	for (u32 i = 0; i < nh; i++) {
+		u32 pair[2] = { i * HASH_EVERY, g_hist_hash[i] };
+		WriteFile(f, pair, sizeof pair, &w, 0);
+	}
+	{   /* the frame journal: this PC's rolling frames of the session, 3 bytes each (ticks run, rollback depth, 1 waited) */
+		u32 nf = g_journal ? g_journal_n : 0;
+		WriteFile(f, &nf, 4, &w, 0);
+		if (nf) WriteFile(f, g_journal, nf * 3, &w, 0);
+	}
+	CloseHandle(f);
+	VirtualFree(enc, 0, 0x8000);
+	log_msg("net: this session's recording: %s, %u ticks, %u KB of inputs", path, ticks, (used + 1023) / 1024);
+	if (send) report_net(REPORT_MATCH, g_session, g_slot, ticks, path, 0, 0);
+}
+
+/* ---- Playback ------------------------------------------------------------------------------ *
+ * ARKLITE_PLAYBACK=<recording.akn> (with ARKLITE_AUTOSTART=<its map>, tools/akn.py prints both)
+ * plays a recorded session again on this PC, the way a joiner catches up with a session in
+ * progress: the level loads in the lobby, the recording's settings go in as the host's would
+ * (rules, limits, respawn and item times, the players the level loaded with, both RNG seed pairs,
+ * the level-start state, this PC's slot as the recording's), the level reloads for it, and the
+ * catch-up runs every recorded tick with every player's recorded input, comparing the state hash
+ * every HASH_EVERY ticks with the recording's (catchup_check: a differing one is logged with the
+ * characters, the images and the tick ring, as a joiner's would be). No network at all: no socket,
+ * no helper, no reports. As fast as it can, or at the game's speed with ARKLITE_PLAYBACK_REALTIME;
+ * the game stands at the end, or Oni closes with ARKLITE_PLAYBACK_QUIT. */
+static int g_pb_started, g_pb_said;
+static struct {
+	u32 level, players, load_players, warm, rules, respawn, items, limit_min, dedicated, ticks, nh, start_tick, start_state;
+	u32 seed[2], mseed[2];
+	int slot, score;
+	u32 *rows, *hash;
+} g_pb;
+
+/* the number at s (after spaces or commas; decimal, or hex with hex != 0), s moved past it */
+static u32 pb_num(const char **s, int hex)
+{
+	u32 v = 0;
+	const char *c = *s;
+	while (*c == ' ' || *c == ',') c++;   /* (only separators: a letter isn't skipped, "match" isn't hex) */
+	for (;;) {
+		u32 d = *c >= '0' && *c <= '9' ? (u32)(*c - '0') : hex && *c >= 'a' && *c <= 'f' ? (u32)(*c - 'a' + 10) :
+		        hex && *c >= 'A' && *c <= 'F' ? (u32)(*c - 'A' + 10) : 99;
+		if (d == 99) break;
+		v = v * (hex ? 16 : 10) + d;
+		c++;
+	}
+	*s = c;
+	return v;
+}
+
+/* in the header line starting with line ("mode: "), the place right after key ("players "); 0 if none */
+static const char *pb_at(const char *text, const char *line, const char *key)
+{
+	u32 ln = str_len(line), kn = str_len(key);
+	for (const char *l = text; *l; ) {
+		if (str_ieq_n(l, line, ln)) {
+			for (const char *c = l; *c && *c != '\n'; c++)
+				if (str_ieq_n(c, key, kn)) return c + kn;
+			return 0;
+		}
+		while (*l && *l != '\n') l++;
+		if (*l) l++;
+	}
+	return 0;
+}
+
+/* the number at pb_at(text, line, key): decimal, or hex; 0 if not there */
+static u32 pb_field(const char *text, const char *line, const char *key, int hex)
+{
+	const char *v = pb_at(text, line, key);
+	return v ? pb_num(&v, hex) : 0;
+}
+
+static int pb_load(const char *path)
+{
+	HANDLE f = CreateFileA(path, 0x80000000, 1, 0, 3, 0x80, 0);
+	u32 size, got = 0, pos, ticks, npl, enc_len, k = 0;
+	u8 *data;
+	char *text;
+	const char *v;
+	if (f == INVALID_HANDLE_VALUE) { log_msg("playback: can't open %s", path); return 0; }
+	size = GetFileSize(f, 0);
+	data = VirtualAlloc(0, size + 16, 0x3000, 4);
+	if (!data) { CloseHandle(f); return 0; }
+	ReadFile(f, data, size, &got, 0);
+	CloseHandle(f);
+	if (got < 24 || *(u32 *)data != REC_MAGIC || *(u32 *)(data + 4) < 1 || *(u32 *)(data + 4) > REC_VERSION) { log_msg("playback: %s isn't a recording", path); return 0; }
+	pos = 12 + *(u32 *)(data + 8);
+	text = VirtualAlloc(0, pos, 0x3000, 4);
+	memcpy(text, data + 12, pos - 12);
+	text[pos - 12] = 0;
+	ticks = *(u32 *)(data + pos); npl = *(u32 *)(data + pos + 4); enc_len = *(u32 *)(data + pos + 8);
+	pos += 12;
+	if (npl != NPL || pos + enc_len + 4 > got) { log_msg("playback: %s holds %u players a tick, this Arklite %d", path, npl, NPL); return 0; }
+	g_pb.ticks = ticks;
+	g_pb.rows = VirtualAlloc(0, ticks * HIST_TICK * 4 + 16, 0x3000, 4);
+	if (!g_pb.rows) return 0;
+	{   /* the ticks: as rec_write encoded them */
+		const u8 *enc = data + pos;
+		u32 prev[HIST_TICK];
+		memset(prev, 0, sizeof prev);
+		for (u32 t = 0; t < ticks && k < enc_len; t++) {
+			u8 mask = enc[k++];
+			for (int p = 0; p < NPL; p++) {
+				u16 words;
+				if (!(mask >> p & 1)) continue;
+				memcpy(&words, enc + k, 2);
+				k += 2;
+				for (int x = 0; x < 12; x++)
+					if (words >> x & 1) { memcpy(&prev[p * 12 + x], enc + k, 4); k += 4; }
+			}
+			memcpy(g_pb.rows + t * HIST_TICK, prev, sizeof prev);
+		}
+	}
+	pos += enc_len;
+	g_pb.nh = *(u32 *)(data + pos);
+	pos += 4;
+	g_pb.hash = VirtualAlloc(0, g_pb.nh * 4 + 16, 0x3000, 4);
+	for (u32 i = 0; i < g_pb.nh && pos + 8 <= got; i++, pos += 8) g_pb.hash[i] = *(u32 *)(data + pos + 4);
+	g_pb.level = pb_field(text, "level: ", "level: ", 0);
+	if ((v = pb_at(text, "seeds: ", "seeds: "))) { g_pb.seed[0] = pb_num(&v, 1); g_pb.seed[1] = pb_num(&v, 1); }
+	g_pb.slot = (int)pb_field(text, "mode: ", "slot ", 0);
+	g_pb.players = pb_field(text, "mode: ", "players ", 0);
+	g_pb.rules = pb_field(text, "rules: ", "rules: ", 1);
+	g_pb.limit_min = pb_field(text, "rules: ", "limits ", 0);
+	if ((v = pb_at(text, "rules: ", " min "))) {
+		int neg = *v == '-';
+		u32 sc;
+		if (neg) v++;
+		sc = pb_num(&v, 0);
+		g_pb.score = neg ? -(int)sc : (int)sc;
+	}
+	g_pb.respawn = pb_field(text, "rules: ", "respawn ", 0);
+	g_pb.items = pb_field(text, "rules: ", "items ", 0);
+	g_pb.load_players = pb_field(text, "load: ", "players ", 0);
+	if ((v = pb_at(text, "load: ", "match seeds "))) { g_pb.mseed[0] = pb_num(&v, 1); g_pb.mseed[1] = pb_num(&v, 1); }
+	g_pb.start_tick = pb_field(text, "load: ", "start tick ", 0);
+	g_pb.start_state = pb_field(text, "load: ", "start state ", 1);
+	g_pb.dedicated = pb_field(text, "load: ", "dedicated host ", 0);
+	g_pb.warm = str_contains_i(text, "(warm-up)") != 0;
+	log_msg("playback: %s: level %u, %u ticks, %u hashes, player %d of %u, %s", path, g_pb.level, ticks, g_pb.nh, g_pb.slot + 1,
+	        g_pb.players, g_pb.warm ? "warm-up" : "match");
+	VirtualFree(data, 0, 0x8000);
+	return g_pb.level && g_pb.load_players >= 1 && g_pb.load_players <= NPL;
+}
+
+/* the lobby's first frame: the recording's settings in place as the host's, and the reload for it */
+static void pb_start(void)
+{
+	g_pb_started = 1;
+	set_char_rules(g_pb.rules & NET_MUTATORS_ALL, "the recording's");
+	g_ded_host = g_pb.dedicated != 0;
+	players_set_dedicated(g_ded_host);
+	players_set_respawn_ticks(g_pb.respawn);
+	items_set_default_ticks(g_pb.items);
+	g_time_limit = g_pb.limit_min;
+	g_score_limit = g_pb.score;
+	g_slot = g_pb.slot;
+	g_nplayers = g_pb.load_players;
+	g_match_seed = g_pb.mseed[0];
+	g_match_local_seed = g_pb.mseed[1];
+	g_seed = g_pb.seed[0];
+	g_local_seed = g_pb.seed[1];
+	g_cu_start_tick = g_pb.start_tick;
+	g_cu_start_hash = g_pb.start_state;
+	g_go_taken = 1;
+	g_warm = g_pb.warm;
+	g_delay = 0;
+	g_catchup = 1;
+	g_lobby_match = 0;
+	log_msg("playback: the recording's settings in place: reloading level %u for it", g_pb.level);
+	start_match();
+}
+
+/* catchup_begin: the recording as the session's history */
+static void pb_fill(void)
+{
+	u32 n = g_pb.ticks < g_hist_cap ? g_pb.ticks : g_hist_cap;
+	if (!hist_room(n)) { log_msg("playback: no memory for %u ticks", n); return; }
+	memcpy(g_hist, g_pb.rows, n * HIST_TICK * 4);
+	g_hist_n = g_hist_avail = n;
+	for (u32 i = 0; i < g_pb.nh && i < g_hist_cap / HASH_EVERY + 1; i++) g_hist_hash[i] = g_pb.hash[i];
+	g_hist_nplayers = g_pb.players;
+}
+
+/* catchup_frame, playback: at the end or where it came apart, once */
+static void pb_end(const char *how)
+{
+	if (g_pb_said) return;
+	g_pb_said = 1;
+	log_msg("playback: %s at tick %u of %u: %u hashes compared, %u differed", how, g_ticks, g_pb.ticks, g_checks, g_bad_checks);
+	{
+		char v[4];
+		if (GetEnvironmentVariableA("ARKLITE_PLAYBACK_QUIT", v, sizeof v)) *(u8 *)0x630ffd = 1;   /* Oni's quit flag */
+	}
+}
+
 static void session_end(const char *why)
 {
 	if (g_state == S_IDLE) return;
@@ -5587,6 +6025,7 @@ static void session_end(const char *why)
 		ONgSoundOn = g_cu_sound;
 		log_msg("net: stopped catching up (%s) at tick %d of %d", why, g_ticks, g_hist_avail);
 	}
+	if (g_state == S_RUN || g_state == S_LOST || g_state == S_OVER) rec_write(why);   /* (match recordings, above) */
 	g_joining = 0;
 	players_set_limits(0, 0, 0);
 	players_set_count(2);   /* a lobby: each PC plays alone (start_match sets the match's) */
@@ -5607,6 +6046,7 @@ static void session_end(const char *why)
 		        g_level, why, g_ticks, g_ticks / 60, g_checks, g_bad_checks, g_bad_checks ? ", see DESYNC above" : "");
 	else if (g_state == S_WAIT)
 		log_msg("net: level %d ended (%s) before the match started", g_level, why);
+	lockstep_fpu_watch(0);
 	g_state = S_IDLE;
 }
 
@@ -5655,7 +6095,7 @@ static void make_input(void)
 {
 	u32 *in = g_in[g_slot][g_gen % RING];
 
-	if (live_menu_open() || char_menu_open() || g_dedicated) {
+	if (live_menu_open() || char_menu_open() || fx_menu_open() || g_dedicated) {
 		memset(in, 0, 0x30);                 /* a menu is up (or a dedicated server's): our player stands */
 		g_has_pending = 0;
 	} else if (g_has_pending) {
@@ -5865,8 +6305,13 @@ static int ready_frame(u32 now)
 		host_go(0);
 		return 1;
 	}
+	if (g_change_until && (g_state != S_LOBBY || lobby_players() >= g_change_players || (int)(now - g_change_until) >= 0)) {
+		if (g_state == S_LOBBY)
+			log_msg("net: %d of the %d players are back after the map change", lobby_players(), g_change_players);
+		g_change_until = 0;
+	}
 	if ((g_state == S_LOBBY ? (solo_session() ? lobby_players() >= 1 : players >= 2) : newcomers()) && !g_countdown_end &&
-	    now - g_last_join >= WARM_WAIT_MS) {
+	    now - g_last_join >= WARM_WAIT_MS && !g_change_until) {
 		log_msg("net: %d player%s: the warm-up %s%s", players, players == 1 ? "" : "s",
 		        g_state == S_LOBBY ? "starts" : "starts again for the new player",
 		        g_state == S_LOBBY && solo_session() ? " (players who come join it as it goes on)" : "");
@@ -5889,6 +6334,11 @@ static u32 lobby_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
 	u8 *gs = ONgGameState;
 	u32 err, n, wanted;
 
+	if (g_playback && !g_pb_started) {   /* the recording's settings, and the reload for it */
+		pb_start();
+		if (ticks_run) *ticks_run = 0;
+		return 0;
+	}
 	if (ready_frame(now) || g_state != S_LOBBY) {   /* or "go" came in receive(): the level is being reloaded */
 		if (ticks_run) *ticks_run = 0;
 		return 0;
@@ -5913,7 +6363,7 @@ static u32 lobby_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
 				memcpy(f, g_last_local, 0x30);   /* the buttons stay held, no aim */
 				f[7] = f[8] = f[9] = f[10] = 0;
 			}
-			if (live_menu_open() || char_menu_open()) memset(f, 0, 0x30);
+			if (live_menu_open() || char_menu_open() || fx_menu_open()) memset(f, 0, 0x30);
 			f[11] = char_menu_record_word() | (k == 0 ? players_emote_take() : 0);
 		}
 		GS_SYNC_BEHIND(gs) = 0;
@@ -6045,9 +6495,14 @@ static void rb_fill_frames(u32 n)
 	}
 }
 
+static int g_rerun;   /* 1: a rollback's re-run is running, 2: a rollback check's (heap_check.c's journal says which) */
+int net_rerun(void) { return g_rerun; }
+
 /* Run the ticks again from g_ticks (just put back) up to to, silently */
 static void rb_resimulate(u32 to)
 {
+	int was = g_rerun;
+	if (!was) g_rerun = 1;
 	rollback_impulses(0);   /* one-shot sounds play only if the first run didn't play them; ambients start again */
 	while (g_ticks < to) {
 		u32 n = to - g_ticks, before = g_ticks;
@@ -6058,6 +6513,7 @@ static void rb_resimulate(u32 to)
 		if (g_ticks == before) break;   /* the update ran nothing: don't spin */
 	}
 	rollback_impulses(1);
+	g_rerun = was;
 }
 
 /* rollback.c's check of a rollback: the same ticks put back and run once more with the same
@@ -6071,7 +6527,9 @@ static void rb_check(u32 t, u32 to, int player)
 	if (g_ticks != to || !rollback_check_begin()) return;
 	if (!rollback_restore_tick(t)) return;
 	g_ticks = t;
+	g_rerun = 2;
 	rb_resimulate(to);
+	g_rerun = 0;
 	if (g_ticks != to) return;   /* the update ran fewer ticks: nothing to compare */
 	fmt(what, "rollback %d, player %d's input at tick %d guessed wrong, ticks %d-%d run again", g_rollbacks,
 	    player + 1, t, t, to - 1);
@@ -6096,6 +6554,22 @@ static int ahead(void)
 static const char *others(void) { return g_mode == NET_HOST ? "joiners" : "others"; }
 
 /* The 30 s log line's ping part: each link's average and worst */
+/* the lag-o-meter's ping line: each other player's last round trip */
+void net_ping_text(char *out, u32 size)
+{
+	out[0] = 0;
+	for (int q = 0; q < (int)g_nplayers && q < NPL; q++) {
+		char one[48];
+		int ms;
+		if (q == g_slot || !remote(q)) continue;
+		ms = g_mode == NET_HOST ? (g_link[q].used ? g_link[q].ping : -1) : q == 0 ? g_link[0].ping : g_peer_ping[q];
+		if (ms < 0) fmt(one, "%s%s -", out[0] ? "   " : "", mp_name(q));
+		else fmt(one, "%s%s %d ms", out[0] ? "   " : "", mp_name(q), ms);
+		if (str_len(out) + str_len(one) < size) str_cpy(out + str_len(out), size - str_len(out), one);
+	}
+	if (!out[0]) str_cpy(out, size, "no other players");
+}
+
 static void ping_log(char *out, u32 size)
 {
 	out[0] = 0;
@@ -6109,6 +6583,9 @@ static void ping_log(char *out, u32 size)
 		k->ping_sum = k->ping_n = k->ping_max = 0;
 	}
 }
+
+static u32 g_lag_depth;   /* this frame's rollback depth, for the lag-o-meter */
+static int g_lag_waited;  /* this frame waited for inputs */
 
 static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u32 now)
 {
@@ -6138,6 +6615,7 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 			if (t1 > g_rb_restore_us_max) g_rb_restore_us_max = t1;
 			g_rollbacks++;
 			g_resim_ticks += to - t;
+			g_lag_depth = to - t;
 			if (to - t > g_rb_deepest) g_rb_deepest = to - t;
 			if (g_rollbacks <= RB_CHECK_FIRST || !(g_rollbacks % RB_CHECK_EVERY)) rb_check(t, to, bad_player);
 		} else if (!g_rb_failed++) {
@@ -6163,16 +6641,15 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 	}
 	if (g_ticks + n > avail + RB_AHEAD) {
 		u32 can = avail + RB_AHEAD > g_ticks ? avail + RB_AHEAD - g_ticks : 0;
+		g_lag_waited = 1;
 		g_stall_frames++;
 		g_stall_ticks += n - can;
 		n = can;
 	}
 	if ((count & 0xffff) && actions) take_record((const u32 *)actions);
 	while (g_gen < g_ticks + n) make_input();
-	if (g_mode == NET_HOST) {
-		joining_frame();
-		hist_append();
-	}
+	if (g_mode == NET_HOST) joining_frame();
+	hist_append();   /* every PC: the host's history for joiners, everyone's recording */
 	send_inputs_due(now);
 	if (now - g_last_stall_log >= STALL_LOG_MS) {
 		char pings[200];
@@ -6217,10 +6694,23 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 		tex_us = us(counter() - first_t0);
 		g_rb_started = rollback_net_begin();
 		log_msg("net: rollback %s: no input delay, the %s' inputs guessed and corrected up to %d ticks back%s",
-		        g_rb_started ? "on" : "FAILED", others(), RB_AHEAD, g_record ? " (recording is off with rollback)" : "");
+		        g_rb_started ? "on" : "FAILED", others(), RB_AHEAD, g_record ? " (the old .akr recording is off with rollback; the session is recorded to .akn)" : "");
 	}
 	players_net_frame(g_frames, n);
 	u32 err = run_update(n, ticks_run);
+	{   /* the lag-o-meter's frame: ticks run, how far past every player's known input, the rollback, the wait */
+		u32 known = remote_min();
+		lagometer_frame(n, g_ticks > known ? g_ticks - known : 0, g_lag_depth, g_lag_waited || (wanted && !n));
+		if (!g_journal) g_journal = VirtualAlloc(0, JOURNAL_MAX * 3, 0x3000, 4);
+		if (g_journal && g_journal_n < JOURNAL_MAX) {   /* the recording's frame journal (rec_write) */
+			u8 *j = g_journal + g_journal_n++ * 3;
+			j[0] = (u8)(n > 255 ? 255 : n);
+			j[1] = (u8)(g_lag_depth > 255 ? 255 : g_lag_depth);
+			j[2] = (u8)((g_lag_waited || (wanted && !n)) ? 1 : 0);
+		}
+		g_lag_depth = 0;
+		g_lag_waited = 0;
+	}
 	if (first_t0)
 		log_msg("net: rollback's first frame took %d ms (%d ticks; the HUD's textures %d ms)", us(counter() - first_t0) / 1000, n,
 		        tex_us / 1000);
@@ -6233,16 +6723,18 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 	u8 *gs = ONgGameState;
 	u32 level = ONrLevel_GetCurrent(), now = GetTickCount();
 
-	if (g_sock == INVALID_SOCKET && !net_open()) {
+	if (!g_playback && g_sock == INVALID_SOCKET && !net_open()) {
 		g_mode = NET_OFF;   /* from now on lockstep.c runs the update itself */
 		players_net_frame(0, 0);
 		return ONrGameState_Update(count, actions, ticks_run);
 	}
-	stun_frame(g_sock, now);
-	helper_frame(g_sock, now);
-	if (g_mode == NET_HOST) helper_frame_host(now);
-	else helper_frame_join(now);
-	punch_frame(now);
+	if (!g_playback) {   /* (playback: no network at all) */
+		stun_frame(g_sock, now);
+		helper_frame(g_sock, now);
+		if (g_mode == NET_HOST) helper_frame_host(now);
+		else helper_frame_join(now);
+		punch_frame(now);
+	}
 	if (g_reload) {   /* the session has ended: the game stands until the dialogs are gone */
 		if (!live_menu_open()) {
 			reload_level(g_reload - 1, g_reload_seeds);
@@ -6288,6 +6780,8 @@ u32 net_update(u32 count, void *actions, u32 *ticks_run)
 
 	receive();
 	now = GetTickCount();   /* after receive(), which stamps last_recv: now - last_recv mustn't wrap */
+	vote_keys();
+	vote_frame(now);   /* (a passed map vote reloads the level: S_IDLE below) */
 	send_names(now);
 	chat_resend_due(now);
 	u32 wanted = GS_SERVER_TIME(gs) - GS_TICK(gs);
@@ -6863,6 +7357,9 @@ static u8 *ONI_FC this_pc_player(void)
 	return gs ? view_character(GS_PLAYER(gs)) : 0;
 }
 
+/* mp_hud.c: the character this PC's screen shows (its player, or the one it watches) */
+u8 *net_view_character(void) { return this_pc_player(); }
+
 /* in place of 0x4fc8a0 (which only touches EAX) */
 __attribute__((naked)) static void get_player_here(void)
 {
@@ -7036,6 +7533,7 @@ static void lobby_goodbye(void);
 static void dedicated_begin(void)
 {
 	g_dedicated = 1;
+	pid_start();   /* (its own player has no number) */
 	players_spectate_want(1);
 	players_set_dedicated(1);
 	server_start();
@@ -7105,7 +7603,8 @@ int net_server_find(const char *who)
 	return count > 1 ? -2 : found;
 }
 
-const char *net_server_kick(int l, u32 minutes, const char *reason)
+/* voted: a passed /vote kick (see "Votes"), else the admin's kick or ban */
+static const char *kick_link(int l, u32 minutes, const char *reason, int voted)
 {
 	static char out[160];
 	char name[MP_NAME_MAX], note[64];
@@ -7114,7 +7613,8 @@ const char *net_server_kick(int l, u32 minutes, const char *reason)
 
 	if (g_mode != NET_HOST || l < 1 || l >= NPL || !g_link[l].used) return "No such player.";
 	str_cpy(name, sizeof name, mp_name(l));
-	if (minutes) fmt(note, "Kicked for %d min%s%s", minutes, reason && reason[0] ? ": " : ".", reason ? reason : "");
+	if (minutes) fmt(note, "%s for %d min%s%s", voted ? "Voted out" : "Kicked", minutes, reason && reason[0] ? ": " : ".",
+	                 reason ? reason : "");
 	else fmt(note, "Banned from this server%s%s", reason && reason[0] ? ": " : ".", reason ? reason : "");
 	note[sizeof note - 1] = 0;
 	for (i = 0; i < BANS; i++) {   /* the same address again, else a free entry, else the oldest kick */
@@ -7132,12 +7632,14 @@ const char *net_server_kick(int l, u32 minutes, const char *reason)
 	for (i = 0; i < 3; i++) send_lobby_addr(&g_link[l].addr, l, 0, NETBAD_KICKED);
 	g_lobby_note = 0;
 	if (g_state == S_LOBBY || g_state == S_IDLE || g_link[l].waiting || g_link[l].joining) remove_link(l);
-	else mark_gone(l, 1, minutes ? "was kicked" : "was banned", 0);
-	server_line(name, minutes ? "was kicked" : "was banned");
+	else mark_gone(l, 1, voted ? "was voted out" : minutes ? "was kicked" : "was banned", 0);
+	server_line(name, voted ? "was voted out" : minutes ? "was kicked" : "was banned");
 	log_msg("net: %s (player %d) removed: %s", name, l + 1, note);
 	fmt(out, "%s: %s", name, note);
 	return out;
 }
+
+const char *net_server_kick(int l, u32 minutes, const char *reason) { return kick_link(l, minutes, reason, 0); }
 
 /* The removed players still out, in g_ban order: what 'bans' numbers 1, 2, ... */
 static int bans_active(int *idx)
@@ -7288,6 +7790,580 @@ void net_server_quit(void)
 	ONgExitRequested = 1;
 }
 
+/* ---- Votes (protocol 23) ------------------------------------------------------------------ *
+ * /vote map <name> and /vote kick <player> [reason] (chat.c), answered with Y / N, /yes / /no or
+ * the F1 Scoreboard's buttons (mp_board.c). The host runs every vote: a joiner's call and answers
+ * reach it as chat messages to CHAT_VOTE (the chat resends them until they're acknowledged, so
+ * each arrives once, in order); a call it refuses gets a server line back, to that player alone.
+ * The state goes to every joiner in a PKT_VOTE every VOTE_SEND_MS, with that joiner's own answer.
+ * Every PC says the start and the result in the chat and plays the sounds itself, from the state
+ * it sees (vote_note): objective_prompt as a vote starts, objective_complete when it passes (not
+ * objective_new: the match's start and end have it), door_fail
+ * (Oni's "that door is locked", ONcEventSound_DoorAction_Fail) when it fails. Votes are never game
+ * state: nothing goes into the inputs.
+ *
+ * Who votes (vote_eligible): the players in the game; not spectators, a dedicated server's own
+ * player or a PC still joining. A call counts as its caller's Yes, and an answer can be changed
+ * while the vote is on. It ends after VOTE_MS, or once every player answered; it passes when at
+ * least half of the players answered Yes (yes * 2 >= players, those still playing at the end).
+ * Its command follows VOTE_ACT_MS later.
+ *
+ * Player numbers (/players, /vote kick <number>): pid_of gives each internet address the next
+ * number when its first player comes (add_link, free_place), from 1, kept for as long as this PC
+ * hosts; a listen host's own player is 1. Players at one address (one PC, one router, CGNAT) share
+ * the number, so a kick by a number that means more than one of them asks for the name.
+ *
+ * A map change (map_change; also the dedicated server's console `map`) needs no new hosting: the
+ * host's level reloads into its lobby with the map's folder put in the custom level's slot first
+ * (level_load, g_next_folder), and the warm-up starts at once, alone, as after any hosting. Each
+ * joiner hears it (PktVote.acted, three times) and reloads with g_dl_level set, and the folder put
+ * in place first when it has one: the load asks the host for the map's file list, downloads the
+ * files that differ (none when it has the same map) and mounts it, as for a host that went to
+ * another map (2026-11-12). The host's lobby waits for the players who were there (CHANGE_WAIT_MS
+ * at most) and starts the warm-up with all of them; one later joins it in progress. A joiner that missed every
+ * word does the same VOTE_LATE_MS after the command was due; one that didn't is refused at the
+ * lobby for the map, and that refusal starts the same download (map_download_start). */
+
+#define VOTE_MS         (NET_VOTE_SECONDS * 1000)
+#define VOTE_ACT_MS     3000
+#define VOTE_SHOW_MS    4000         /* the result stays on screen this long (after the command) */
+#define VOTE_SEND_MS    250
+#define VOTE_LATE_MS    2000
+#define VOTE_KICK_MIN   5
+
+static struct {
+	u32 id, state, kind;
+	u32 ends, act_at, shown_to, last_send;
+	int caller, acted;
+	u32 final[3];              /* yes, no and players when it ended (the result shows them, not later counts) */
+	u32 host_id;               /* the host's player's answer is for this vote... */
+	int host_ans;              /* ...1 yes, 2 no */
+	char caller_name[MP_NAME_MAX], subject[64], reason[64], folder[64];
+	SOCKADDR_IN target;        /* kick: the player's PC */
+} g_vote;
+/* joiner: the host's vote as its last PKT_VOTE said, and this PC's answer on its way */
+static PktVote g_vrx;
+static u32 g_vrx_at, g_vrx_acted, g_vrx_cast_id;
+static int g_vrx_cast;
+/* every PC: the vote whose start and result the chat has said, and when the result came */
+static u32 g_vn_id, g_vn_state, g_vn_result_at;
+static int g_vn_y, g_vn_n;     /* Y and N were down */
+
+static void vote_reset(void)
+{
+	u32 id = g_vote.id;
+	memset(&g_vote, 0, sizeof g_vote);
+	g_vote.id = id;            /* (the next one is still new to every PC) */
+	memset(&g_vrx, 0, sizeof g_vrx);
+	g_vrx_at = g_vrx_acted = g_vrx_cast_id = 0;
+	g_vrx_cast = 0;
+	g_vn_id = g_vn_state = g_vn_result_at = 0;
+	g_next_folder[0] = 0;
+	g_change_until = 0;
+}
+
+u32 net_player_id(int slot)
+{
+	if (slot < 0 || slot >= NPL) return 0;
+	if (g_mode == NET_HOST) return slot == 0 ? g_pid_host : g_link[slot].used ? pid_of(g_link[slot].addr.addr, 0) : 0;
+	return g_mode == NET_JOIN ? g_slot_pid[slot] : 0;
+}
+
+/* host: player p may vote: one of the players in the game (the lobby's or the session's) */
+static int vote_eligible(int p)
+{
+	if (g_mode != NET_HOST || p < 0 || p >= NPL || watches(p)) return 0;   /* spectators; a dedicated server's own */
+	if (p == 0) return !players_spectate_wanted();
+	if (!g_link[p].used || gone(p)) return 0;
+	return g_state == S_LOBBY || !(g_link[p].waiting || g_link[p].rejoin || g_link[p].joining);
+}
+
+static int vote_answer(int p)
+{
+	if (p == 0) return g_vote.host_id == g_vote.id ? g_vote.host_ans : 0;
+	return p > 0 && p < NPL && g_link[p].used && g_link[p].vote_id == g_vote.id ? g_link[p].vote_ans : 0;
+}
+
+static void vote_count(u32 *yes, u32 *no, u32 *voters)
+{
+	*yes = *no = *voters = 0;
+	for (int p = 0; p < NPL; p++) {
+		int a;
+		if (!vote_eligible(p)) continue;
+		(*voters)++;
+		a = vote_answer(p);
+		*yes += a == 1;
+		*no += a == 2;
+	}
+}
+
+/* "change the map to X" / "kick X (reason)" */
+static void vote_what(char *out, u32 size, u32 kind, const char *subject, const char *reason)
+{
+	char t[200];
+	if (kind == NET_VOTE_MAP) fmt(t, "change the map to %s", subject);
+	else if (reason[0]) fmt(t, "kick %s (%s)", subject, reason);
+	else fmt(t, "kick %s", subject);
+	str_cpy(out, size, t);
+}
+
+/* Every PC: the vote's start and result in the chat, with their sounds, once each */
+static void vote_note(u32 id, u32 state, u32 kind, const char *caller, const char *subject, const char *reason)
+{
+	char what[160], t[CHAT_MAX + 200];
+
+	if (!id || state == NET_VOTE_NONE || state > NET_VOTE_FAILED) return;
+	if (id != g_vn_id) {
+		g_vn_id = id;
+		g_vn_state = NET_VOTE_NONE;
+		g_vn_result_at = 0;
+	}
+	if (state == g_vn_state) return;
+	if (state != NET_VOTE_OPEN && g_vn_state != NET_VOTE_OPEN) {   /* the result of a vote never seen: not news here */
+		g_vn_state = state;
+		return;
+	}
+	vote_what(what, sizeof what, kind, subject, reason);
+	if (state == NET_VOTE_OPEN) {
+		fmt(t, "%s called a vote: %s. Y: yes, N: no", caller, what);
+		mp_sound("objective_prompt");
+	} else {
+		fmt(t, state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
+		mp_sound(state == NET_VOTE_PASSED ? "objective_complete" : "door_fail");
+		g_vn_result_at = GetTickCount() | 1;
+	}
+	t[CHAT_MAX - 1] = 0;
+	chat_server(t);
+	g_vn_state = state;
+}
+
+static void vote_send(int l, u32 now)
+{
+	PktVote p;
+	memset(&p, 0, sizeof p);
+	head(&p.h, PKT_VOTE);
+	p.id = g_vote.id;
+	p.state = g_vote.state;
+	p.kind = g_vote.kind;
+	p.acted = g_vote.acted;
+	vote_count(&p.yes, &p.no, &p.voters);
+	if (g_vote.state != NET_VOTE_OPEN) p.yes = g_vote.final[0], p.no = g_vote.final[1], p.voters = g_vote.final[2];
+	if (g_vote.state == NET_VOTE_OPEN) p.ms_left = (int)(g_vote.ends - now) > 0 ? g_vote.ends - now : 0;
+	else if (g_vote.state == NET_VOTE_PASSED && !g_vote.acted) p.ms_left = (int)(g_vote.act_at - now) > 0 ? g_vote.act_at - now : 0;
+	p.mine = (u32)vote_answer(l);
+	p.may = (u32)vote_eligible(l);
+	str_cpy(p.caller, sizeof p.caller, g_vote.caller_name);
+	str_cpy(p.subject, sizeof p.subject, g_vote.subject);
+	str_cpy(p.reason, sizeof p.reason, g_vote.reason);
+	str_cpy(p.folder, sizeof p.folder, g_vote.folder);
+	send_link(l, &p, sizeof p);
+}
+
+static void vote_send_all(void)
+{
+	u32 now = GetTickCount();
+	for (int l = 1; l < NPL; l++)
+		if (g_link[l].used && !gone(l)) vote_send(l, now);
+	g_vote.last_send = now;
+}
+
+/* host: what's wrong with changing to the map `what` names; 0: folder and name filled */
+static const char *vote_check_map(const char *what, char *folder, char *name)
+{
+	static char why[CHAT_MAX];
+	char t[512], other[96], full[96];
+	const char *cur = custom_game_level_folder(g_level);
+	int spawns = 0, r;
+
+	if (!*what) return "Usage: /vote map <the map's folder or name>";
+	if (!cur) return "Map votes need the game to be on a CustomLevels map.";
+	r = custom_game_find_map(what, folder, 64, full, sizeof full, other, sizeof other, &spawns);
+	str_cpy(name, 64, full);
+	if (!r) fmt(t, "The server has no map called %s.", what);
+	else if (r < 0) fmt(t, "More than one map fits %s (%s, %s): type more of it.", what, full, other);
+	else if (spawns < 2) fmt(t, "%s isn't a multiplayer map (%d player spawn point%s).", full, spawns, spawns == 1 ? "" : "s");
+	else if (str_len(cur) == str_len(folder) && str_ieq_n(cur, folder, str_len(folder))) fmt(t, "%s is the map already.", full);
+	else if ((u32)spawns + (g_dedicated != 0) < places_taken())   /* (a dedicated server's own uses Konoko's placement) */
+		fmt(t, "%s has room for %d players; %d are here.", full, spawns, places_taken() - (g_dedicated != 0));
+	else return 0;
+	str_cpy(why, sizeof why, t);
+	return why;
+}
+
+/* host: a player present to be named (the host's own, a joiner not gone) */
+static int vote_present(int p)
+{
+	if (p == 0) return !g_dedicated;
+	return p > 0 && p < NPL && g_link[p].used && !gone(p);
+}
+
+/* host: whom "/vote kick <args>" means: a number from /players, else the longest present player's
+ * name the text starts with, else the one name that starts with its first word; *reason: the rest */
+static const char *vote_check_kick(int caller, const char *args, int *target, const char **reason)
+{
+	static char why[CHAT_MAX];
+	int best = -1, best_len = 0, found = -1, count = 0, e = 0, digits = 1;
+	u32 id = 0;
+
+	if (!*args) return "Usage: /vote kick <player's name, or number from /players> [reason]";
+	while (args[e] && args[e] != ' ') {
+		digits &= args[e] >= '0' && args[e] <= '9';
+		if (digits) id = id * 10 + (u32)(args[e] - '0');
+		e++;
+	}
+	if (digits && e <= 4) {   /* a number: the players at that address */
+		*reason = skip_space(args + e);
+		if (id && id == g_pid_host) return "The host can't be kicked.";
+		for (int l = 1; l < NPL; l++)
+			if (vote_present(l) && id && pid_of(g_link[l].addr.addr, 0) == id) found = l, count++;
+		if (!count) fmt(why, "Nobody here has the number %d (/players lists them).", id);
+		else if (count > 1) fmt(why, "Number %d is %d players at one internet address: /vote kick <name> instead.", id, count);
+		if (count != 1) return why;
+		*target = found;
+	} else {
+		for (int p = 0; p < NPL; p++) {
+			const char *nm = mp_name(p);
+			int k = (int)str_len(nm);
+			if (!vote_present(p) || !k) continue;
+			if (k > best_len && str_ieq_n(args, nm, (u32)k) && (args[k] == ' ' || !args[k])) best = p, best_len = k;
+		}
+		if (best >= 0) {
+			*target = best;
+			*reason = skip_space(args + best_len);
+		} else {
+			for (int p = 0; p < NPL; p++)
+				if (vote_present(p) && mp_name(p)[0] && str_ieq_n(mp_name(p), args, (u32)e)) found = p, count++;
+			if (count > 1) return "More than one player's name starts with that: type more of it, or the number from /players.";
+			if (!count) return "No player here has that name (/players lists them).";
+			*target = found;
+			*reason = skip_space(args + e);
+		}
+	}
+	if (*target == 0) return "The host can't be kicked.";
+	if (*target == caller) return "You can't vote to kick yourself.";
+	return 0;
+}
+
+/* host: player p calls a vote ("map <name>" / "kick <player> [reason]"); 0, or why not */
+static const char *vote_call(int p, const char *text)
+{
+	char kind[8], folder[64], name[64], what[160];
+	const char *args = skip_space(text), *err, *reason = "";
+	u32 n = 0, k;
+	int target = -1;
+
+	while (args[n] && args[n] != ' ' && n < sizeof kind - 1) kind[n] = args[n], n++;
+	kind[n] = 0;
+	while (args[n] && args[n] != ' ') n++;
+	args = skip_space(args + n);
+	if (g_vote.state == NET_VOTE_OPEN) return "A vote is on already: answer it with Y or N.";
+	if (g_vote.state == NET_VOTE_PASSED && !g_vote.acted) return "The last vote passed: its command comes first.";
+	if (!vote_eligible(p)) return "Only players can call a vote, not spectators.";
+	if (str_len(kind) == 3 && str_ieq_n(kind, "map", 3)) {
+		if ((err = vote_check_map(args, folder, name))) return err;
+		k = NET_VOTE_MAP;
+	} else if (str_len(kind) == 4 && str_ieq_n(kind, "kick", 4)) {
+		if ((err = vote_check_kick(p, args, &target, &reason))) return err;
+		k = NET_VOTE_KICK;
+		str_cpy(name, sizeof name, mp_name(target));
+		folder[0] = 0;
+	} else {
+		return "Usage: /vote map <map>, or /vote kick <player> [reason]";
+	}
+	g_vote.id = g_vote.id ? g_vote.id + 1 : (GetTickCount() * 2654435761u ^ g_server_id) | 1;
+	if (!g_vote.id) g_vote.id = 1;
+	g_vote.state = NET_VOTE_OPEN;
+	g_vote.kind = k;
+	g_vote.ends = GetTickCount() + VOTE_MS;
+	g_vote.acted = 0;
+	g_vote.caller = p;
+	str_cpy(g_vote.caller_name, sizeof g_vote.caller_name, mp_name(p));
+	str_cpy(g_vote.subject, sizeof g_vote.subject, name);
+	str_cpy(g_vote.reason, sizeof g_vote.reason, reason);
+	clean_text(g_vote.reason, sizeof g_vote.reason);
+	str_cpy(g_vote.folder, sizeof g_vote.folder, folder);
+	memset(&g_vote.target, 0, sizeof g_vote.target);
+	if (target > 0) g_vote.target = g_link[target].addr;
+	if (p == 0) g_vote.host_id = g_vote.id, g_vote.host_ans = 1;   /* the caller's Yes */
+	else g_link[p].vote_id = g_vote.id, g_link[p].vote_ans = 1;
+	vote_what(what, sizeof what, k, g_vote.subject, g_vote.reason);
+	log_msg("net: %s (player %d) called a vote: %s", g_vote.caller_name, p + 1, what);
+	vote_note(g_vote.id, g_vote.state, g_vote.kind, g_vote.caller_name, g_vote.subject, g_vote.reason);
+	vote_send_all();
+	return 0;
+}
+
+/* host: player p answers vote id */
+static const char *vote_cast(int p, u32 id, int yes)
+{
+	if (g_vote.state != NET_VOTE_OPEN || id != g_vote.id) return "No vote is on.";
+	if (!vote_eligible(p)) return "Only players vote, not spectators.";
+	if (p == 0) g_vote.host_id = id, g_vote.host_ans = yes ? 1 : 2;
+	else g_link[p].vote_id = id, g_link[p].vote_ans = yes ? 1 : 2;
+	log_msg("net: %s (player %d) voted %s", mp_name(p), p + 1, yes ? "yes" : "no");
+	g_vote.last_send = 0;   /* the new count at once */
+	return 0;
+}
+
+/* host: a joiner's chat message to CHAT_VOTE: "call <what>", "yes <id>" or "no <id>" */
+static void vote_message(int l, const char *text)
+{
+	const char *err = "?";
+	u32 id = 0;
+	int yes = str_ieq_n(text, "yes ", 4);
+
+	if (str_ieq_n(text, "call ", 5)) {
+		err = vote_call(l, text + 5);
+	} else if (yes || str_ieq_n(text, "no ", 3)) {
+		for (const char *s = skip_space(text + (yes ? 4 : 3)); *s >= '0' && *s <= '9'; s++) id = id * 10 + (u32)(*s - '0');
+		err = vote_cast(l, id, yes);
+	}
+	if (err && chat_link(l)) chat_queue(l, CHAT_SERVER, CHAT_ALL, err);   /* to that player alone */
+}
+
+/* host: the voted map in place of this one, without hosting again (see above) */
+static void map_change(const char *folder, const char *name)
+{
+	if (!custom_game_level_dir(g_level)) return;
+	log_msg("net: the map changes to %s (CustomLevels\\%s): reloading level %d into the lobby", name, folder, g_level);
+	if (g_dedicated) server_print("Changing the map to %s.", name);
+	str_cpy(g_vote.folder, sizeof g_vote.folder, folder);
+	g_vote.acted = 1;
+	for (int i = 0; i < 3; i++) vote_send_all();   /* every joiner reloads too (each gets the map if it must) */
+	str_cpy(g_next_folder, sizeof g_next_folder, folder);
+	g_change_players = places_taken();   /* (the server's own place included, as lobby_players counts it) */
+	g_change_until = (GetTickCount() + CHANGE_WAIT_MS) | 1;
+	g_quiet_end = 1;   /* no goodbye: nobody leaves */
+	session_end("the map changes");
+	g_quiet_end = 0;
+	g_match_pending = 0;
+	g_countdown_end = 0;
+	g_load_step = "Changing the map";
+	reload_level(g_level, 0);
+}
+
+/* host: a passed vote's command */
+static void vote_act(void)
+{
+	if (g_vote.kind == NET_VOTE_MAP) {
+		map_change(g_vote.folder, g_vote.subject);
+		return;
+	}
+	g_vote.acted = 1;
+	{
+		int l = link_of(&g_vote.target);
+		if (l > 0 && !gone(l)) kick_link(l, VOTE_KICK_MIN, g_vote.reason, 1);
+		else log_msg("net: %s left before the vote's kick", g_vote.subject);
+	}
+	vote_send_all();
+}
+
+/* joiner: the host changes the map: this PC reloads too, getting the map from the host (not when
+ * it's on that map already: it came after the change) */
+static void joiner_change_map(const char *folder)
+{
+	char f[64];
+	const char *cur = custom_game_level_folder(g_level);
+
+	str_cpy(f, sizeof f, folder);
+	if (cur && str_len(cur) == str_len(f) && str_ieq_n(cur, f, str_len(f))) return;
+	if (!folder_name_ok(f) || !custom_game_level_dir(g_level)) {
+		log_msg("net: the host changes the map to \"%s\": not a folder name, or this PC isn't on a custom map", f);
+		return;
+	}
+	log_msg("net: the host changes the map to CustomLevels\\%s: reloading level %d, getting the map from the host", f, g_level);
+	if (custom_game_has_folder(f)) str_cpy(g_next_folder, sizeof g_next_folder, f);   /* the host's version decides */
+	g_dl_level = g_level;
+	g_dl_declined = 0;
+	g_over_lost = 1;
+	g_quiet_end = 1;
+	session_end("the host changes the map");
+	g_quiet_end = 0;
+	g_match_pending = 0;
+	g_go_taken = g_cu_failed = 0;   /* the host's new session numbers aren't repeats */
+	g_cover_pending = 1;            /* one loading popup until this PC is in the warm-up */
+	g_load_step = "Changing the map";
+	reload_level(g_level, 0);
+}
+
+static void vote_received(const u8 *buf, u32 n)
+{
+	PktVote v;
+
+	memcpy(&v, buf, sizeof v);
+	v.caller[sizeof v.caller - 1] = v.subject[sizeof v.subject - 1] = v.reason[sizeof v.reason - 1] = 0;
+	v.folder[sizeof v.folder - 1] = 0;
+	clean_text(v.caller, sizeof v.caller);
+	clean_text(v.subject, sizeof v.subject);
+	clean_text(v.reason, sizeof v.reason);
+	if (!v.id || v.state > NET_VOTE_FAILED || v.ms_left > 2 * VOTE_MS) return;
+	g_vrx = v;
+	g_vrx_at = GetTickCount();
+	vote_note(v.id, v.state, v.kind, v.caller, v.subject, v.reason);
+	if (v.kind == NET_VOTE_MAP && v.state == NET_VOTE_PASSED && v.acted && g_vrx_acted != v.id) {
+		g_vrx_acted = v.id;
+		joiner_change_map(v.folder);
+	}
+}
+
+/* Every frame: the host's vote ends and its command; a joiner whose host went quiet changes
+ * the map itself. 1: the level is being reloaded. */
+static int vote_frame(u32 now)
+{
+	u32 yes, no, voters;
+
+	if (g_mode == NET_JOIN) {
+		if (g_vrx.id && g_vrx.kind == NET_VOTE_MAP && g_vrx.state == NET_VOTE_PASSED && g_vrx_acted != g_vrx.id &&
+		    g_vn_id == g_vrx.id && (int)(now - g_vrx_at) > (int)g_vrx.ms_left + VOTE_LATE_MS) {
+			log_msg("net: no word from the host since its map vote passed: changing the map here too");
+			g_vrx_acted = g_vrx.id;
+			joiner_change_map(g_vrx.folder);
+			return 1;
+		}
+		return 0;
+	}
+	if (g_mode != NET_HOST || !g_vote.id) return 0;
+	if (g_vote.state == NET_VOTE_OPEN) {
+		vote_count(&yes, &no, &voters);
+		if ((int)(now - g_vote.ends) >= 0 || yes + no >= voters) {
+			int pass = voters && yes * 2 >= voters;
+			char what[160];
+			g_vote.final[0] = yes, g_vote.final[1] = no, g_vote.final[2] = voters;
+			g_vote.state = pass ? NET_VOTE_PASSED : NET_VOTE_FAILED;
+			g_vote.act_at = now + VOTE_ACT_MS;
+			g_vote.shown_to = now + (pass ? VOTE_ACT_MS : 0) + VOTE_SHOW_MS;
+			g_vote.last_send = 0;
+			vote_what(what, sizeof what, g_vote.kind, g_vote.subject, g_vote.reason);
+			log_msg("net: the vote to %s %s: %d yes, %d no, %d players", what, pass ? "passed" : "failed", yes, no, voters);
+			vote_note(g_vote.id, g_vote.state, g_vote.kind, g_vote.caller_name, g_vote.subject, g_vote.reason);
+		}
+	}
+	if (g_vote.state == NET_VOTE_PASSED && !g_vote.acted && (int)(now - g_vote.act_at) >= 0) {
+		vote_act();
+		return g_state == S_IDLE;
+	}
+	if ((g_vote.state == NET_VOTE_OPEN || (int)(now - g_vote.shown_to) < 0) && now - g_vote.last_send >= VOTE_SEND_MS)
+		vote_send_all();
+	return 0;
+}
+
+/* Y and N answer the vote, while this window has the keyboard and nothing else takes the keys */
+static void vote_keys(void)
+{
+	int y = (GetAsyncKeyState('Y') & 0x8000) != 0, n = (GetAsyncKeyState('N') & 0x8000) != 0;
+	int yes = y && !g_vn_y, no = n && !g_vn_n;
+	NetVote v;
+
+	g_vn_y = y;
+	g_vn_n = n;
+	if (!(yes || no) || (yes && no)) return;
+	if (!focused() || chat_blocking() || live_menu_open() || char_menu_open() || fx_menu_open() || mp_name_editing() || server_running()) return;
+	if (!net_vote(&v) || v.state != NET_VOTE_OPEN || !v.may || v.mine == (yes ? 1 : 2)) return;
+	net_vote_cast(yes);
+}
+
+int net_vote(NetVote *v)
+{
+	u32 now = GetTickCount(), yes, no, voters;
+
+	memset(v, 0, sizeof *v);
+	if (g_mode == NET_HOST) {
+		if (!g_vote.id || g_vote.state == NET_VOTE_NONE) return 0;
+		if (g_vote.state != NET_VOTE_OPEN && (int)(now - g_vote.shown_to) >= 0) return 0;
+		vote_count(&yes, &no, &voters);
+		if (g_vote.state != NET_VOTE_OPEN) yes = g_vote.final[0], no = g_vote.final[1], voters = g_vote.final[2];
+		v->yes = (int)yes, v->no = (int)no, v->voters = (int)voters;
+		v->state = (int)g_vote.state;
+		v->kind = (int)g_vote.kind;
+		if (g_vote.state == NET_VOTE_OPEN) v->ms_left = (int)(g_vote.ends - now) > 0 ? (int)(g_vote.ends - now) : 0;
+		else if (!g_vote.acted) v->ms_left = (int)(g_vote.act_at - now) > 0 ? (int)(g_vote.act_at - now) : 0;
+		v->mine = vote_answer(0);
+		v->may = vote_eligible(0);
+		str_cpy(v->caller, sizeof v->caller, g_vote.caller_name);
+		str_cpy(v->subject, sizeof v->subject, g_vote.subject);
+		str_cpy(v->reason, sizeof v->reason, g_vote.reason);
+		return 1;
+	}
+	if (g_mode != NET_JOIN || !g_vrx.id) return 0;
+	{
+		int age = (int)(now - g_vrx_at), left = (int)g_vrx.ms_left - age;
+		if (g_vrx.state == NET_VOTE_OPEN) {
+			if (left < -VOTE_LATE_MS) return 0;   /* the host went quiet */
+		} else if (g_vn_id != g_vrx.id || g_vn_state != g_vrx.state || !g_vn_result_at ||
+		           (int)(now - g_vn_result_at) >= (g_vrx.state == NET_VOTE_PASSED ? VOTE_ACT_MS : 0) + VOTE_SHOW_MS) {
+			return 0;
+		}
+		v->ms_left = left > 0 ? left : 0;
+	}
+	v->state = (int)g_vrx.state;
+	v->kind = (int)g_vrx.kind;
+	v->yes = (int)g_vrx.yes, v->no = (int)g_vrx.no, v->voters = (int)g_vrx.voters;
+	v->mine = g_vrx_cast_id == g_vrx.id && g_vrx_cast ? g_vrx_cast : (int)g_vrx.mine;
+	v->may = g_vrx.may != 0;
+	str_cpy(v->caller, sizeof v->caller, g_vrx.caller);
+	str_cpy(v->subject, sizeof v->subject, g_vrx.subject);
+	str_cpy(v->reason, sizeof v->reason, g_vrx.reason);
+	return 1;
+}
+
+const char *net_vote_call(const char *args)
+{
+	char t[CHAT_MAX];
+
+	if (g_mode == NET_OFF || !ONgGameState) return "Votes are for network games.";
+	if (g_mode == NET_HOST) return vote_call(0, args);
+	if (!chat_link(0)) return "The host isn't answering: no vote now.";
+	if (g_vrx.state == NET_VOTE_OPEN && net_vote(&(NetVote){ 0 })) return "A vote is on already: answer it with Y or N.";
+	if (players_spectate_wanted()) return "Only players can call a vote, not spectators.";
+	fmt(t, "call ");
+	str_cpy(t + 5, sizeof t - 5, args);
+	chat_queue(0, (u32)g_slot, CHAT_VOTE, t);   /* the host says it to everyone, or why not to this PC */
+	return 0;
+}
+
+const char *net_vote_cast(int yes)
+{
+	char t[32];
+	NetVote v;
+
+	if (g_mode == NET_HOST) return vote_cast(0, g_vote.id, yes);
+	if (g_mode != NET_JOIN || !net_vote(&v) || v.state != NET_VOTE_OPEN) return "No vote is on.";
+	if (!v.may) return "Only players vote, not spectators.";
+	if (!chat_link(0)) return "The host isn't answering.";
+	fmt(t, "%s %u", yes ? "yes" : "no", g_vrx.id);
+	chat_queue(0, (u32)g_slot, CHAT_VOTE, t);
+	g_vrx_cast_id = g_vrx.id;
+	g_vrx_cast = yes ? 1 : 2;
+	return 0;
+}
+
+/* The dedicated server's console: map <name>, at once (an open vote is called off) */
+const char *net_server_map(const char *what)
+{
+	char folder[64], name[64], t[CHAT_MAX];
+	const char *err;
+
+	if (g_mode != NET_HOST) return "Not hosting.";
+	if ((err = vote_check_map(what, folder, name))) return err;
+	if (g_vote.state == NET_VOTE_OPEN || (g_vote.state == NET_VOTE_PASSED && !g_vote.acted)) {
+		g_vote.state = NET_VOTE_NONE;
+		log_msg("net: the open vote is called off: the console changes the map");
+	}
+	fmt(t, "Changing the map to %s.", name);
+	t[CHAT_MAX - 1] = 0;
+	net_server_say(t);
+	g_vote.kind = NET_VOTE_MAP;
+	if (!g_vote.id) g_vote.id = (GetTickCount() * 2654435761u ^ g_server_id) | 1;
+	else g_vote.id++;
+	g_vote.state = NET_VOTE_PASSED;   /* (what joiners read the change from: a vote they never saw open, so no line) */
+	g_vote.shown_to = GetTickCount();
+	str_cpy(g_vote.subject, sizeof g_vote.subject, name);
+	g_vote.reason[0] = 0;
+	g_vote.caller_name[0] = 0;
+	map_change(folder, name);
+	return 0;
+}
+
 /* ---- Install ------------------------------------------------------------------------------ */
 
 static int resolve(const char *spec, SOCKADDR_IN *out)
@@ -7393,6 +8469,16 @@ static void net_prepare(void)
 	sounds_install();
 }
 
+/* Every level load net.c sees: a joiner's map download, a host's map change (a vote's) */
+static void load_install(void)
+{
+	static int done;
+	if (done) return;
+	done = 1;
+	if (patch_call(ONcLevelLoad_TMCall, (u32)TMrLevel_Load, (u32)level_load))
+		log_msg("net: a map that differs from the host's is downloaded while the level loads; a voted map is put in place");
+}
+
 /* The joiner's view, sounds and map download. Every patch only changes anything while this PC
  * is joining (view_character, g_dl_level), so hosting or playing alone later is as before. */
 static void join_install(void)
@@ -7400,8 +8486,7 @@ static void join_install(void)
 	if (g_join_installed) return;
 	g_join_installed = 1;
 	view_install();
-	if (patch_call(ONcLevelLoad_TMCall, (u32)TMrLevel_Load, (u32)level_load))
-		log_msg("net: a map that differs from the host's is downloaded while the level loads");
+	load_install();
 	if (!patch_call(ONcLevelStart_FadeCall, ONrFade_Frame, (u32)level_fade_frame))
 		log_msg("net: the level start's black frame at 0x%x isn't the expected call: a joiner may see it flash", ONcLevelStart_FadeCall);
 	sounds_join_install();
@@ -7437,6 +8522,8 @@ static void net_leave(void)
 	 * this PC to catch up with it was taken for a late repeat and ignored (the rejoin never got in) */
 	g_go_taken = g_cu_failed = 0;
 	players_spectate_want(0);   /* a new game starts playing */
+	vote_reset();
+	memset(g_slot_pid, 0, sizeof g_slot_pid);
 	g_ded_host = 0;
 	g_kick_note[0] = 0;
 	players_set_dedicated(g_dedicated && g_mode == NET_HOST);   /* (a dedicated server never leaves: quit closes Oni) */
@@ -7468,7 +8555,8 @@ u32 net_host_char_rules_saved(void)
 	       (GetPrivateProfileIntA("host", "fast_screamer", 0, ini_path()) ? NET_MUT_FAST_SCREAMER : 0) |
 	       (GetPrivateProfileIntA("host", "fast_plasma", 0, ini_path()) ? NET_MUT_FAST_PLASMA : 0) |
 	       (GetPrivateProfileIntA("host", "bombs", 0, ini_path()) ? NET_MUT_BOMBS : 0) |
-	       (GetPrivateProfileIntA("host", "fast_ball", 0, ini_path()) ? NET_MUT_FAST_BALL : 0);
+	       (GetPrivateProfileIntA("host", "fast_ball", 0, ini_path()) ? NET_MUT_FAST_BALL : 0) |
+	       (GetPrivateProfileIntA("host", "jamming_guns", 0, ini_path()) ? NET_MUT_JAMMING : 0);
 }
 
 void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules)
@@ -7486,6 +8574,8 @@ void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, 
 	motd_load();
 	g_server_id = GetTickCount() * 2654435761u ^ (u32)GetCurrentProcessId();
 	net_prepare();
+	load_install();
+	pid_start();
 	log_msg("net: hosting \"%s\" on UDP port %d, %d players, %d min, %d points; mutators %02x", g_server_name, g_port,
 	        g_max_players, g_time_limit, g_score_limit, g_char_rules);
 }
@@ -7729,6 +8819,20 @@ void net_install(void)
 	if (port < 1 || port > 65535) port = DEFAULT_PORT;
 	g_port = (u16)port;
 
+	{   /* a recording to play again, no network (see "Playback") */
+		char pb[MAX_PATH];
+		if (GetEnvironmentVariableA("ARKLITE_PLAYBACK", pb, sizeof pb) && pb[0]) {
+			if (!pb_load(pb)) { log_msg("playback: nothing to play, networking off"); return; }
+			g_playback = 1;
+			g_mode = NET_JOIN;
+			g_startup_mode = 1;
+			g_join[0] = 0;
+			net_prepare();
+			join_install();
+			log_msg("playback: the level loads in its lobby, then the recording plays (ARKLITE_AUTOSTART must be its map)");
+			return;
+		}
+	}
 	if (GetEnvironmentVariableA("ARKLITE_DEDICATED", ded_env, sizeof ded_env)) {   /* <map folder>[:port] */
 		const char *colon = ded_env;
 		while (*colon && *colon != ':') colon++;
@@ -7759,7 +8863,7 @@ void net_install(void)
 	        g_mode == NET_HOST ? "hosting" : "joining", g_delay, g_mode == NET_HOST ? "joiner" : "host");
 	net_prepare();
 	if (g_mode == NET_JOIN) join_install(), g_cover_pending = 1;
-	else view_install();   /* a watching host's view */
+	else view_install(), load_install(), pid_start();   /* a watching host's view; the map a vote picks */
 	if (g_mode == NET_HOST && ded_env[0]) dedicated_begin();
 	/* a second Oni on the same PC, for testing: skip "There is already an instance". Daodan
 	 * replaces Oni's platform setup (0x50f670) with DD_ONrPlatform_Initialize, which checks
