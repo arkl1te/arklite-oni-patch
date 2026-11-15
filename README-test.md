@@ -5,13 +5,13 @@ Arklite release without changing it: your release, its options and its saves sta
 
 ## Install
 
-You need Arklite's release installed first.
-
-1. Extract this zip anywhere.
+1. Extract this zip anywhere (inside Oni's AE folder is the surest).
 2. Windows: double-click `install-test.bat`. Linux: run `./install-test.sh`.
+   It finds Oni's AE folder by itself; with more than one Oni it asks which, and with none it asks for the path.
 3. Start Oni as usual. The bottom of the screen shows **Arklite test** and the build's commit.
 
 The first time, your options and saves are copied for the test build. It plays with those copies only.
+Without Arklite's release in that folder the test build still works; switched off, Oni then runs without Arklite.
 
 ## While testing
 

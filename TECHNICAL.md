@@ -763,7 +763,11 @@ that matches `VERSION` it publishes a release with the zip attached.
 
 **Test builds**: `./package.sh test` makes `dist/Arklite-test-<commit>.zip` from a clean commit
 (it refuses uncommitted changes). Testers install it beside their release with `install-test.bat`
-or `install-test.sh` (see `README-test.md` in the zip). It lives in `AE/arklite-test/`:
+or `install-test.sh` (see `README-test.md` in the zip). They find Oni's AE folder themselves: the
+folder they're in and the ones around it, then (Windows) the Oni that Windows has registered and
+`Oni\AE`, `Games\Oni\AE` and `Program Files\Oni\AE` on every drive, or (Linux) the Wine prefixes in
+the home folder; with more than one they ask which. A release in that folder isn't required: they keep
+AE's Bink and put Arklite's loader in as `install.bat` does. It lives in `AE/arklite-test/`:
 
 - **Its files**: its own `Arklite.ini`, logs, custom-level saves and Oni's `persist.dat`, copied from
   the release's at the first install. The release's files are never read or written by it.
