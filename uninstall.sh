@@ -17,9 +17,15 @@ is_loader() { [ -L "$1" ] || { [ -f "$1" ] && grep -aqF "$MARKER" "$1"; }; }
 PURGE=0
 [ "${1:-}" = --purge ] && { PURGE=1; shift; }
 AE="${1:-${ONI_AE_DIR:-}}"
+# Same search as install.sh, but only folders Arklite is installed in: the nearest folder around this
+# file wins (AE under this one, this one, AE next to it, then up), then the common Wine prefixes.
 if [ -z "$AE" ]; then
-	# Same search as install.sh, but only folders Arklite is installed in.
-	mapfile -t found < <(for c in "$HERE/.." "$HERE/../AE" "$HERE/../.." "$HOME"/.wine/drive_c/"Program Files"*/Oni/AE "$HOME"/Games/*/drive_c/"Program Files"*/Oni/AE \
+	for c in "$HERE/AE" "$HERE" "$HERE/../AE" "$HERE/.." "$HERE/../.."; do
+		[ -f "$c/Oni.exe" ] && [ -e "$c/Arklite.dll" ] && { AE="$(cd "$c" && pwd -P)"; break; }
+	done
+fi
+if [ -z "$AE" ]; then
+	mapfile -t found < <(for c in "$HOME"/.wine/drive_c/"Program Files"*/Oni/AE "$HOME"/Games/*/drive_c/"Program Files"*/Oni/AE \
 	                             "$HOME"/.local/share/bottles/bottles/*/drive_c/"Program Files"*/Oni/AE "$HOME"/Games/Oni/AE "$HOME"/Oni/AE; do
 		[ -e "$c/Arklite.dll" ] && (cd "$c" && pwd -P); done | sort -u)
 	case ${#found[@]} in

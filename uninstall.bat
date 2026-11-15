@@ -12,7 +12,8 @@ set "PURGE="
 if /i "%~1"=="/purge" ( set "PURGE=1" & shift )
 
 set "AE=%~1"
-for %%D in ("%HERE%.." "%HERE%..\AE" "%HERE%AE" "%HERE%..\.." "%ProgramFiles(x86)%\Oni\AE" "%ProgramFiles%\Oni\AE") do (
+rem The nearest folder wins, as in install.bat: AE under this one, this one, AE next to it, then up.
+for %%D in ("%HERE%AE" "%HERE%." "%HERE%..\AE" "%HERE%.." "%HERE%..\.." "%ProgramFiles(x86)%\Oni\AE" "%ProgramFiles%\Oni\AE") do (
 	if not defined AE if exist "%%~D\Oni.exe" if exist "%%~D\Arklite.dll" set "AE=%%~fD"
 )
 if not defined AE set /p "AE=Oni's AE folder (for example C:\Program Files (x86)\Oni\AE): "

@@ -18,8 +18,10 @@ if not exist "%HERE%Arklite.dll" ( echo error: Arklite.dll is not next to instal
 if not exist "%HERE%arklite_loader.dll" ( echo error: arklite_loader.dll is not next to install.bat & goto fail )
 
 set "AE=%~1"
-rem An AE folder has Oni.exe and realbink.dll (or bink_orig.dll once Arklite is in); Oni\ has no realbink.dll.
-for %%D in ("%HERE%.." "%HERE%..\AE" "%HERE%AE" "%HERE%..\.." "%ProgramFiles(x86)%\Oni\AE" "%ProgramFiles%\Oni\AE") do (
+rem An AE folder has Oni.exe and realbink.dll (or bink_orig.dll once Arklite is in). Oni\ can look the
+rem same (FPS Daodan's readme puts realbink.dll next to any Oni.exe), so the nearest folder wins: AE
+rem under this one, this one (the zip's files extracted straight into AE), then AE next to it, then up.
+for %%D in ("%HERE%AE" "%HERE%." "%HERE%..\AE" "%HERE%.." "%HERE%..\.." "%ProgramFiles(x86)%\Oni\AE" "%ProgramFiles%\Oni\AE") do (
 	if not defined AE if exist "%%~D\Oni.exe" if exist "%%~D\realbink.dll" set "AE=%%~fD"
 	if not defined AE if exist "%%~D\Oni.exe" if exist "%%~D\bink_orig.dll" set "AE=%%~fD"
 )

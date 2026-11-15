@@ -24,19 +24,32 @@ die() { echo "error: $*" >&2; exit 1; }
 # Arklite's loader: a link (development install) or a file with the marker (3.5 KB; Bink is ~280 KB).
 is_loader() { [ -L "$1" ] || { [ -f "$1" ] && grep -aqF "$MARKER" "$1"; }; }
 
+is_ae() { [ -f "$1/Oni.exe" ] && { [ -e "$1/realbink.dll" ] || [ -e "$1/bink_orig.dll" ]; }; }
+# Around this file the nearest folder wins: AE under this one, this one (the zip's files extracted
+# straight into AE), AE next to it, then up. Oni/ can look like AE (FPS Daodan's readme puts
+# realbink.dll next to any Oni.exe), so these are not a search for every match.
+find_near() {
+	local c
+	for c in "$HERE/AE" "$HERE" "$HERE/../AE" "$HERE/.." "$HERE/../.."; do
+		is_ae "$c" && { (cd "$c" && pwd -P); return 0; }
+	done
+	return 0
+}
 find_ae() {
 	local c
-	for c in "$HERE/.." "$HERE/../AE" "$HERE/../.." "$HOME"/.wine/drive_c/"Program Files (x86)"/Oni/AE \
+	for c in "$HOME"/.wine/drive_c/"Program Files (x86)"/Oni/AE \
 	         "$HOME"/.wine/drive_c/"Program Files"/Oni/AE \
 	         "$HOME"/Games/*/drive_c/"Program Files (x86)"/Oni/AE \
 	         "$HOME"/Games/*/drive_c/"Program Files"/Oni/AE \
 	         "$HOME"/.local/share/bottles/bottles/*/drive_c/"Program Files (x86)"/Oni/AE \
 	         "$HOME"/Games/Oni/AE "$HOME"/Oni/AE; do
-		[ -f "$c/Oni.exe" ] && { [ -e "$c/realbink.dll" ] || [ -e "$c/bink_orig.dll" ]; } && (cd "$c" && pwd -P)
+		is_ae "$c" && (cd "$c" && pwd -P)
 	done
+	return 0
 }
 
 AE="${1:-${ONI_AE_DIR:-}}"
+[ -n "$AE" ] || AE="$(find_near)"
 if [ -z "$AE" ]; then
 	mapfile -t found < <(find_ae | sort -u)
 	case ${#found[@]} in
