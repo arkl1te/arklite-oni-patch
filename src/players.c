@@ -1097,8 +1097,9 @@ static void present_tick(u32 present)
 }
 
 /* ---- Spectating (/spectate, /join) ------------------------------------------------------------ *
- * A player who watches has no part in the game: no character to hit, no score, not in the match's
- * result. Each PC's wish (chat.c sets it, players_spectate_want) is bit 11 of word 11 of every
+ * The host's /spectate (a joiner's moves its PC to a spectator's place instead, net.c "Spectators",
+ * so no one waits for it). A player who watches has no part in the game: no character to hit, no
+ * score, not in the match's result. Each PC's wish (chat.c sets it, players_spectate_want) is bit 11 of word 11 of every
  * record its player sends (PLAYERS_SPECTATE_FLAG; net.c make_input), a state rather than a
  * request, so a guessed record keeps it, a replay join rebuilds it and the first records after a
  * reload into the match park the player again. Every PC applies a change in the tick whose record

@@ -265,12 +265,18 @@ int  net_mutator_daodan(void);         /* the game has the Daodan mutator (never
  * no_weapons, fast_screamer, fast_plasma, bombs, fast_ball */
 u32  net_host_char_rules_saved(void);
 #define NET_PLAYERS_MAX     4      /* the Host dialog's Max players: 2 to this (a dedicated server's too) */
-#define NET_SLOTS           5      /* the netcode's places: slot 0 is the host's (a dedicated server's own,
+#define NET_PLAYER_SLOTS    5      /* the players' places: slot 0 is the host's (a dedicated server's own,
                                       always watching), so a dedicated server still takes NET_PLAYERS_MAX */
+#define NET_WATCHERS_MAX    3      /* spectators' places past them (the Join page's Spectate, a joiner's
+                                      /spectate): never in the session's players, so no one waits for them */
+#define NET_SLOTS           (NET_PLAYER_SLOTS + NET_WATCHERS_MAX)   /* the netcode's places (8 at most:
+                                      the history's and recordings' byte of player bits) */
 #define NET_TIME_LIMIT_MAX  999
 #define NET_SCORE_LIMIT_MAX 999
 #define NET_MOTD_MAX        (CHAT_MAX - 13)  /* the message of the day (Arklite.ini [host] motd): a chat line after "Server MOTD: " */
 void net_menu_join(const char *address);   /* host[:port] */
+void net_menu_join_as(const char *address, int watch);   /* watch: the Join page's Spectate */
+const char *net_spectate_move(int on);   /* a joiner's /spectate (1), /join (0): the line to show; 0 on the host */
 /* A dedicated server (server.c): hosting, with this PC's own player always watching and never
  * counted as one of the players; no drawing, no sound, a console for the admin */
 void net_menu_dedicated(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules);
@@ -359,6 +365,7 @@ typedef struct {
 	int desynced;              /* a state hash differed in this match */
 	u32 present;               /* the players in this lobby or match, a bit per player (gone ones not) */
 	u32 gone, left;            /* match: players who stopped answering, and of them those who left (they stand) */
+	u32 spectators;            /* the spectators' places taken (bits PLS..: net.c "Spectators"), this PC's own included */
 	int silent_ms, silent_who; /* match: nothing from that player's PC for this long (0: under 1.5 s) */
 	int lost;                  /* joiner's match: 1 the host stopped answering, 2 it left */
 	u32 time_limit;            /* the match's limits (the host's): minutes, 0 none */
@@ -376,9 +383,9 @@ typedef struct {
 /* What differs between the two PCs, so the host doesn't let the joiner in */
 enum {
 	NETBAD_PROTO = 1, NETBAD_DLL = 2, NETBAD_DAODAN = 4, NETBAD_DAODAN_INI = 8, NETBAD_LEVEL0 = 16,
-	NETBAD_MAP = 32, NETBAD_PLAYERS = 64, NETBAD_FULL = 128, NETBAD_KICKED = 256,
+	NETBAD_MAP = 32, NETBAD_PLAYERS = 64, NETBAD_FULL = 128, NETBAD_KICKED = 256, NETBAD_SPECTATE = 512,
 };
-#define NETBAD_LAST NETBAD_KICKED
+#define NETBAD_LAST NETBAD_SPECTATE
 const char *net_kick_note(void);   /* joiner: why the server removed this PC, and for how long ("" none) */
 /* Votes (net.c "Votes"): /vote map <name>, /vote kick <player> [reason]; the host runs them. A
  * vote lasts NET_VOTE_SECONDS; it passes when at least half of the players answered Yes, and its
@@ -671,7 +678,7 @@ void players_install(void);
 const u32 *players_begin_frame(void);         /* player 2's record for this frame, or 0 */
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
 /* Players in a game: slot 0 Konoko, 1..PLAYERS_MAX-1 the next Player-flagged placements */
-#define PLAYERS_MAX NET_SLOTS   /* places; a listen host's game has NET_PLAYERS_MAX at most */
+#define PLAYERS_MAX NET_PLAYER_SLOTS   /* places; a listen host's game has NET_PLAYERS_MAX at most */
 void players_net_frame(const u32 (*records)[6][12], u32 n);   /* networked: slot s's tick i gets records[s][i] (slot 0 unused) */
 void players_set_count(u32 n);                /* players spawned at the next level load (2 by default) */
 u32  players_count(void);

@@ -76,7 +76,7 @@ enum { ID_BOARD = 100, ID_OBJECTIVE, ID_ITEMS, ID_WEAPONS, ID_DIARY, ID_HELP, ID
 
 static WMtDialogProc g_stock;
 static int g_board;                /* the Scoreboard tab is up */
-static WMtWindow *g_mute[PLAYERS_MAX];
+static WMtWindow *g_mute[NET_SLOTS];
 static WMtWindow *g_vote_yes, *g_vote_no;
 static void tab_shade(WMtWindow *w, u32 shade);
 
@@ -91,8 +91,11 @@ static int board_wanted(void)
 static int listed(const NetHud *h, int who)
 {
 	if (h->state == NETHUD_OFF) return players_char(who) != 0;
-	return who == h->local_player || ((h->present | h->gone) >> who & 1);
+	return who == h->local_player || ((h->present | h->gone | h->spectators) >> who & 1);
 }
+
+/* In the Spectator list: the host's /spectate, or a spectator's place (net.c "Spectators") */
+static int spectator(const NetHud *h, int who) { return players_spectating(who) || (h->spectators >> who & 1); }
 
 /* The match's goal in one sentence */
 void mp_board_goal(char *out, u32 minutes, int score)
@@ -237,9 +240,9 @@ static void draw_board(void)
 	draw_limits(&h);
 	/* players, then (when anyone watches: /spectate) the spectators in a list of their own */
 	draw_header(&h, "Player", HEADER_Y, 1);
-	for (int who = 0; who < PLAYERS_MAX; who++) {
+	for (int who = 0; who < NET_SLOTS; who++) {
 		if (!listed(&h, who)) continue;
-		if (players_spectating(who)) {
+		if (spectator(&h, who)) {
 			nspect++;
 			continue;
 		}
@@ -250,15 +253,15 @@ static void draw_board(void)
 	if (nspect) {
 		draw_header(&h, "Spectator", y, 0);
 		y += ROWS_Y - HEADER_Y;
-		for (int who = 0; who < PLAYERS_MAX; who++) {
-			if (!listed(&h, who) || !players_spectating(who)) continue;
+		for (int who = 0; who < NET_SLOTS; who++) {
+			if (!listed(&h, who) || !spectator(&h, who)) continue;
 			draw_row(&h, who, y, 0);
 			y += ROW_H;
 			shown |= 1u << who;
 		}
 		row = (y - ROWS_Y) / ROW_H;
 	}
-	for (int who = 0; who < PLAYERS_MAX; who++) {   /* Mute boxes only on listed rows, not this PC's */
+	for (int who = 0; who < NET_SLOTS; who++) {   /* Mute boxes only on listed rows, not this PC's */
 		WMtWindow *box = g_mute[who];
 		int show = h.state != NETHUD_OFF && (shown >> who & 1) && who != h.local_player && !(h.gone >> who & 1);
 		if (box && (WIN_VISIBLE(box) != 0) != show) WMrWindow_SetVisible(box, show);
@@ -392,7 +395,7 @@ static void board_init(WMtWindow *dialog)
 		if (g_vote_yes) WMrWindow_SetVisible(g_vote_yes, 0);
 		if (g_vote_no) WMrWindow_SetVisible(g_vote_no, 0);
 	}
-	for (int who = 0; who < PLAYERS_MAX; who++) {
+	for (int who = 0; who < NET_SLOTS; who++) {
 		g_mute[who] = ui_add(dialog, objective, objective, WMcClass_CheckBox, 0x10000, "Mute", ID_MUTE + who,
 		                     AREA_X + COL_MUTE, AREA_Y + ROWS_Y, MUTE_W, 20);
 		if (g_mute[who]) WMrWindow_SetVisible(g_mute[who], 0);
@@ -402,7 +405,7 @@ static void board_init(WMtWindow *dialog)
 
 static void mute_hide(void)
 {
-	for (int who = 0; who < PLAYERS_MAX; who++)
+	for (int who = 0; who < NET_SLOTS; who++)
 		if (g_mute[who]) WMrWindow_SetVisible(g_mute[who], 0);
 }
 
@@ -435,7 +438,7 @@ static u8 ONI_FC help_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 			if (err) log_msg("F1 screen: %s", err);
 			return 1;
 		}
-		if (id >= ID_MUTE && id < ID_MUTE + PLAYERS_MAX) {
+		if (id >= ID_MUTE && id < ID_MUTE + NET_SLOTS) {
 			chat_set_muted((int)(id - ID_MUTE), !chat_muted((int)(id - ID_MUTE)));
 			return 1;
 		}

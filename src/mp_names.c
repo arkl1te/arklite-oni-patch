@@ -86,7 +86,7 @@ __declspec(dllimport) u32  WINAPI GetWindowThreadProcessId(void *, u32 *);
 __declspec(dllimport) u32  WINAPI GetCurrentProcessId(void);
 __declspec(dllimport) u32  WINAPI GetTickCount(void);
 
-static char g_name[MP_NAME_MAX], g_p2_name[MP_NAME_MAX], g_peer[PLAYERS_MAX][MP_NAME_MAX];   /* g_peer: the other PCs' players' */
+static char g_name[MP_NAME_MAX], g_p2_name[MP_NAME_MAX], g_peer[NET_SLOTS][MP_NAME_MAX];   /* g_peer: the other PCs' players' (and spectators') */
 static char g_edit[MP_NAME_MAX], g_before[MP_NAME_MAX];
 static int g_editing;
 static u32 g_serial = 1;
@@ -124,7 +124,7 @@ u32 mp_name_serial(void) { return g_serial; }
 void mp_name_set(int who, const char *name)
 {
 	char n[MP_NAME_MAX];
-	if (who < 0 || who >= PLAYERS_MAX) return;
+	if (who < 0 || who >= NET_SLOTS) return;
 	clean(n, name, "");
 	if (same(n, g_peer[who])) return;
 	str_cpy(g_peer[who], MP_NAME_MAX, n);
@@ -139,7 +139,7 @@ const char *mp_name(int who)
 	net_hud(&h);
 	if (h.state == NETHUD_OFF) return who == 1 ? g_p2_name : g_name;
 	if (who == h.local_player) return g_name;
-	if (who >= 0 && who < PLAYERS_MAX && *g_peer[who]) return g_peer[who];
+	if (who >= 0 && who < NET_SLOTS && *g_peer[who]) return g_peer[who];
 	fmt(fallback, "Player %d", who + 1);
 	return fallback;
 }

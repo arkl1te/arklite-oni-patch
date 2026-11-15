@@ -87,7 +87,7 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | `[host]` | `listed` | 1 | 0: your game stays off the server list (players who know your address still get introduced) |
 | | `delay` | 0 | 0: no input delay; the other players' input is predicted and the game corrects itself when the real one arrives (rollback). 1 or more: the input delay in ticks (1/60 s each), and the game waits for the other players' input instead. The host's value is used on every PC |
 | `[host]` | `name` | New Oni multiplayer game | The server's name in other players' Join list (the Host dialog saves it) |
-| | `max_players` | 4 | The Host dialog's last value: players 2 to 4 (spectators have no limit). Matches of 3 or 4 players are untested |
+| | `max_players` | 4 | The Host dialog's last value: players 2 to 4 (3 spectators can join on top, a full server too). Matches of 3 or 4 players are untested |
 | | `time_limit` | 10 | Minutes a match lasts; 0: no time limit (the Host dialog saves it) |
 | | `score_limit` | 20 | Points that win a match; 0: no score limit. Below 0, e.g. -5: the first player whose score goes down to it wins, by suicides (the Host dialog saves it) |
 | | `mutant_muro` | 0 | The Mutant Muro mutator: 1, players may pick Mutant Muro in the character menu (F2); 0, he's left out. The Host page's Mutators save it, and joiners get the host's |
@@ -141,7 +141,7 @@ The button asks whether to start a **New** custom game or **Join** one through t
 and whenever the list is read, if it's missing, so it's there before the first map) plus any installed level whose
 number isn't from the original game, with how many players it has room for (its Player-flagged
 characters, the spawn points); the ones that can be played in multiplayer are blue. **Play** plays it alone. **Host** opens the host settings (map,
-server name, port, max players, the mutators, the message of the day; the last ones used are kept; anyone can spectate) and starts the level
+server name, port, max players, the mutators, the message of the day; the last ones used are kept; up to 3 more can spectate) and starts the level
 as a network game others can join. A map needs two or more spawn points to be hosted; the list
 says so under it when the selected one hasn't. **Dedicate** starts the map as a dedicated server
 (see below). **Double-clicking** a map hosts it if it's blue (the host settings open) and plays it alone otherwise. In the text fields, **Enter** or **Esc** confirms what you typed and leaves the field (Esc doesn't close the screen while you're in a field), and **Tab** goes to the next field. Text is selected as in Windows: **Shift** with the arrows, **Home** and **End** (and **Ctrl** for whole words), a double click selects a word, a triple click everything, **Ctrl+A** too.
@@ -149,7 +149,9 @@ says so under it when the selected one hasn't. **Dedicate** starts the map as a 
 **Join** lists your saved servers with their ping, name and players, and adds the games hosted on
 this PC or your local network by itself (those aren't saved unless you edit their address). Select one to see what it
 says about itself (name, map, players connected and how many are spectating) and **Play** to join it; if you don't
-have its map, Play downloads it. **+** (under the list) makes a new entry: type its address (`192.168.1.10`, a
+have its map, Play downloads it. **Spectate** joins it to watch, in one of 3 spectators' places past the players'
+(a full server takes spectators too): you fly the camera or follow a player, and no one's game ever waits for your PC.
+`/join` makes you a player when a place is free. **+** (under the list) makes a new entry: type its address (`192.168.1.10`, a
 name, and `:port` if it isn't 27777) in **Address**. **-** deletes the selected one. **Refresh** asks every server again at once: games that ended drop off the list.
 
 **Chat**: in a network game (the lobby, the warm-up and the match), press **Enter** to chat; a
@@ -183,6 +185,8 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `/punch 1.2.3.4:5678` | Host: lets in a player from outside your network when they can't reach you. They tell you their address (shown under "Connecting to the host..." or by their `/ip`); your game knocks toward it for 2 minutes |
 | `/bug what happened` | Sends the developer this moment: what Oni drew on your screen, your words, every player's ping, the Lag-o-meter's last 128 frames and input packets, and the game's recording so far (with the log and the machine and setup dump, see "Problem reports"). Eight a game. With `[reports] send=0` it's only saved in `AE/logs` |
 | `/lagometer`, `/lag` | The Lag-o-meter, after Quake 3's: the upper graph is one bar a frame (blue up: how many ticks the game runs ahead of every player's known input, yellow past 6; red down: a rollback and its depth; gray: a frame that waited for inputs), the lower one a bar per input packet (how many ticks late it came: green up to 2, yellow up to 6, red past that), with each player's ping and the rollbacks a second above. On again at the next start: `[hud] lagometer=1` |
+| `/spectate` | Watch instead of playing: you fly the camera (move and look as usual, jump: up, crouch: down, walk: slow), a click follows the next player (the health and weapon rings show only while you follow one). A joiner moves to a spectator's place, a few seconds of loading: their place is free for someone else, and no one's game waits for their PC any more. The host watches in place |
+| `/join` | Play again after `/spectate`, or after joining with Spectate: a few seconds of loading, when a player's place is free (else you keep watching). Your score starts from 0 |
 | `/players` | Everyone in the game with their number: the host gives each internet address a number, from 1, in the order players first come, and keeps it while it hosts (a listen host is 1). Players on one PC or behind one router share it |
 | `/vote map Name` | Calls a vote to change the map: its folder in `CustomLevels` or its name, on the host's PC (no quotes needed, a start of it is enough when only one map fits). The map needs a spawn point for everyone here |
 | `/vote kick Who [reason]` | Calls a vote to kick a player: their name (or a start of it), or their number from `/players`. A number shared by more than one player asks for the name. The host can't be kicked |
@@ -601,6 +605,19 @@ PC loads the level and replays the game so far, muted and as fast as it can ("Jo
 catching up (n%)"), checking along the way that it matches the host's. Then they spawn at a spawn
 point no one is near. The host keeps the game's inputs for about 97 minutes; after that, and when a
 replay comes out different, a new player comes in the old way:
+
+**Spectators** (the Join page's **Spectate**, a joiner's `/spectate`) have 3 places of their own past the
+players'. A spectator isn't one of the game's players: no one waits for its input, the host's time
+sync leaves it out, and it can't make anyone's game roll back. The host only sends it everyone's
+inputs. It joins the game in progress like anyone, as it goes on; when a match starts or ends it
+doesn't reload with the players (nobody waits for its PC to load): it goes back to its lobby and
+catches up a moment later. `/spectate` and `/join` tell the host before the reload, so it frees the
+place at once; with no place of the other kind free you keep your own (a moment of loading, back
+where you were). Spectating needs rollback: a host with input delay turns spectators away. Each
+packet of inputs the host sends shares its room between the players: when the round trip is longer
+than a player's share, it carries the inputs not sent yet and, with the rest of the share, the oldest
+ones the other PC hasn't confirmed (the oldest alone kept a player's inputs from crossing faster than
+one share per round trip, so the games of four and five players waited more for every player who came).
 
 With input delay, someone joining during the warm-up reloads the level on every PC a moment
 later, which starts the warm-up over (F3 stays as it was). If the countdown is running they come in

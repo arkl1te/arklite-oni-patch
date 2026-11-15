@@ -1856,7 +1856,7 @@ int mp_menu_host(const char *const *maps, int nmaps, int start, int (*map_dir)(i
 
 /* ---- Join ----------------------------------------------------------------------------------- */
 
-enum { ID_JOIN_PLAY = 1, ID_JOIN_BACK = 2, ID_JOIN_ADD = 3, ID_JOIN_REMOVE = 4, ID_JOIN_REFRESH = 5, ID_JOIN_LIST = 100,
+enum { ID_JOIN_PLAY = 1, ID_JOIN_BACK = 2, ID_JOIN_ADD = 3, ID_JOIN_REMOVE = 4, ID_JOIN_REFRESH = 5, ID_JOIN_SPECTATE = 6, ID_JOIN_LIST = 100,
        ID_JOIN_ADDRESS = 120, ID_JOIN_MODS = 130 };
 #define JOIN_COLUMNS    3      /* Ping, Name, Players: drawn into each row of the one list */
 #define MAX_BOOKMARKS   64
@@ -1997,7 +1997,8 @@ static void show_once(int slot, WMtWindow *w, const char *text)
 
 /* Why the selected server can't be joined, or its map; 1 if Play may go. The line is cut to its
  * label's width by show_once. */
-static int join_status(const Bookmark *b, u32 now, char *text)
+/* spectate: for the Spectate button (a spectator's place: net.c "Spectators"); the line shown is Play's */
+static int join_status(const Bookmark *b, u32 now, char *text, int spectate)
 {
 	if (!b) {
 		str_cpy(text, TEXT_MAX, "Select a server, or add one with +.");
@@ -2030,6 +2031,10 @@ static int join_status(const Bookmark *b, u32 now, char *text)
 		str_cpy(text, TEXT_MAX, "It runs another version of Arklite.");
 		return 0;
 	}
+	if (spectate && b->info.spectators >= b->info.max_spectators) {   /* (before a map download it would be for nothing) */
+		str_cpy(text, TEXT_MAX, "No spectator's place is free.");
+		return 0;
+	}
 	if (!b->have_map && !b->info.folder[0]) {   /* an original level: nothing to download */
 		str_cpy(text, TEXT_MAX, "You don't have its map: ");
 		str_cpy(text + str_len(text), TEXT_MAX - str_len(text), b->info.map);
@@ -2042,8 +2047,12 @@ static int join_status(const Bookmark *b, u32 now, char *text)
 			fmt(text, "You don't have its map (%s): Play downloads it.", b->info.folder);
 		return 1;
 	}
+	if (spectate) {
+		str_cpy(text, TEXT_MAX, "Ready: Spectate watches it.");
+		return 1;
+	}
 	if (b->info.players >= b->info.max_players) {
-		str_cpy(text, TEXT_MAX, "The server is full.");
+		str_cpy(text, TEXT_MAX, b->info.spectators < b->info.max_spectators ? "The server is full: Spectate watches it." : "The server is full.");
 		return 0;
 	}
 	str_cpy(text, TEXT_MAX, b->info.in_match ? "Match on: you'll wait for the next one." : "Ready: Play joins it.");
@@ -2320,7 +2329,7 @@ static void join_frame(void)
 		if (known && sel->info.spectators) fmt(text, "%d/%d (%d spectating)", sel->info.players, sel->info.max_players, sel->info.spectators);
 		else if (known) fmt(text, "%d/%d", sel->info.players, sel->info.max_players);
 		show_once(2, g_infoConnected, known ? text : "-");
-		join_status(sel, now, text);
+		join_status(sel, now, text, 0);
 		show_once(3, g_jstatus, text);
 		join_mods_show(known ? sel : 0, text);
 		show_once(4, g_jtotal, text);
@@ -2484,14 +2493,16 @@ static void join_init(WMtWindow *dialog)
 	mods_list_add(dialog, lb, ui_label(dialog, lb, play, "Current mods", 427, 25, 150, 20, UI_LEFT), ID_JOIN_MODS, 395, 62, 225, 190, 0);
 	g_jtotal = ui_label(dialog, lb, play, "Total download: -", 395, 264, 232, 20, UI_LEFT);
 
-	/* + and - (add, remove) at the list's lower left; Play, Refresh and Back full size, centered */
+	/* + and - (add, remove) at the list's lower left; Play, Spectate, Refresh and Back full size,
+	 * 11 apart, from the frame's left to Back ending left of the Bungie logo */
 	small_button_add(dialog, play, back, "+", ID_JOIN_ADD, 30, 264);
 	small_button_add(dialog, play, back, "-", ID_JOIN_REMOVE, 52, 264);
 	ui_set_text(play, "Play");
-	ui_set_frame(play, 121, 433, BUTTON_W, BUTTON_H);
-	ui_add(dialog, play, back, 0, ~0u, "Refresh", ID_JOIN_REFRESH, 262, 433, BUTTON_W, BUTTON_H);
+	ui_set_frame(play, 22, 433, BUTTON_W, BUTTON_H);
+	ui_add(dialog, play, back, 0, ~0u, "Spectate", ID_JOIN_SPECTATE, 22 + (BUTTON_W + 11), 433, BUTTON_W, BUTTON_H);
+	ui_add(dialog, play, back, 0, ~0u, "Refresh", ID_JOIN_REFRESH, 22 + 2 * (BUTTON_W + 11), 433, BUTTON_W, BUTTON_H);
 	ui_set_text(back, "Back");
-	ui_set_frame(back, 402, 433, BUTTON_W, BUTTON_H);
+	ui_set_frame(back, 22 + 3 * (BUTTON_W + 11), 433, BUTTON_W, BUTTON_H);
 
 	bookmarks_load();
 	for (int i = 0; i < g_nmarks; i++) join_add_row(i);
@@ -2524,11 +2535,12 @@ static u8 ONI_FC join_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	if (id == ID_JOIN_LIST && code == WMcNotify_DoubleClick) id = ID_JOIN_PLAY;
 	else if (code != WMcNotify_Click) return 1;
 
-	if (id == ID_JOIN_PLAY) {
+	if (id == ID_JOIN_PLAY || id == ID_JOIN_SPECTATE) {
+		int spectate = id == ID_JOIN_SPECTATE;
 		Bookmark *b;
 		b = join_selected();
-		if (!join_status(b, now, text)) {   /* it says why on the dialog already */
-			log_msg("join: can't join: %s", text);
+		if (!join_status(b, now, text, spectate)) {
+			log_msg("join: can't %s: %s", spectate ? "spectate" : "join", text);   /* (the dialog's line says why) */
 			return 1;
 		}
 		str_cpy(g_joinFolder, g_joinFolderSize, b->info.folder);
@@ -2537,9 +2549,9 @@ static u8 ONI_FC join_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 			const u8 *ip = (const u8 *)&b->addr;
 			char where[32];
 			fmt(where, "%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], ((b->port & 0xff) << 8) | (b->port >> 8));
-			net_menu_join(where);
+			net_menu_join_as(where, spectate);
 		} else
-			net_menu_join(b->address);
+			net_menu_join_as(b->address, spectate);
 		if (b->have_info && b->info.same_version && b->info.has_download) net_join_level0(b->info.l0);   /* one load fewer */
 		bookmarks_save();
 		WMrDialog_ModalEnd(dialog, 1);

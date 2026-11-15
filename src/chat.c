@@ -575,10 +575,16 @@ static void emote(int e, const char *what)
 	players_emote_request(e);
 }
 
-/* /spectate, /join: this PC's player watches or plays again. The wish goes out in every record
- * from the next one; every PC makes the change in the same tick (players.c "Spectating"). */
+/* /spectate, /join: this PC's player watches or plays again. A joiner moves to a spectator's place
+ * and back (net.c "Spectators"). The host watches in place: the wish goes out in every record from
+ * the next one; every PC makes the change in the same tick (players.c "Spectating"). */
 static void spectate(int on)
 {
+	const char *moved = net_spectate_move(on);   /* a joiner moves to the other kind of place (net.c "Spectators") */
+	if (moved) {
+		info(moved, 0, INFO);
+		return;
+	}
 	if (!net_synced() || !multiplayer_map()) {
 		info("Only in a network game on a multiplayer map.", 0, INFO);
 		return;
@@ -679,8 +685,8 @@ static int help(void)
 		"/taunt, /t; /taunt2, /t2\ta taunt: the first, or the rare second (Konoko, Ninja's moonwalk, Tanker)",
 		"/sneeze\tsneeze (Konoko)",
 		"/idle, /i\ta special idle (most characters have one)",
-		"/spectate\twatch the game without playing (your score goes to 0)",
-		"/join\tplay again after /spectate (your score goes to 0)",
+		"/spectate\twatch without playing: a spectator's place, no one waits for you",
+		"/join\tplay again after /spectate or Spectate (your score starts at 0)",
 		"/players\tthe players and their numbers (one per internet address, from 1)",
 		"/vote map Name\tvote to change the map (its folder or its name)",
 		"/vote kick Who [why]\tvote to kick a player (name or number from /players)",

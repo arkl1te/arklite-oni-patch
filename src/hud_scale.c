@@ -107,6 +107,7 @@ static const u32 g_triangleCalls[] = { 0x50073a, 0x5007af };
 static const u32 g_spriteCalls[] = { 0x5000f2, 0x50045d, 0x50053a, 0x500fdb, 0x501309, 0x50141b };
 
 static int g_inHud;
+static int g_noRings;    /* this HUD pass draws no ring arcs or pictures (a spectator flying free) */
 static int g_hudDrawn;   /* this frame, for the subtitles */
 
 /* Textures switched to GL_NEAREST this frame */
@@ -305,6 +306,7 @@ static u32 ONI_FC hud_triangle(const float *points, const void *uvs)
 	float placed[3 * 4];
 	float s = hud_scale();
 
+	if (g_inHud && g_noRings) return 0;
 	if (!g_inHud || hud_as_is()) return M3rDraw_Triangle(points, uvs);
 	place_points(points, placed, 3, s);
 	return hud_draw(M3rDraw_Triangle, placed, 3, uvs, s);
@@ -315,6 +317,7 @@ static u32 ONI_FC hud_sprite(const float *points, const void *uvs)
 	float placed[2 * 4];
 	float s = hud_scale();
 
+	if (g_inHud && g_noRings) return 0;
 	if (!g_inHud || hud_as_is()) return M3rDraw_Sprite(points, uvs);
 	place_points(points, placed, 2, s);
 	return hud_draw(M3rDraw_Sprite, placed, 2, uvs, s);
@@ -504,10 +507,14 @@ static void subtitles_display(void)
 static void hud_display(void)
 {
 	if (hud_scale() != 1.0f) hud_smooth_frame();
+	/* a spectator flying free has no character of its own: no rings or HUD pictures (they show the
+	 * player it follows). The HUD still runs: the text drawn in it stays (mp_hud.c's after the timer) */
+	g_noRings = net_watching() == -2;
 	g_hudDrawn = 1;
 	g_inHud = 1;
 	ONiInGameUI_DisplayHUD();
 	g_inHud = 0;
+	g_noRings = 0;
 	g_textOn = 0;
 	if (g_helpContext) {
 		TSrContext_SetFontSize(g_helpContext, g_helpSize);

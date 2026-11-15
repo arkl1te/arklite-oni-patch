@@ -332,6 +332,11 @@ static int draw_problem(const NetHud *h, int width, int y)
 		text(joiner ? "Can't join: the server is full" : "A player can't join: the server is full", x, y, CENTER, RED);
 		return y + g_line_height + LINE_GAP;
 	}
+	if (h->problem == NETBAD_SPECTATE) {   /* the host has input delay: a spectator couldn't catch up (net.c "Spectators") */
+		text(joiner ? "Can't spectate: the server has input delay (spectating needs rollback)" : "A spectator can't join: this server has input delay",
+		     x, y, CENTER, RED);
+		return y + g_line_height + LINE_GAP;
+	}
 	if (h->problem == NETBAD_KICKED) {   /* the server's admin removed this PC (net.c "Dedicated server") */
 		char line[96];
 		fmt(line, "Can't join: %s", joiner && net_kick_note()[0] ? net_kick_note() : "the server removed this player");
@@ -341,7 +346,7 @@ static int draw_problem(const NetHud *h, int width, int y)
 	text(joiner ? "Can't join: not the same on both PCs:" : "A player can't join: not the same on both PCs:",
 	     x, y, CENTER, RED);
 	for (u32 bit = 1; bit <= NETBAD_LAST; bit <<= 1) {
-		if (bit == NETBAD_FULL || bit == NETBAD_KICKED) continue;
+		if (bit == NETBAD_FULL || bit == NETBAD_KICKED || bit == NETBAD_SPECTATE) continue;
 		if (!(h->problem & bit)) continue;
 		y += g_line_height + GAP2;
 		text(net_problem_text(bit), x, y, CENTER, RED);
