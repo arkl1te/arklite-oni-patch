@@ -446,9 +446,7 @@ static int draw_vote(int width, int y)
 	int x = width / 2;
 
 	if (!net_vote(&v)) return y;
-	if (v.kind == NET_VOTE_MAP) fmt(what, "change the map to %s", v.subject);
-	else if (v.reason[0]) fmt(what, "kick %s (%s)", v.subject, v.reason);
-	else fmt(what, "kick %s", v.subject);
+	net_vote_what(what, sizeof what, v.kind, v.subject, v.reason);
 	if (v.state != NET_VOTE_OPEN) {
 		fmt(line, v.state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
 		text(line, x, y, CENTER, v.state == NET_VOTE_PASSED ? GREEN : RED);

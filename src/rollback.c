@@ -338,8 +338,10 @@ void rollback_tick_end(void)
  *
  * Sound: Oni's sound thread reads what the ticks write about the sounds playing (channels,
  * positions, buffer pointers), and putting those back under it crashed its mixer. So every
- * RB_WATCH_EVERY ticks (every tick for the first RB_WATCH_FIRST), between ticks, the known
- * pages are made PAGE_NOACCESS until the next tick: the main thread (drawing) touching one only
+ * frame (RB_WATCH_FIRST frames, then a tenth of them each frame, so each one every RB_WATCH_EVERY
+ * frames: all at once every 10th tick was ~700 system calls in one frame, and with rollbacks those
+ * ticks were mostly re-run ones, watching only the microseconds to the next tick), between the
+ * frame's last tick and its next one, the known pages are made PAGE_NOACCESS until the next tick: the main thread (drawing) touching one only
  * opens it again, another thread touching one makes it shared, and a shared page is put back
  * only in the dwords ticks were seen changing (tmask: its slot against the tick's end) and
  * never seen changing between ticks (omask: the tick's end against the next tick's start).
@@ -401,6 +403,7 @@ void rollback_tick_end(void)
 #define PF_EXEC          8                /* executable (restore EXECUTE_READWRITE) */
 #define PF_WATCH         16               /* PAGE_NOACCESS between ticks, to catch other threads */
 #define PF_SHARED        32               /* known, but another thread uses it: put back only where ticks alone write (tmask, omask) */
+#define PF_GONE          64               /* known, but its last snapshot copy faulted (decommitted): asked about until it's back */
 #define RB_MAX_EXCL      1024             /* ranges never put back (SS2's sound state, open ACM streams) */
 #define RB_MAX_NOTES     48               /* pages that became shared, logged from the main thread */
 #define RB_WATCH_EVERY   10
@@ -449,6 +452,7 @@ typedef struct {
 	u32 oni[RB_MAX_ONI], noni;     /* allocation bases of Oni's runtime memory */
 	u32 oni_span[RB_MAX_ONI];      /* and each one's size, reserved part included (rb_span) */
 	u32 samples_wanted, samples_done, next_sample, total_bad, ticks_protected, last_runs, nshared;
+	u32 frames_ended;              /* updates whose last tick handed the memory back to the frame (rb_watch) */
 	u32 fault_page, fault_tid, fault_repeat, forced;   /* a fault that keeps coming back */
 	volatile u32 body_serial, in_fault;   /* rb_watchdog: ticks begun; the main thread is in rb_fault */
 	volatile long learn_lock;      /* rb_learn from the main thread, another thread and the watchdog */
@@ -699,6 +703,36 @@ __attribute__((naked, noinline, used)) static int ONI_FC rb_read8(u32 a, u32 *ou
 		"ret\n");
 }
 
+/* Copies a 4 KB page: 1, or 0 when reading src faulted (rb_probe_fault sends a fault between rb_copy_lo and
+ * rb_copy_hi to rb_copy_fail). The snapshot copies every known page each tick without asking the system
+ * first whether a tick freed it: that question was one VirtualQuery per run of pages, ~57 calls a tick,
+ * 2.5-9 us each on Windows (2026-11-16). A page that faults is PF_GONE and asked about until it is back. */
+extern const u8 rb_copy_lo[] __asm__("rb_copy_lo"), rb_copy_hi[] __asm__("rb_copy_hi");
+extern const u8 rb_copy_fail[] __asm__("rb_copy_fail");
+
+__attribute__((naked, noinline, used)) static int ONI_FC rb_copy_page(void *dst, const void *src)
+{
+	__asm__ volatile(
+		"pushl %esi\n\t"
+		"pushl %edi\n\t"
+		"movl %ecx, %edi\n\t"
+		"movl %edx, %esi\n\t"
+		"movl $1024, %ecx\n\t"
+		"cld\n"
+		"rb_copy_lo:\n\t"
+		"rep movsl\n"
+		"rb_copy_hi:\n\t"
+		"popl %edi\n\t"
+		"popl %esi\n\t"
+		"movl $1, %eax\n\t"
+		"ret\n"
+		"rb_copy_fail:\n\t"
+		"popl %edi\n\t"
+		"popl %esi\n\t"
+		"xorl %eax, %eax\n\t"
+		"ret\n");
+}
+
 /* Asked last, when the page watch didn't take the fault: a known page shut between ticks is
  * opened and read as before, only memory that is really gone makes rb_read8 answer 0 */
 static long rb_probe_fault(EXCEPTION_POINTERS *ep)
@@ -707,8 +741,12 @@ static long rb_probe_fault(EXCEPTION_POINTERS *ep)
 	if (code != 0xc0000005u && code != 0xc0000006u && code != 0x80000001u /* guard page */) return 0;
 	if (*eip >= (u32)rb_probe_lo && *eip < (u32)rb_probe_hi) *eip = (u32)rb_probe_fail;
 	else if (*eip >= (u32)rb_hash_lo && *eip < (u32)rb_hash_hi) *eip = (u32)rb_hash_fail;   /* hash_page */
+	else if (*eip >= (u32)rb_copy_lo && *eip < (u32)rb_copy_hi) *eip = (u32)rb_copy_fail;   /* rb_copy_page */
 	else return 0;
-	if (g_e) g_e->probe_faults++;
+	if (g_e) {
+		g_e->probe_faults++;
+		g_e->fault_page = 0;   /* (moved on: not a fault that keeps coming back) */
+	}
 	return -1;   /* EXCEPTION_CONTINUE_EXECUTION, at rb_probe_fail */
 }
 
@@ -883,6 +921,7 @@ static void rb_start(void)
 	e->grow = e->grown = e->grow_logs = e->plist_logs = e->plist_cuts = e->freed = e->freed_logs = 0;
 	e->reused = e->heap_pages = e->heap_logs = e->heap_walked = e->ndropped = e->seg_kept = 0;
 	e->vchecks = e->vbad = e->vlogs = 0;
+	e->frames_ended = 0;
 	e->main_tid = GetCurrentThreadId();
 	if (!e->main_thread) e->main_thread = OpenThread(0x1fffff /* THREAD_ALL_ACCESS */, 0, e->main_tid);
 	__asm__ volatile("movl %%fs:4, %0" : "=r"(e->stack_top));
@@ -954,9 +993,14 @@ static void rb_snapshot(u32 tick, const void *action)
 	}
 	const u16 *order = rb_order();   /* (by address: page_writable asks once per run) */
 	for (u32 o = 0; o < e->npages; o++) {
-		u32 i = order[o];
-		if ((e->flag[e->pages[i]] & PF_CAND) && page_writable(e->pages[i]))
-			memcpy(slot_page(s, i), (const void *)(e->pages[i] << PAGE_SHIFT), 0x1000);
+		u32 i = order[o], p = e->pages[i];
+		u8 *f = &e->flag[p];
+		if (!(*f & PF_CAND)) continue;
+		if (*f & PF_GONE) {
+			if (!page_writable(p)) continue;
+			*f &= ~PF_GONE;
+		}
+		if (!rb_copy_page(slot_page(s, i), (const void *)(p << PAGE_SHIFT))) *f |= PF_GONE;
 	}
 	e->slot_tick[s] = tick;
 	e->slot_valid[s] = 1;
@@ -1068,13 +1112,21 @@ static int rb_own_pair(u32 d)
 }
 
 /* g_e->mask[k] = 1 for the dwords of the page that belong to a live critical section: its
- * DebugInfo (+0) points to a debug record whose CriticalSection field (+4) points back */
-static void rb_lock_mask(u32 p)
+ * DebugInfo (+0) points to a debug record whose CriticalSection field (+4) points back. Only where
+ * the page and other (the copy it is put back from or compared with) differ: a dword the same in
+ * both comes out the same masked or not, so a section none of whose 24 bytes differ isn't tested.
+ * That test is a system call for most pointer-like words (the debug records are outside Oni's
+ * memory), and testing every word of every page put back cost a Windows restore ~2 ms, ~200 calls
+ * (2026-11-16; Windows finds ~14 sections a restore, Wine none: its sections have no debug record). */
+static void rb_lock_mask(u32 p, const u32 *other)
 {
 	const u32 *page = (const u32 *)(p << PAGE_SHIFT);
+	u32 next = 1024;   /* the first dword at or after k where page and other differ */
 	memset(g_e->mask, 0, sizeof g_e->mask);
-	for (u32 k = 0; k < 1024; k++) {
+	for (u32 k = 1024; k-- > 0; ) {
 		u32 d = page[k];
+		if (d != other[k]) next = k;
+		if (next >= k + 6) continue;   /* (a section is 6 dwords: none of them differs) */
 		if ((d & 3) || d < 0x10000 || k + 3 >= 1024) continue;
 		/* it must look like one: a free/held LockCount, a small RecursionCount, the owner a
 		 * thread id or 0. A two-way list node ({next, prev}) passes the pointer test below, so
@@ -1101,7 +1153,7 @@ static void rb_restore_page(u32 i, const u8 *from)
 	u32 p = e->pages[i], a = p << PAGE_SHIFT;
 	u32 *page = (u32 *)a;
 	const u32 *src = (const u32 *)from;
-	rb_lock_mask(p);
+	rb_lock_mask(p, src);
 	if (rb_wine_segment(a, page) && (page[3] != src[3] || page[4] != src[4]) && e->seg_kept++ < 8)
 		log_msg("rollback: heap segment %08x's links kept in a restore: next %08x prev %08x, the snapshot had %08x %08x",
 		        a, page[3], page[4], src[3], src[4]);
@@ -1144,7 +1196,7 @@ static int rb_page_differs(u32 p, const u8 *want)
 	const u32 *now = (const u32 *)(p << PAGE_SHIFT), *w = (const u32 *)want;
 	if (!memcmp_pages((const u8 *)now, want)) return 0;
 	rb_rd_forget();
-	rb_lock_mask(p);
+	rb_lock_mask(p, w);
 	for (u32 k = 0; k < 1024; k++)
 		if (!g_e->mask[k] && now[k] != w[k]) return 1;
 	return 0;
@@ -1167,6 +1219,21 @@ static int rb_page_differs(u32 p, const u8 *want)
 static int g_gap_allowed;   /* net.c hooks the frame's camera call (rollback_gap_allow) */
 
 void rollback_gap_allow(void) { g_gap_allowed = 1; }
+
+/* A rollback's re-run and the frame's own ticks after it share one protection (net.c holds it, rollback_gap_hold):
+ * between them only Arklite's network code and the end of Oni's update (camera, particles' frame step, the sound
+ * listener) run, and a write there faults and opens its page as in any gap. Checked 2026-11-16 (a TEMP build that
+ * left one held rollback in 50 open and compared every unknown candidate across the window): every page that changed
+ * there faulted in the held windows too, on Wine and Windows (~40000 held windows, 0 missed). The drawing that
+ * follows does write from system calls (OpenGL under Wine): the frame's own update, or net_update's end, opens it. */
+static int g_hold;           /* net.c: a re-run is running whose last tick keeps the protection */
+static u32 g_held;           /* the protection is kept past an update's end by a hold, until the next tick */
+
+/* net.c, around a rollback's re-run (and its check's): its last tick keeps the protection for the frame's own
+ * ticks. Off again before those run; net_update's end closes a held protection no tick took over
+ * (rollback_gap_close). */
+void rollback_gap_hold(int on) { g_hold = on; }
+void rollback_gap_close(void);
 
 /* A protected page written between two ticks of one update: open, and noted (under learn_lock) */
 static void rb_gap_open_locked(u32 p)
@@ -1226,9 +1293,23 @@ void rollback_update_end(void)
 {
 	Engine *e = g_e;
 	if (!e || !e->gap) return;
+	if (g_hold) return;   /* a re-run's update: the frame's own ticks take the protection over */
+	if (g_held) {   /* held for this frame's ticks, and the frame runs none */
+		rollback_gap_close();
+		return;
+	}
 	if (e->gap_late++ < 4)
 		log_msg("rollback: tick %d: the update ended with the protection kept for a next tick; opened now", e->last_tick);
 	rb_gap_end();
+}
+
+/* net.c, at net_update's end: a protection a re-run kept that no tick took over (the frame ran no tick of its
+ * own) is opened before drawing. Normally the frame's own update ended it already. */
+void rollback_gap_close(void)
+{
+	Engine *e = g_e;
+	g_held = 0;
+	if (e && e->active && e->gap) rb_gap_end();
 }
 
 static void rb_protect(void)
@@ -1271,12 +1352,14 @@ static void rb_unprotect(void)
 	e->nruns = 0;
 }
 
-static void rb_watch(void)
+/* The known pages i with i % RB_WATCH_EVERY == part, or all of them (part < 0) */
+static void rb_watch(int part)
 {
 	Engine *e = g_e;
 	u32 old;
 	for (u32 i = 0; i < e->npages; i++) {
 		u32 p = e->pages[i];
+		if (part >= 0 && i % RB_WATCH_EVERY != (u32)part) continue;
 		if ((e->flag[p] & (PF_SHARED | PF_WATCH)) || !(e->flag[p] & PF_CAND)) continue;
 		e->flag[p] |= PF_WATCH;
 		if (!VirtualProtect((void *)(p << PAGE_SHIFT), 0x1000, 0x01 /* PAGE_NOACCESS */, &old)) e->flag[p] &= ~PF_WATCH;
@@ -2276,7 +2359,7 @@ static void rb_out_diff(u32 p, const u8 *want)
 		}
 	rb_globals_near(p, near);
 	rb_rd_forget();
-	rb_lock_mask(p);
+	rb_lock_mask(p, (const u32 *)want);
 	while (off < 0x1000 && (g_e->mask[off / 4] || *(const u32 *)(want + off) == *(const u32 *)(now + off))) off += 4;
 	u32 lo = off >= 8 ? off - 8 : 0;
 	out("    DIFFERS 0x%08x %s, first at +0x%03x (0x%08x); Oni.exe globals near:%s", a, who, off, a + off,
@@ -2306,6 +2389,7 @@ static void rb_rewind_test(u32 tick, void (*body)(void *))
 	if (SSgLock) SSrLock(SSgLock);
 	rb_sound_before_restore(back);
 	rb_restore(back % RB_SLOTS);
+	lockstep_glass_rewound();
 	rb_os_handles_repair(back);
 	if (SSgLock) SSrUnlock(SSgLock);
 	for (u32 t = back; t < tick; t++) {
@@ -2334,6 +2418,7 @@ static void rb_rewind_test(u32 tick, void (*body)(void *))
 	}
 	if (!bad) out("    none: every known page came out as the first time");
 	rb_restore(now_slot);   /* this tick's start as it was, either way */
+	lockstep_glass_rewound();
 
 	e->samples_done++;
 	e->total_bad += bad;
@@ -2353,7 +2438,7 @@ static void rb_rewind_test(u32 tick, void (*body)(void *))
 
 /* Where a tick's time goes, around and in its body (the 30 s log line, rollback_phase_text): the checks
  * before (allocations; heaps, particles, OS table), the snapshot copy, protecting, the body, unprotecting,
- * the shared pages' masks, watching (every RB_WATCH_EVERY ticks); in performance-counter units */
+ * the shared pages' masks, watching (at the frame's last tick: rb_watch); in performance-counter units */
 enum { PH_ALLOCS, PH_BEFORE, PH_COPY, PH_PROTECT, PH_BODY, PH_UNPROTECT, PH_SHARED, PH_WATCH, PH_N };
 static unsigned long long g_ph[PH_N];
 static u32 g_phq[PH_N];   /* and the VirtualQuery calls in each */
@@ -2430,6 +2515,7 @@ int rollback_test_tick(void *action, void (*body)(void *))
 
 	if (!e || !gs) return 0;
 	if (!e->samples_wanted && !e->start_now && !e->active) return 0;   /* neither the test nor a match */
+	g_held = 0;
 	tick = GS_TICK(gs);
 	if (e->active) rb_unwatch();
 	if (e->gap && tick != e->last_tick + 1) rb_gap_end();   /* (not the update's next tick: never expected) */
@@ -2477,12 +2563,15 @@ int rollback_test_tick(void *action, void (*body)(void *))
 	e->in_body = 0;
 	e->amb_hi[e->cur] = SSgAmbientNextId;
 	t1 = ph_now(); g_ph[PH_BODY] += t1 - t0; t0 = t1; g_phq[PH_BODY] += g_vq - q0; q0 = g_vq;
-	if (g_gap_allowed && !e->samples_wanted && e->layout == e->gap_layout && GS_TICK(gs) + 1 < GS_SERVER_TIME(gs)) {
+	int last = GS_TICK(gs) + 1 >= GS_SERVER_TIME(gs), frame_end = 0;
+	if (g_gap_allowed && !e->samples_wanted && e->layout == e->gap_layout && (!last || g_hold)) {
+		if (last) g_held = 1;   /* (a hold: the frame's own ticks take it over) */
 		/* more ticks in this update, and the runs still fit */
 		e->body_serial++;   /* (the watchdog times the gap as a tick of its own) */
 		e->gap = 1;
 	} else {
 		rb_unprotect();
+		frame_end = last && !g_hold;   /* (the frame goes on: drawing, the other threads) */
 	}
 	t1 = ph_now(); g_ph[PH_UNPROTECT] += t1 - t0; t0 = t1; g_phq[PH_UNPROTECT] += g_vq - q0; q0 = g_vq;
 	/* shared pages: what this tick changed (from its start, in its slot), and the end for the
@@ -2514,7 +2603,10 @@ int rollback_test_tick(void *action, void (*body)(void *))
 	if (e->ticks_protected <= 3 || !(e->ticks_protected % 600))
 		log_msg("rollback: tick %d done (%d protected): %d known pages, %d shared, %d foreign, %d over the limit, %d runs",
 		        tick, e->ticks_protected, e->npages, e->nshared, e->nforeign_pages, e->overflow, e->last_runs);
-	if (e->ticks_protected <= RB_WATCH_FIRST || !(e->ticks_protected % RB_WATCH_EVERY)) rb_watch();
+	if (frame_end) {
+		e->frames_ended++;
+		rb_watch(e->frames_ended <= RB_WATCH_FIRST ? -1 : (int)(e->frames_ended % RB_WATCH_EVERY));
+	}
 	g_ph[PH_WATCH] += ph_now() - t0; g_phq[PH_WATCH] += g_vq - q0;
 	g_ph_ticks++;
 	return 1;
@@ -2993,6 +3085,7 @@ int rollback_restore_tick(u32 tick)
 	heap_check_rewound(GS_TICK(ONgGameState), tick);   /* (its journal: blocks this rewind makes free again) */
 	r1 = ph_now(); g_rs[RS_HEAP] += r1 - r0; r0 = r1; g_rsq[RS_HEAP] += g_vq - v0; v0 = g_vq;
 	rb_restore(s);
+	lockstep_glass_rewound();   /* panes broken in the ticks taken back: whole again (lockstep.c "Broken glass") */
 	r1 = ph_now(); g_rs[RS_PAGES] += r1 - r0; r0 = r1; g_rsq[RS_PAGES] += g_vq - v0; v0 = g_vq;
 	rb_os_handles_repair(tick);   /* (before the orphans: they read the handles) */
 	r1 = ph_now(); g_rs[RS_HANDLES] += r1 - r0; r0 = r1; g_rsq[RS_HANDLES] += g_vq - v0; v0 = g_vq;

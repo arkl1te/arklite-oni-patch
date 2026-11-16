@@ -120,6 +120,7 @@ Environment variables, for testing (set them before starting `Oni.exe`):
 | --- | --- |
 | `ARKLITE_AUTOSTART=<folder>` | Opens Custom Game and plays `CustomLevels/<folder>` |
 | `ARKLITE_SAVEPOINT=<n>` | With `ARKLITE_AUTOSTART`, starts at save point n (0–9) |
+| `ARKLITE_SPAWN=<id>` | With `ARKLITE_AUTOSTART`, Konoko's first spawn in that level is at the player placement with that object id (Catwalk's debug spawn point); played alone only |
 | `ARKLITE_RECORD=<file>` | Records the first level played into `AE/<file>` |
 | `ARKLITE_REPLAY=<file>` | Replays `AE/<file>` and writes `MATCHED` or `DESYNCED` to the newest `AE/logs/Arklite_<date>_<time>.log` |
 | `ARKLITE_HOST=1` | Hosts a network game on UDP port 27777 (or `ARKLITE_HOST=<port>`) |
@@ -190,10 +191,11 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `/players` | Everyone in the game with their number: the host gives each internet address a number, from 1, in the order players first come, and keeps it while it hosts (a listen host is 1). Players on one PC or behind one router share it |
 | `/callvote map Name` | Calls a vote to change the map: its folder in `CustomLevels` or its name, on the host's PC (no quotes needed, a start of it is enough when only one map fits). The map needs a spawn point for everyone here |
 | `/callvote kick Who [reason]` | Calls a vote to kick a player: their name (or a start of it), or their number from `/players`. A number shared by more than one player asks for the name. The host can't be kicked |
+| `/callvote restart` | Calls a vote to restart from a warm-up, during a match or a warm-up: every PC reloads the level with new seeds and checks it starts the same, so a game that came apart is back in sync (the console's `warmup`, by vote) |
 | `/yes`, `/no` | Answers the vote (as Y and N do) |
 | `\/text` | Sends "/text" as a message, not a command |
 
-**Votes**: `/callvote map` and `/callvote kick` start a 30-second vote on every screen, with a soft
+**Votes**: `/callvote map`, `/callvote kick` and `/callvote restart` start a 30-second vote on every screen, with a soft
 prompt sound: what it's about, the Yes and No counts, the seconds left. Answer with **Y** or
 **N** (while the chat is closed), `/yes` or `/no`, or the Yes and No buttons under the F1
 Scoreboard; you can change your answer while it's on, and calling a vote counts as your Yes. Only

@@ -509,6 +509,9 @@ static u32 g_sock = INVALID_SOCKET;
 static Link g_link[NPL];
 static u16 g_port = DEFAULT_PORT;
 static u32 g_delay = 4;
+static u32 g_aim_delay;   /* ticks the aim waits while unarmed ("Aim held back while unarmed"); 0: off */
+static void aim_reset(void);
+static void aim_rewound(u32 from);
 static int g_record = 1;               /* [net] record: Arklite-net-host.akr / -join.akr */
 
 static u32 g_level, g_last_tick;
@@ -610,7 +613,7 @@ static u32 g_seed, g_local_seed;       /* the host's, put in place before the fi
 static u32 g_start_hash, g_start_tick, g_start_fpu;
 static u32 g_last_hello;
 static int g_lost_left;                /* joiner S_LOST: the host said goodbye, not silence */
-static u32 g_frames[NPL][6][12];       /* each player's records for the frame's ticks; [0] the update's own */
+static u32 g_frames[NPL][NET_UPDATE_MAX][12];   /* each player's records for the update's ticks; [0] the update's own */
 
 typedef struct { u32 index, flags; int health; float pos[3], facing, vel[3]; } CharSum;
 static struct { u32 tick, hash, n, seeds[2]; CharSum chars[MAX_CHARS]; } g_mine[HASH_SLOTS];
@@ -3002,6 +3005,7 @@ static u32 run_update(u32 n, u32 *ticks_run);
  * match's seeds are set just before the load, since the frames between draw from the RNGs. */
 static void reload_level(u32 level, int seeds)
 {
+	rollback_gap_close();   /* (a level load reads files into Oni's heap: nothing may be protected) */
 	if (live_menu_open()) {
 		if (!g_reload) log_msg("net: closing the pause menu to reload level %d", level);
 		g_reload = level + 1;
@@ -5688,6 +5692,7 @@ static void session_begin(u32 level)
 	g_joining = 0;
 	g_cu_abort = 0;
 	g_verified = 0;
+	aim_reset();
 	g_rb_started = 0;
 	g_rollbacks = g_resim_ticks = g_rb_failed = g_rb_deepest = g_rb_frames = 0;
 	g_npackets_sent = g_npackets_recv = g_ninputs_recv = g_send_errors = 0;
@@ -6269,8 +6274,9 @@ static void session_end(const char *why)
 		u32 checks, checks_bad;
 		rollback_check_stats(&checks, &checks_bad);
 		log_msg("net: rollback: %d rollbacks re-ran %d ticks (deepest %d), %d couldn't go back far enough; %d checked by "
-		        "running them twice, %d of those came out differently%s", g_rollbacks, g_resim_ticks, g_rb_deepest, g_rb_failed,
-		        checks, checks_bad, checks_bad ? " (see Arklite-rollbackcheck in logs)" : "");
+		        "running them twice, %d of those came out differently%s; %u one-shot sounds not played twice (a late input "
+		        "moved them)", g_rollbacks, g_resim_ticks, g_rb_deepest, g_rb_failed, checks, checks_bad,
+		        checks_bad ? " (see Arklite-rollbackcheck in logs)" : "", lockstep_sounds_moved());
 		g_rb_started = 0;
 	}
 	if (g_state == S_RUN || g_state == S_LOST || g_state == S_OVER)
@@ -6706,7 +6712,7 @@ void net_hud(NetHud *h)
 static int same_input(const u32 *a, const u32 *b)
 {
 	for (int i = 0; i < 12; i++)
-		if (a[i] != b[i]) return 0;
+		if (a[i] != b[i] && (!g_aim_delay || (i != 9 && i != 10))) return 0;   /* (aim: aim_wrong) */
 	return 1;
 }
 
@@ -6735,6 +6741,27 @@ static void rb_fill_frames(u32 n)
 	}
 }
 
+/* Oni's update runs at most 6 ticks (0x4fb08f cmp edi, 6; 0x4fb096 mov ebx, 6), so a rollback's re-run of
+ * 7-12 ticks took two updates, each protecting and opening Oni's memory again (0.5 ms on Windows, 1.2 ms
+ * under Wine). While one re-runs the cap is NET_UPDATE_MAX; the frame's own updates keep Oni's 6. */
+#define ONcUpdateCapCmp   0x4fb08f
+#define ONcUpdateCapMov   0x4fb096
+static u32 g_update_cap_ok = 2, g_update_max = 6;   /* 2: not checked yet */
+
+static void update_cap(u32 n)
+{
+	static const u8 cmp6[3] = { 0x83, 0xff, 0x06 }, mov6[5] = { 0xbb, 0x06, 0x00, 0x00, 0x00 };
+	if (g_update_cap_ok == 2) {
+		g_update_cap_ok = code_matches(ONcUpdateCapCmp, cmp6, 3) && code_matches(ONcUpdateCapMov, mov6, 5);
+		if (!g_update_cap_ok) log_msg("net: Oni's update cap (0x%x) isn't as expected: a rollback re-runs 6 ticks an update", ONcUpdateCapCmp);
+	}
+	if (!g_update_cap_ok || n == g_update_max) return;
+	u8 cmp[3] = { 0x83, 0xff, (u8)n }, mov[5] = { 0xbb, (u8)n, 0, 0, 0 };
+	patch_write(ONcUpdateCapCmp, cmp, 3);
+	patch_write(ONcUpdateCapMov, mov, 5);
+	g_update_max = n;
+}
+
 static int g_rerun;   /* 1: a rollback's re-run is running, 2: a rollback check's (heap_check.c's journal says which) */
 int net_rerun(void) { return g_rerun; }
 
@@ -6744,14 +6771,16 @@ static void rb_resimulate(u32 to)
 	int was = g_rerun;
 	if (!was) g_rerun = 1;
 	rollback_impulses(0);   /* one-shot sounds play only if the first run didn't play them; ambients start again */
+	if (to - g_ticks > 6) update_cap(NET_UPDATE_MAX);   /* all of it in one update: one protection, one camera and particle step */
 	while (g_ticks < to) {
 		u32 n = to - g_ticks, before = g_ticks;
-		if (n > 6) n = 6;
+		if (n > g_update_max) n = g_update_max;
 		rb_fill_frames(n);
 		players_net_frame(g_frames, n);
 		run_update(n, 0);
 		if (g_ticks == before) break;   /* the update ran nothing: don't spin */
 	}
+	update_cap(6);
 	rollback_impulses(1);
 	g_rerun = was;
 }
@@ -6759,13 +6788,17 @@ static void rb_resimulate(u32 to)
 /* rollback.c's check of a rollback: the same ticks put back and run once more with the same
  * inputs, the two runs compared (anything that differs is state a rollback leaves behind) */
 #define RB_CHECK_FIRST 40   /* every rollback of a match's first 40 */
-#define RB_CHECK_EVERY 16   /* then one in 16 */
+#define RB_CHECK_EVERY 16   /* then one in 16, */
+#define RB_CHECK_MS    1000 /* at most one a second: a check runs the rollback's ticks once more, a frame's spike, and with
+                             * 4 players' rollbacks in most frames one in 16 was two such frames a second */
+static u32 g_rb_check_at;
 
 static void rb_check(u32 t, u32 to, int player)
 {
 	char what[120];
 	if (g_ticks != to || !rollback_check_begin()) return;
 	if (!rollback_restore_tick(t)) return;
+	aim_rewound(t);
 	g_ticks = t;
 	g_rerun = 2;
 	rb_resimulate(to);
@@ -6825,6 +6858,143 @@ static void ping_log(char *out, u32 size)
 }
 
 static u32 g_lag_depth;   /* this frame's rollback depth, for the lag-o-meter */
+
+/* ---- Aim held back while unarmed ---------------------------------------------------------- *
+ * 82-83% of the rollbacks of real matches (2026-11-15) came from another player's mouse: the guess
+ * of a late input has no aim, so every tick someone turns is a wrong guess; 95% of those ticks were
+ * turns with no gun in hand (looking around, melee, running). With g_aim_delay = D, a player
+ * without a gun in hand turns by the mouse of D ticks before: each tick applies the aim words
+ * (9, 10: the tick's mouse movement) of every record not applied yet, up to its own record with a
+ * gun in hand, up to D ticks back without; none is lost (a gun drawn applies the waiting ones at
+ * once). Each record notes the tick that applied its aim and the aim it used (g_aim_used), so a
+ * late input whose aim no tick used yet costs no rollback, and one that a tick used with a guess
+ * rolls back to that tick, not to its own. Every PC applies the same rule to the same inputs, the
+ * catch-up road and playback too. */
+static u32 g_aim_upto[NPL] TICK_STATE;       /* each slot's first record whose aim no tick applied yet */
+static struct { u32 rec, at, aim[2]; } g_aim_used[NPL][RING];   /* rec: the record it's about (the ring wraps); at: the tick that applied it + 1, 0 none */
+static u32 g_aim_given[NPL][RING][2];        /* the aim words each tick's record had when it ran */
+static u32 g_aim_saved;                      /* late aim that differed from the guess and no tick had used: no rollback */
+static u32 g_aim_noted[NPL][RING];           /* record + 1, once counted in g_aim_saved */
+
+static void aim_reset(void)
+{
+	memset(g_aim_upto, 0, sizeof g_aim_upto);
+	memset(g_aim_used, 0, sizeof g_aim_used);
+	memset(g_aim_given, 0, sizeof g_aim_given);
+	memset(g_aim_noted, 0, sizeof g_aim_noted);
+}
+
+/* Record k's aim as known now: the session's history (every input verified, the catch-up's too), else
+ * the input if it's here, else what its tick was given (a guess) */
+static void aim_of(int s, u32 k, u32 *a)
+{
+	const u32 *r = g_hist && s < PLS && k < g_hist_n ? g_hist + k * HIST_TICK + s * 12 + 9 :
+	               k < have_of(s) ? &g_in[s][k % RING][9] : g_aim_given[s][k % RING];
+	a[0] = r[0];
+	a[1] = r[1];
+}
+
+/* In the tick (players.c for slots 1-5, lockstep.c for Konoko's): rec is slot s's record for the
+ * tick running (g_ticks), chr its character; its aim words become the aim this tick applies */
+void net_aim_tick(int s, const u8 *chr, u32 *rec)
+{
+	u32 t = g_ticks, to, k;
+	float lr = 0.0f, ud = 0.0f;
+	if (!g_aim_delay || s < 0 || s >= NPL || (g_state != S_RUN && g_state != S_CATCHUP && g_state != S_LOST)) return;
+	g_aim_given[s][t % RING][0] = rec[9];
+	g_aim_given[s][t % RING][1] = rec[10];
+	to = (chr && *(const u32 *)(chr + 0x194)) ? t + 1 : t + 1 > g_aim_delay ? t + 1 - g_aim_delay : 0;
+	if (g_aim_upto[s] + RING / 2 < to) g_aim_upto[s] = to - RING / 2;   /* (never more than the ring holds) */
+	for (k = g_aim_upto[s]; k < to; k++) {
+		u32 a[2];
+		float x, y;
+		aim_of(s, k, a);
+		memcpy(&x, &a[0], 4);
+		memcpy(&y, &a[1], 4);
+		lr += x;
+		ud += y;
+		g_aim_used[s][k % RING].rec = k;
+		g_aim_used[s][k % RING].at = t + 1;
+		g_aim_used[s][k % RING].aim[0] = a[0];
+		g_aim_used[s][k % RING].aim[1] = a[1];
+	}
+	if (to > g_aim_upto[s]) g_aim_upto[s] = to;
+	memcpy(&rec[9], &lr, 4);
+	memcpy(&rec[10], &ud, 4);
+}
+
+/* After a rewind to tick from: the aim the ticks from there on applied isn't applied any more */
+static void aim_rewound(u32 from)
+{
+	if (!g_aim_delay) return;
+	for (int s = 0; s < NPL; s++)
+		for (u32 k = 0; k < RING; k++)
+			if (g_aim_used[s][k].at > from) g_aim_used[s][k].at = 0;
+}
+
+/* The first tick whose run used player p's aim wrongly, among records lo..hi-1 (0xffffffff: none) */
+static u32 aim_wrong(int p, u32 lo, u32 hi)
+{
+	u32 first = 0xffffffffu;
+	for (u32 k = lo; k < hi; k++) {
+		const u32 *in = &g_in[p][k % RING][9];
+		if (in[0] == g_aim_given[p][k % RING][0] && in[1] == g_aim_given[p][k % RING][1]) continue;
+		if (!g_aim_used[p][k % RING].at || g_aim_used[p][k % RING].rec != k) {   /* no tick used it yet: nothing to undo */
+			if (g_aim_noted[p][k % RING] != k + 1) g_aim_noted[p][k % RING] = k + 1, g_aim_saved++;
+			continue;
+		}
+		if (g_aim_used[p][k % RING].aim[0] == in[0] && g_aim_used[p][k % RING].aim[1] == in[1]) continue;
+		if (g_aim_used[p][k % RING].at - 1 < first) first = g_aim_used[p][k % RING].at - 1;
+	}
+	return first;
+}
+
+/* Frame times in network play, the drag players see (camera turns made it show, 2026-11-15): each
+ * rolling frame's distance from the last, in 1 ms steps, with whether that frame held a rollback and
+ * how long the rollback took; one line every 30 s. A gap over a second (a menu, a load) isn't a frame. */
+#define FR_STEPS 101
+static u32 g_fr_last, g_fr_hist[FR_STEPS], g_fr_n, g_fr_max_us, g_fr_sum_ms, g_fr_rb_ms;
+static u32 g_fr_slow[3], g_fr_slow_rb[3], g_fr_slow_rb_us[3];   /* over 20, 33, 50 ms: all, with a rollback, its time */
+static u32 g_fr_rb_us;   /* the rollback in the frame running now (0: none) */
+
+static void frame_note(u32 dt_us)
+{
+	static const u32 limit[3] = { 20000, 33000, 50000 };
+	if (dt_us > 1000000) return;
+	g_fr_n++;
+	g_fr_hist[dt_us / 1000 < FR_STEPS - 1 ? dt_us / 1000 : FR_STEPS - 1]++;
+	if (dt_us > g_fr_max_us) g_fr_max_us = dt_us;
+	g_fr_sum_ms += dt_us / 1000;
+	g_fr_rb_ms += g_fr_rb_us / 1000;
+	for (int k = 0; k < 3; k++)
+		if (dt_us > limit[k]) {
+			g_fr_slow[k]++;
+			if (g_fr_rb_us) g_fr_slow_rb[k]++, g_fr_slow_rb_us[k] += g_fr_rb_us;
+		}
+}
+
+/* The 30 s line: median and 99th percentile, the slowest, the slow frames and the rollbacks in them */
+static void frame_log(void)
+{
+	u32 med = 0, p99 = 0, seen = 0;
+	if (!g_fr_n) return;
+	for (u32 i = 0; i < FR_STEPS; i++) {
+		seen += g_fr_hist[i];
+		if (!med && seen * 2 >= g_fr_n) med = i ? i : 1;
+		if (!p99 && seen * 100 >= g_fr_n * 99) p99 = i ? i : 1;
+	}
+	log_msg("net: frames in the last %d s: %u, median %u ms, 99%% under %u ms, slowest %u ms; over 20 ms %u (%u with a rollback, "
+	        "%u us each), over 33 ms %u (%u, %u us), over 50 ms %u (%u, %u us); rollbacks took %u%% of the time",
+	        STALL_LOG_MS / 1000, g_fr_n, med, p99, g_fr_max_us / 1000, g_fr_slow[0], g_fr_slow_rb[0],
+	        g_fr_slow_rb[0] ? g_fr_slow_rb_us[0] / g_fr_slow_rb[0] : 0, g_fr_slow[1], g_fr_slow_rb[1],
+	        g_fr_slow_rb[1] ? g_fr_slow_rb_us[1] / g_fr_slow_rb[1] : 0, g_fr_slow[2], g_fr_slow_rb[2],
+	        g_fr_slow_rb[2] ? g_fr_slow_rb_us[2] / g_fr_slow_rb[2] : 0, g_fr_sum_ms ? g_fr_rb_ms * 100 / g_fr_sum_ms : 0);
+	memset(g_fr_hist, 0, sizeof g_fr_hist);
+	memset(g_fr_slow, 0, sizeof g_fr_slow);
+	memset(g_fr_slow_rb, 0, sizeof g_fr_slow_rb);
+	memset(g_fr_slow_rb_us, 0, sizeof g_fr_slow_rb_us);
+	g_fr_n = g_fr_max_us = g_fr_sum_ms = g_fr_rb_ms = 0;
+}
 static int g_lag_waited;  /* this frame waited for inputs */
 
 static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u32 now)
@@ -6832,6 +7002,12 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 	/* the inputs that came in: were the guesses right? From the first wrong one on, again */
 	u32 bad = 0xffffffffu;
 	int bad_player = 0, bad_kind = 3;
+	{   /* the frame that just ended (frame_note), then this one's */
+		u32 c = counter();
+		if (g_fr_last) frame_note(us(c - g_fr_last));
+		g_fr_last = c;
+		g_fr_rb_us = 0;
+	}
 	for (int p = 0; p < (int)g_nplayers; p++) {
 		if (!remote(p)) continue;
 		u32 upto = g_have[p] < g_ticks ? g_have[p] : g_ticks;
@@ -6844,14 +7020,25 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 				           a[11] != b[11] ? 3 : 2;
 				break;
 			}
+		if (g_aim_delay) {   /* aim: back to the tick that used it wrongly, if any did */
+			u32 w = aim_wrong(p, g_verified, upto);
+			if (w < bad) {
+				bad = w;
+				bad_player = p;
+				bad_kind = 1;
+			}
+		}
 	}
 	if (bad != 0xffffffffu) {
 		u32 t = bad, to = g_ticks, t0 = counter();
 		if (rollback_restore_tick(t)) {
+			rollback_gap_hold(1);   /* the re-run's protection stays on for this frame's own ticks */
 			u32 t1 = us(counter() - t0);
+			aim_rewound(t);
 			g_ticks = t;
 			rb_resimulate(to);
 			t0 = us(counter() - t0);
+			g_fr_rb_us = t0;
 			g_rb_us_sum += t0;
 			g_rb_timed++;
 			g_rb_restore_us_sum += t1;
@@ -6864,7 +7051,13 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 			g_resim_ticks += to - t;
 			g_lag_depth = to - t;
 			if (to - t > g_rb_deepest) g_rb_deepest = to - t;
-			if (g_rollbacks <= RB_CHECK_FIRST || !(g_rollbacks % RB_CHECK_EVERY)) rb_check(t, to, bad_player);
+			if (g_rollbacks <= RB_CHECK_FIRST || (g_rollbacks % RB_CHECK_EVERY == 0 && now - g_rb_check_at >= RB_CHECK_MS)) {
+				u32 c0 = counter();
+				g_rb_check_at = now;
+				rb_check(t, to, bad_player);
+				g_fr_rb_us += us(counter() - c0);   /* (the check's run is the frame's too) */
+			}
+			rollback_gap_hold(0);   /* (the frame's own update opens it at its end) */
 		} else if (!g_rb_failed++) {
 			log_msg("net: rollback: tick %d isn't kept any more (now %d): this game will come apart", t, g_ticks);
 		}
@@ -6941,11 +7134,15 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 				log_msg("net: in the last %d s by player: %s; a rollback put back %u us and ran %u ticks again at %u us a tick, on average",
 				        STALL_LOG_MS / 1000, line[0] ? line : "-", g_rb_timed ? g_rb_restore_us_sum / g_rb_timed : 0,
 				        g_rb_timed ? g_rb_rerun_ticks / g_rb_timed : 0, g_rb_rerun_ticks ? g_rb_rerun_us_sum / g_rb_rerun_ticks : 0);
+			if (g_aim_delay) log_msg("net: in the last %d s: %u late aims cost no rollback (held back %u ticks while unarmed)",
+			                         STALL_LOG_MS / 1000, g_aim_saved, g_aim_delay);
+			g_aim_saved = 0;
 			{   /* every tick's parts (rollback.c), first runs and re-runs alike */
 				char ph[640];
 				rollback_phase_text(ph, sizeof ph);
 				if (ph[0]) log_msg("net: a tick's parts: %s", ph);
 			}
+			frame_log();
 			memset(g_wait_by, 0, sizeof g_wait_by);
 			memset(g_rb_by, 0, sizeof g_rb_by);
 			g_rb_restore_us_sum = g_rb_rerun_us_sum = g_rb_rerun_ticks = 0;
@@ -7004,8 +7201,20 @@ static u32 rolling_frame(u32 count, void *actions, u32 *ticks_run, u32 wanted, u
 
 static int move_frame(void);   /* ("Spectators": /spectate and /join's reload) */
 
-/* lockstep.c's update hook, in place of the update, while networking is on */
+static u32 net_update_frame(u32 count, void *actions, u32 *ticks_run);
+
+/* lockstep.c's update hook, in place of the update, while networking is on. A protection a rollback's
+ * re-run kept for this frame's own ticks (rollback_gap_hold) never lasts past it: drawing and the rest of
+ * the frame write Oni's memory from system calls (OpenGL under Wine), which fail on a protected page */
 u32 net_update(u32 count, void *actions, u32 *ticks_run)
+{
+	u32 r = net_update_frame(count, actions, ticks_run);
+	rollback_gap_hold(0);
+	rollback_gap_close();
+	return r;
+}
+
+static u32 net_update_frame(u32 count, void *actions, u32 *ticks_run)
 {
 	u8 *gs = ONgGameState;
 	u32 level = ONrLevel_GetCurrent(), now = GetTickCount();
@@ -8089,7 +8298,7 @@ void net_server_quit(void)
 }
 
 /* ---- Votes (protocol 23) ------------------------------------------------------------------ *
- * /callvote map <name> and /callvote kick <player> [reason] (chat.c), answered with Y / N, /yes / /no or
+ * /callvote map <name>, /callvote kick <player> [reason] and /callvote restart (chat.c), answered with Y / N, /yes / /no or
  * the F1 Scoreboard's buttons (mp_board.c). The host runs every vote: a joiner's call and answers
  * reach it as chat messages to CHAT_VOTE (the chat resends them until they're acknowledged, so
  * each arrives once, in order); a call it refuses gets a server line back, to that player alone.
@@ -8195,11 +8404,12 @@ static void vote_count(u32 *yes, u32 *no, u32 *voters)
 	}
 }
 
-/* "change the map to X" / "kick X (reason)" */
+/* "change the map to X" / "kick X (reason)" / "restart from a warm-up" (the scoreboard and the HUD too) */
 static void vote_what(char *out, u32 size, u32 kind, const char *subject, const char *reason)
 {
 	char t[200];
 	if (kind == NET_VOTE_MAP) fmt(t, "change the map to %s", subject);
+	else if (kind == NET_VOTE_RESTART) str_cpy(t, sizeof t, "restart from a warm-up (everyone reloads, in sync)");
 	else if (reason[0]) fmt(t, "kick %s (%s)", subject, reason);
 	else fmt(t, "kick %s", subject);
 	str_cpy(out, size, t);
@@ -8342,7 +8552,15 @@ static const char *vote_check_kick(int caller, const char *args, int *target, co
 	return 0;
 }
 
-/* host: player p calls a vote ("map <name>" / "kick <player> [reason]"); 0, or why not */
+/* host: /callvote restart (and its command): a match or a warm-up running, or a match's end */
+static int restart_possible(void) { return g_mode == NET_HOST && (g_state == S_RUN || g_state == S_OVER || g_state == S_LOST); }
+
+void net_vote_what(char *out, u32 size, int kind, const char *subject, const char *reason)
+{
+	vote_what(out, size, (u32)kind, subject, reason);
+}
+
+/* host: player p calls a vote ("map <name>" / "kick <player> [reason]" / "restart"); 0, or why not */
 static const char *vote_call(int p, const char *text)
 {
 	char kind[8], folder[64], name[64], what[160];
@@ -8365,8 +8583,12 @@ static const char *vote_call(int p, const char *text)
 		k = NET_VOTE_KICK;
 		str_cpy(name, sizeof name, mp_name(target));
 		folder[0] = 0;
+	} else if (str_len(kind) == 7 && str_ieq_n(kind, "restart", 7)) {
+		if (!restart_possible()) return "Not now: no match or warm-up is on.";
+		k = NET_VOTE_RESTART;
+		name[0] = folder[0] = 0;
 	} else {
-		return "Usage: /callvote map <map>, or /callvote kick <player> [reason]";
+		return "Usage: /callvote map <map>, /callvote kick <player> [reason], or /callvote restart";
 	}
 	g_vote.id = g_vote.id ? g_vote.id + 1 : (GetTickCount() * 2654435761u ^ g_server_id) | 1;
 	if (!g_vote.id) g_vote.id = 1;
@@ -8445,6 +8667,18 @@ static void vote_act(void)
 {
 	if (g_vote.kind == NET_VOTE_MAP) {
 		map_change(g_vote.folder, g_vote.subject);
+		return;
+	}
+	if (g_vote.kind == NET_VOTE_RESTART) {   /* every PC reloads into a new warm-up: new seeds, the level-start state compared */
+		g_vote.acted = 1;
+		vote_send_all();
+		if (!restart_possible()) {
+			log_msg("net: the voted restart can't happen now: no match or warm-up is on");
+			return;
+		}
+		log_msg("net: the vote restarts the %s: everyone reloads into a warm-up", g_warm ? "warm-up" : "match");
+		if (g_dedicated) server_print("Restarting from a warm-up (voted).");
+		host_go(1);
 		return;
 	}
 	g_vote.acted = 1;
@@ -9164,6 +9398,11 @@ void net_install(void)
 	g_delay = GetPrivateProfileIntA("net", "delay", 0, ini_path());   /* 0: rollback, no input delay */
 	g_record = GetPrivateProfileIntA("net", "record", 1, ini_path()) != 0;
 	if (g_delay > 30) g_delay = 30;
+	{   /* TEMP (lab): the aim held back while unarmed, the same on every PC */
+		char v[8];
+		g_aim_delay = GetEnvironmentVariableA("ARKLITE_AIM_DELAY", v, sizeof v) && v[0] >= '0' && v[0] <= '9' ? (u32)(v[0] - '0') : 0;
+		if (g_aim_delay) log_msg("net: TEMP aim held back %u ticks while unarmed", g_aim_delay);
+	}
 	if (port < 1 || port > 65535) port = DEFAULT_PORT;
 	g_port = (u16)port;
 

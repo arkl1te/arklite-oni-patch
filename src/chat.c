@@ -690,6 +690,7 @@ static int help(void)
 		"/players\tthe players and their numbers (one per internet address, from 1)",
 		"/callvote map Name\tvote to change the map (its folder or its name)",
 		"/callvote kick Who [why]\tvote to kick a player (name or number from /players)",
+		"/callvote restart\tvote to restart from a warm-up: everyone reloads, back in sync",
 		"/yes, /no\tanswer the vote (or Y / N, or the F1 Scoreboard)",
 		"/ip\tyour internet address, for a host outside your network",
 		"/punch address\thost: let in a player outside whose host can't be reached (they tell you their /ip)",
@@ -736,12 +737,12 @@ static int players_list(void)
 	return n + 1;
 }
 
-/* /callvote map Name, /callvote kick Who [why]: the host runs it (net.c "Votes"), and says it to everyone */
+/* /callvote map Name, /callvote kick Who [why], /callvote restart: the host runs it (net.c "Votes"), and says it to everyone */
 static void vote(const char *args)
 {
 	const char *err;
 	if (!*args) {
-		info("Usage: /callvote map Name, or /callvote kick Who [why] (Who: a name, or a number from /players)", 0, INFO);
+		info("Usage: /callvote map Name, /callvote kick Who [why] (Who: a name, or a number from /players), or /callvote restart", 0, INFO);
 		return;
 	}
 	if ((err = net_vote_call(args))) info(err, 0, INFO);

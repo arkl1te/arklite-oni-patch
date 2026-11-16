@@ -118,6 +118,7 @@ typedef unsigned long long u64;
 #define OBJrEnumerate           ((u32 (ONI_FC *)(u32, void *, u32))0x4d0080)
 #define OBJcType_CHAR           0x43484152   /* 'CHAR' */
 #define ONrGameState_NewCharacter ((u16 (ONI_FC *)(u8 *, u32, u32, u32 *))0x4dac50)
+#define OBJ_ID(o)               (*(u32 *)((o) + 0x4))     /* object_id: its Id in the level */
 #define OBJ_FLAGS(o)            (*(u32 *)((o) + 0x2c))
 #define OBJ_ISPLAYER            0x1
 #define OBJ_SPAWNED             0x20
@@ -177,7 +178,7 @@ static u32 g_level;
 static u32 g_input[PL][12] TICK_STATE; /* each player's input state, like gs+0xb8 (slot 0 unused) */
 static u32 g_record[12];               /* this frame's record for player 2 (gamepad) */
 static int g_has_record, g_tick_index;
-static const u32 (*g_net_records)[6][12];  /* networked game: records[slot][tick] (net.c) */
+static const u32 (*g_net_records)[NET_UPDATE_MAX][12];  /* networked game: records[slot][tick] (net.c) */
 static u32 g_net_count;
 static u32 g_count = 2;                /* players to spawn (players_set_count) */
 
@@ -369,7 +370,7 @@ const u32 *players_begin_frame(void)
 	return g_record;
 }
 
-void players_net_frame(const u32 (*records)[6][12], u32 n)
+void players_net_frame(const u32 (*records)[NET_UPDATE_MAX][12], u32 n)
 {
 	g_tick_index = 0;
 	g_has_record = 0;
@@ -607,6 +608,7 @@ static void player_tick(int s, int tick)
 		memcpy(rec, g_record, sizeof rec);
 		src = rec;
 	}
+	if (src) net_aim_tick(s, p2, rec);   /* (its aim: net.c "Aim held back while unarmed") */
 	if (src) note_choice(s, rec);
 	if (src && (!*gs_field(GS_INPUT_ON) || *gs_field(GS_INPUT_OFF) || (CHR_FLAGS(p2) & CHR_NOINPUT))) {
 		rec[7] = rec[8] = rec[9] = rec[10] = 0;
@@ -848,6 +850,22 @@ static u8 ONI_FC spawn_player(u8 *obj, u32 *seen)
 	return 1;   /* keep walking */
 }
 
+/* Catwalk's debug spawn point (ARKLITE_SPAWN, Play in Catwalk): the spawn point whose placement
+ * has that object id, while playing the level Catwalk started; -1 for the usual random pick. Only
+ * Konoko's first spawn of a level load: respawns pick as always. */
+static int debug_spawn(void)
+{
+	u32 id = custom_game_debug_spawn();
+	if (!id) return -1;
+	for (int i = 0; i < g_nspawn; i++)
+		if (OBJ_ID(g_spawn[i]) == id) {
+			log_msg("players: debug spawn point %u (%s), spawn point %d", id, OBJ_NAME(g_spawn[i]), i);
+			return i;
+		}
+	log_msg("players: debug spawn point %u isn't a player placement here; picking as usual", id);
+	return -1;
+}
+
 /* Replaces the walks that spawn the player (all three walk CHAR with 0x48a3a0, which spawns the
  * first Player-flagged placement) */
 static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
@@ -868,7 +886,8 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 		/* Konoko: her placement moved to the spawn point while the game spawns her */
 		u8 *obj = g_spawn[0];
 		u32 pos[3], facing = OBJ_FACING(obj);
-		int point = choose_spawn(0, 0, 1);
+		int point = debug_spawn();
+		if (point < 0) point = choose_spawn(0, 0, 1);
 		memcpy(pos, OBJ_POS(obj), sizeof pos);
 		memcpy(OBJ_POS(obj), OBJ_POS(g_spawn[point]), sizeof pos);
 		OBJ_FACING(obj) = OBJ_FACING(g_spawn[point]);

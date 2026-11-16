@@ -287,9 +287,7 @@ static void draw_vote(void)
 	char what[160], line[224];
 
 	if (!net_vote(&v)) return;
-	if (v.kind == NET_VOTE_MAP) fmt(what, "change the map to %s", v.subject);
-	else if (v.reason[0]) fmt(what, "kick %s (%s)", v.subject, v.reason);
-	else fmt(what, "kick %s", v.subject);
+	net_vote_what(what, sizeof what, v.kind, v.subject, v.reason);
 	if (v.state == NET_VOTE_OPEN) fmt(line, "Vote: %s", what);
 	else fmt(line, v.state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
 	text_at(line, 0, 8, UI_LEFT, v.state == NET_VOTE_OPEN ? WHITE : v.state == NET_VOTE_PASSED ? 0xff40ff40u : 0xffff4040u, AREA_W);

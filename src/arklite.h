@@ -124,6 +124,7 @@ const char *custom_game_level_folder(u32 level); /* that folder's name in Custom
 int  custom_game_remount(u32 level);             /* list its files again and mount them (net.c's map download) */
 int  custom_game_mount_folder(u32 level, const char *folder);   /* CustomLevels\<folder> in that slot instead */
 int  custom_game_folder_path(const char *folder, char *out, u32 size);   /* CustomLevels\<folder>\, there or not */
+u32  custom_game_debug_spawn(void);              /* ARKLITE_SPAWN's object id while loading the autostarted level, or 0 */
 const char *custom_game_level_name(u32 level);   /* the custom level's name (level.ini), or 0 */
 int  custom_game_has_folder(const char *folder);  /* CustomLevels\<folder> holds a level */
 int  custom_game_folder_dir(const char *folder, char *out, u32 size);   /* its folder (ends with '\\'), 1 if it holds a level */
@@ -222,6 +223,8 @@ void rollback_net_end(void);
 void rollback_phase_text(char *out, u32 size);   /* a tick's parts' average time since the last call (net.c's 30 s line) */
 void rollback_gap_allow(void);            /* net.c hooked the frame's camera call after the tick loop... */
 void rollback_update_end(void);           /* ...which calls this: protection kept between ticks ends */
+void rollback_gap_hold(int on);           /* a re-run's last tick keeps the protection for the frame's own ticks */
+void rollback_gap_close(void);            /* net_update's end: a protection still kept is opened */
 int  rollback_restore_tick(u32 tick);     /* back to the start of tick: 1, or 0 if not kept */
 void rollback_impulses(int on);           /* one-shot sounds off while ticks run again */
 u32  rollback_ambients_stopped(void);     /* ambient sounds stopped because their ticks were taken back */
@@ -232,6 +235,7 @@ int  rollback_check_end(const char *what); /* after the same ticks ran again: 1 
 void rollback_check_stats(u32 *checks, u32 *bad);
 void rollback_keep(const void *p, u32 n); /* memory a rewind never puts back (HUD textures) */
 #define ROLLBACK_KEPT_TICKS 12            /* RB_SLOTS: how far back the game can go */
+#define NET_UPDATE_MAX      ROLLBACK_KEPT_TICKS   /* ticks in one update at most (a rollback's re-run: net.c update_cap) */
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
 int  lockstep_replay_spawn_seed(u32 *seed);   /* replaying: the recording's spawn seed (1), else 0 */
@@ -251,6 +255,7 @@ void net_install(void);        /* ARKLITE_HOST / ARKLITE_JOIN: two PCs in lockst
 void net_exit(void);
 void net_main_menu(void);      /* the main menu opened: the network game this PC was in is over */
 int  net_active(void);
+void net_aim_tick(int slot, const u8 *chr, u32 *rec);   /* in the tick: the aim slot's record applies (net.c) */
 int  net_synced(void);   /* in a session every PC runs the same (warm-up or match): multiplayer rules, players or not */
 /* Custom Game picks what the next level is: alone, hosting, or joining */
 #define NET_DEFAULT_PORT    27777
@@ -402,12 +407,12 @@ enum {
 };
 #define NETBAD_LAST NETBAD_SPECTATE
 const char *net_kick_note(void);   /* joiner: why the server removed this PC, and for how long ("" none) */
-/* Votes (net.c "Votes"): /callvote map <name>, /callvote kick <player> [reason]; the host runs them. A
+/* Votes (net.c "Votes"): /callvote map <name>, /callvote kick <player> [reason], /callvote restart; the host runs them. A
  * vote lasts NET_VOTE_SECONDS; it passes when at least half of the players answered Yes, and its
  * command follows 3 s later. Only players vote, never spectators. */
 #define NET_VOTE_SECONDS 30
 enum { NET_VOTE_NONE, NET_VOTE_OPEN, NET_VOTE_PASSED, NET_VOTE_FAILED };
-enum { NET_VOTE_MAP = 1, NET_VOTE_KICK };
+enum { NET_VOTE_MAP = 1, NET_VOTE_KICK, NET_VOTE_RESTART };
 typedef struct {
 	int state, kind;           /* NET_VOTE_* (NONE: nothing to show) */
 	int yes, no, voters;       /* voters: the players who may vote now */
@@ -418,6 +423,7 @@ typedef struct {
 	char subject[64];          /* the map's name, or the player's */
 	char reason[64];           /* kick: why ("" none) */
 } NetVote;
+void net_vote_what(char *out, u32 size, int kind, const char *subject, const char *reason);   /* "change the map to X", "kick X", ... */
 int  net_vote(NetVote *v);                 /* 1: a vote to show (open, or its result for a moment) */
 const char *net_vote_call(const char *args);   /* "map <name>" / "kick <player> [reason]": 0 asked, else why not */
 const char *net_vote_cast(int yes);        /* 0: answered, else why not */
@@ -694,7 +700,7 @@ const u32 *players_begin_frame(void);         /* player 2's record for this fram
 void players_replay_frame(const u32 *record); /* replay: this frame's recorded one instead */
 /* Players in a game: slot 0 Konoko, 1..PLAYERS_MAX-1 the next Player-flagged placements */
 #define PLAYERS_MAX NET_PLAYER_SLOTS   /* places; a listen host's game has NET_PLAYERS_MAX at most */
-void players_net_frame(const u32 (*records)[6][12], u32 n);   /* networked: slot s's tick i gets records[s][i] (slot 0 unused) */
+void players_net_frame(const u32 (*records)[NET_UPDATE_MAX][12], u32 n);   /* networked: slot s's tick i gets records[s][i] (slot 0 unused) */
 void players_set_count(u32 n);                /* players spawned at the next level load (2 by default) */
 u32  players_count(void);
 int  players_spawn_points(void);              /* the level's Player-flagged placements */
@@ -753,6 +759,8 @@ u8 *ONI_FC lockstep_p3_create_particle(u8 *cls, u32 time);
 u8 *ONI_FC lockstep_p3_create_effect(void *spec, void *data);
 u8 ONI_FC lockstep_p3_send_event(u8 *cls, u8 *particle, u32 event, float time);
 void wm_timers_check(void);                         /* live_menu.c: before every WMrUpdate */
+u32  lockstep_sounds_moved(void);                     /* net.c: one-shot sounds a late input moved, not played twice */
+void lockstep_glass_rewound(void);                    /* rollback.c: after every restore (lockstep.c "Broken glass") */
 void lockstep_decor_level_log(void);                  /* every tick (lockstep.c), after the game's */
 int  mutators_body_gone(const u8 *c);      /* a player whose bomb went off: not drawn */
 void players_spawn_weapons(int blank);     /* players.c: the spawn placements' weapons blanked (1) or back (0) */

@@ -69,6 +69,11 @@ static int  g_autostartPending;
  * as Catwalk gives it (a copy of level 1: 0 Combat Training, 1 the Warehouse). -1: not given. */
 static int  g_autostartSavePoint = -1;
 static int  g_startSavePoint = -1;
+/* ARKLITE_SPAWN=<object id> (with AUTOSTART): Catwalk's debug spawn point, the IsPlayer
+ * character placement whose spot the player starts at in that level (players.c). 0: not given. */
+static u32  g_autostartSpawn;
+static char g_spawnFolder[64];                /* the autostart folder it belongs to */
+static u32  g_loadingSlot;                    /* the level whose files were opened last (open_level_file_hook) */
 
 /* persist.dat save games in memory (ONrPersist, 0x50f320): [40 levels][10 save points],
  * 0x204 bytes each (ONtContinue: name[64], flags at 0x40: bit 0 = present, bit 1 = restore_game
@@ -507,6 +512,7 @@ static u16 ONI_FC open_level_file_hook(char *ref, void **out)
 	for (u32 i = 0; i < TMgLevelFileCount; i++) {
 		u32 slot = TMgLevelFiles[i].file_index >> 25;
 		if (TMgLevelFiles[i].ref != ref || slot == 0) continue;
+		g_loadingSlot = slot;
 		if (slot != (u32)g_slot) {
 			str_cpy(g_igmdFormat, sizeof g_igmdFormat, "IGMD\\%s");
 			break;
@@ -543,6 +549,13 @@ const char *custom_game_level_dir(u32 level)
 const char *custom_game_level_folder(u32 level)
 {
 	return custom_game_level_ini(level) ? g_mountedFolder : 0;
+}
+
+u32 custom_game_debug_spawn(void)
+{
+	const char *folder = custom_game_level_folder(g_loadingSlot);   /* not current yet while spawning */
+	if (!g_autostartSpawn || !folder || net_active()) return 0;
+	return str_ieq_n(folder, g_spawnFolder, sizeof g_spawnFolder) ? g_autostartSpawn : 0;
 }
 
 const char *custom_game_level_name(u32 level)
@@ -1175,6 +1188,17 @@ void custom_game_install(void)
 		if (GetEnvironmentVariableA("ARKLITE_SAVEPOINT", sp, sizeof sp) - 1 < sizeof sp - 1 &&
 		    sp[0] >= '0' && sp[0] <= '9')
 			g_autostartSavePoint = sp[0] - '0';
+	}
+	if (g_autostartPending && GetEnvironmentVariableA("ARKLITE_AUTOSTART", 0, 0)) {   /* not a dedicated server */
+		char id[16];
+		u32 n = 0;
+		if (GetEnvironmentVariableA("ARKLITE_SPAWN", id, sizeof id) - 1 < sizeof id - 1)
+			for (const char *c = id; *c >= '0' && *c <= '9'; c++) n = n * 10 + (u32)(*c - '0');
+		if (n) {
+			g_autostartSpawn = n;
+			str_cpy(g_spawnFolder, sizeof g_spawnFolder, g_autostart);
+			log_msg("autostart: debug spawn point %u", n);
+		}
 	}
 
 	patch_push_imm32(ONcMainMenu_ProcPushAddr, ONcMainMenu_Proc, (u32)main_menu_proc);

@@ -348,36 +348,74 @@ static u32 impulse_start(void)
  * shot, the taunt heard only when the guess "still held" was right). Now each tick remembers
  * the sounds its runs started (group and impulse, in order), and a re-run plays a sound only
  * when it starts more of it than the tick's runs before did: a little late, not twice. Which
- * sounds play is never game state (the sound card decides as much), so the PCs stay in sync. */
+ * sounds play is never game state (the sound card decides as much), so the PCs stay in sync.
+ *
+ * A late input also moves sounds: the guess (the last input, held) started a move, or the next
+ * part of a combo, a tick or a few earlier or later than the real input does, and so the move's
+ * sound. The first run played it at one tick, the re-run started it at another, where no run had
+ * played it: heard twice (2026-11-15 test build, /bug: a ninja's "double flip kick" sound twice).
+ * So each sound a run plays is claimed by that run; a rollback leaves the sounds of the ticks it
+ * takes back unclaimed (played_rewound), and a run that starts a sound takes an unclaimed one of
+ * the same group and impulse, at its own tick or up to PLAYED_SHIFT ticks away, instead of playing
+ * it again. Unclaimed ones are the guess's sounds the real inputs moved or never made: the first
+ * kind is matched, the second was heard once already. */
 #define PLAYED_TICKS 64
 #define PLAYED_MAX   32
-typedef struct { u32 tick, n, sig[PLAYED_MAX]; } Played;
+#define PLAYED_SHIFT 12   /* ticks a late input can move a sound (rollbacks go back 10 at most) */
+typedef struct { u32 tick, n, claimed, sig[PLAYED_MAX]; } Played;   /* claimed: bit k, sig[k] is the current run's */
 static Played g_played[PLAYED_TICKS];
-static u32 g_play_tick;              /* the tick running, and the sounds this run of it started */
-static u32 g_run_sig[PLAYED_MAX], g_run_n;
+static u32 g_play_tick;              /* the tick running */
+static u32 g_played_moved;           /* sounds not played twice: an earlier run played them at a tick nearby */
 
 static void played_tick_begin(u32 tick)
 {
 	Played *p = &g_played[tick % PLAYED_TICKS];
 	g_play_tick = tick;
-	g_run_n = 0;
 	if (!g_impulses_muted || p->tick != tick) {   /* the tick's first run */
 		p->tick = tick;
 		p->n = 0;
+		p->claimed = 0;
 	}
+}
+
+/* A rollback's re-run starts at tick from: the sounds earlier runs played from there on belong to no run until one starts them again */
+static void played_rewound(u32 from)
+{
+	for (u32 i = 0; i < PLAYED_TICKS; i++)
+		if (g_played[i].tick >= from) g_played[i].claimed = 0;
+}
+
+/* An unclaimed sig in p: claimed now (1), or none (0) */
+static int played_claim(Played *p, u32 sig)
+{
+	for (u32 k = 0; k < p->n; k++)
+		if (p->sig[k] == sig && !(p->claimed >> k & 1)) {
+			p->claimed |= 1u << k;
+			return 1;
+		}
+	return 0;
 }
 
 static u32 impulse_play(u32 group, u32 impulse)
 {
 	Played *p = &g_played[g_play_tick % PLAYED_TICKS];
-	u32 sig = group * 0x9e3779b1u ^ impulse, before = 0, played = 0;
+	u32 sig = group * 0x9e3779b1u ^ impulse;
 	if (!SSgDriverOn) return 0;
 	if (!sound_in_tick()) return !g_impulses_muted;
-	for (u32 k = 0; k < g_run_n; k++) before += g_run_sig[k] == sig;
-	if (g_run_n < PLAYED_MAX) g_run_sig[g_run_n++] = sig;
-	for (u32 k = 0; k < p->n; k++) played += p->sig[k] == sig;
-	if (played > before) return 0;   /* an earlier run of the tick played it */
-	if (p->n < PLAYED_MAX) p->sig[p->n++] = sig;
+	if (played_claim(p, sig)) return 0;   /* an earlier run of the tick played it */
+	for (u32 d = 1; d <= PLAYED_SHIFT; d++)   /* or of a tick nearby, the nearest first: the same sound, moved */
+		for (int side = 0; side < 2; side++) {
+			u32 t = side ? g_play_tick + d : g_play_tick - d;
+			Played *q = &g_played[t % PLAYED_TICKS];
+			if (q->tick == t && q->n && played_claim(q, sig)) {
+				g_played_moved++;
+				return 0;
+			}
+		}
+	if (p->n < PLAYED_MAX) {
+		p->claimed |= 1u << p->n;
+		p->sig[p->n++] = sig;
+	}
 	return 1;
 }
 
@@ -441,9 +479,18 @@ static u32 ONI_FC ambient_update(u8 *ambient, u32 edx)
 	return r;
 }
 
+/* net.c, at a network session's end: one-shot sounds a run didn't play again since the last call (impulse_play) */
+u32 lockstep_sounds_moved(void)
+{
+	u32 n = g_played_moved;
+	g_played_moved = 0;
+	return n;
+}
+
 /* 1: impulse_play decides per sound, nothing more to patch */
 int lockstep_impulses_mute(int muted)
 {
+	if (muted && !g_impulses_muted) played_rewound(GS_TICK(ONgGameState));   /* (the game was just put back to that tick) */
 	g_impulses_muted = (u8)muted;
 	return g_play_hooked;
 }
@@ -1256,6 +1303,150 @@ static void quality_install(void)
 	log_msg("particles: network games run every class at High quality on every PC; this PC's quality leaves out only classes that look");
 }
 
+/* ---- Broken glass in network games ------------------------------------------------------ *
+ * A breakable pane breaks in ONrParticle3_EmitGlassPieces (0x508f10, Oni_Particle3.c, from
+ * P3iDamageQuad 0x462d60: the DamageBlast, GlassCharge and DamageEnvironment actions): it sets the
+ * quad's BrokenGlass flag (gqGeneral +0x30, 0x40000), then emits its shards, drawing 3 to 5
+ * numbers a shard from the tick's effects stream (45 shards, 540 draws, for the pane of Versus).
+ * An already broken quad returns at once. The flag is level data: the environment's quads are in
+ * the level file Oni maps (MapViewOfFile, 0x402485), which no rollback snapshot holds on any PC
+ * (both PCs' snapshots cover ~47 MB of Oni's heap). So when a rollback ran a tick that broke a
+ * pane again, the pane was already broken, the re-run emitted nothing, and that PC's effects seed
+ * fell 540 draws behind the other's for good. 2026-11-15 test build (2193e77): DESYNC at tick
+ * 47160 of a warm-up on Versus, every character equal, only the effects seed apart from tick
+ * 47116 (the joiner's ninja firing); a playback of the host's recording made the 540 draws at
+ * that tick (ONrParticle3_EmitGlassPieces, its first glass of the session), the host's live game
+ * none: a rollback's first run had broken the pane there already.
+ *
+ * Now each pane broken in a network game's tick goes into a list kept as tick state (.tstate:
+ * snapshotted and put back with the game), and every pane this PC broke into a second list that no
+ * rewind touches. After each restore (rollback.c), a pane of the second list has the flag exactly
+ * when the restored first list has it: a rewind to before its break mends it, and the re-run breaks
+ * it again with its shards. Each level's start empties both lists (the load itself makes every pane
+ * whole again: a warm-up's 24 broken quads were all whole at the match's start, hidden test).
+ *
+ * The number of shards also came from each PC's graphics quality (ONgGlassDetailLevel 0x5564b0,
+ * set to min(2, quality) by ONrParticle3_LevelBegin 0x508dd0): cells of 22, 20 or 15 units and
+ * 2.5, 3.5 or 5 shards a cell. Two PCs with different qualities drew different counts for one
+ * pane. In network games it's 2 on every PC (the most shards: Oni's default). */
+#define ONrParticle3_LevelBegin     0x508dd0
+#define ONcParticle3_LevelBeginCall 0x505f42   /* in the level load, after P3rLevelBegin (0x505e9b) */
+#define ONcGlass_FlagSet            0x508f47   /* in 0x508f10: or eax, 0x40000 (ESI the quad), then mov [esi+0x30], eax */
+#define ONgGlassDetailLevel         (*(u32 *)0x5564b0)
+#define ONcGlass_MaxDetail          2
+#define AKcGQ_BrokenGlass           0x40000
+#define GQ_FLAGS(q)                 (*(u32 *)((q) + 0x30))
+#define GLASS_MAX                   512
+
+static u32 g_glass_n TICK_STATE;            /* panes broken in this level's ticks, as of this tick */
+static u32 g_glass_q[GLASS_MAX] TICK_STATE; /* their quads (gqGeneral entries) */
+static u32 g_glass_seen[GLASS_MAX], g_glass_seen_n;   /* every pane this PC broke in this level, rewound ones too */
+static u32 g_glass_arr;                     /* the quad array (AKtGQGeneralArray) both lists point into */
+static u32 g_glass_breaks, g_glass_mended, g_glass_full;   /* this level's: breaks (re-runs' too), mends */
+static int g_glass_on;
+
+/* The environment's quad array (gs +0x150 the level, +0x40 its environment, +0xc gqGeneralArray), 0 if none */
+static u32 glass_array(void)
+{
+	u8 *gs = ONgGameState, *level, *env;
+	if (!gs || !(level = *(u8 **)(gs + 0x150)) || !(env = *(u8 **)(level + 0x40))) return 0;
+	return *(u32 *)(env + 0xc);
+}
+
+static int glass_in(const u32 *list, u32 n, u32 q)
+{
+	for (u32 i = 0; i < n; i++)
+		if (list[i] == q) return 1;
+	return 0;
+}
+
+/* Oni just set a quad's BrokenGlass flag (it was clear): note it while a network game runs */
+__attribute__((used)) static void __cdecl glass_broke(u32 quad)
+{
+	u32 arr;
+	if (!net_active() || !(arr = glass_array())) return;
+	if (arr != g_glass_arr) {   /* (a level whose start glass_level_begin didn't see: the lists start here) */
+		g_glass_arr = arr;
+		g_glass_n = g_glass_seen_n = 0;
+	}
+	if (g_glass_n >= GLASS_MAX || (!glass_in(g_glass_seen, g_glass_seen_n, quad) && g_glass_seen_n >= GLASS_MAX)) {
+		if (!g_glass_full++) log_msg("glass: more than %d panes broke in this level: later ones aren't mended by rewinds", GLASS_MAX);
+		return;
+	}
+	g_glass_q[g_glass_n++] = quad;
+	if (!glass_in(g_glass_seen, g_glass_seen_n, quad)) g_glass_seen[g_glass_seen_n++] = quad;
+	g_glass_breaks++;
+}
+
+/* In place of 0x508f47's or eax, 0x40000: every register but the flags kept (the next cmp sets them) */
+__attribute__((naked)) static void glass_flag_stub(void)
+{
+	__asm__ volatile(
+		"orl $0x40000, %%eax\n\t"
+		"pushl %%eax\n\t"
+		"pushl %%ecx\n\t"
+		"pushl %%edx\n\t"
+		"pushl %%esi\n\t"   /* the quad */
+		"call %c0\n\t"
+		"addl $4, %%esp\n\t"
+		"popl %%edx\n\t"
+		"popl %%ecx\n\t"
+		"popl %%eax\n\t"
+		"ret\n" :: "i"(glass_broke));
+}
+
+/* rollback.c, after every restore: each pane this PC broke is broken exactly when the restored game has it so */
+void lockstep_glass_rewound(void)
+{
+	u32 kept = 0;
+	if (!g_glass_on || !g_glass_seen_n || glass_array() != g_glass_arr) return;
+	for (u32 i = 0; i < g_glass_seen_n; i++) {
+		u32 q = g_glass_seen[i];
+		if (glass_in(g_glass_q, g_glass_n, q)) {
+			GQ_FLAGS(q) |= AKcGQ_BrokenGlass;   /* (the rewind test's last restore goes forward again) */
+			g_glass_seen[kept++] = q;
+		} else if (GQ_FLAGS(q) & AKcGQ_BrokenGlass) {
+			GQ_FLAGS(q) &= ~AKcGQ_BrokenGlass;
+			g_glass_mended++;
+		}
+	}
+	g_glass_seen_n = kept;
+}
+
+/* In place of the level load's call to ONrParticle3_LevelBegin */
+static u32 glass_level_begin(void)
+{
+	u32 r = ((u32 (*)(void))ONrParticle3_LevelBegin)();
+	if (g_glass_breaks)
+		log_msg("glass: the last network level: %u pane(s) broken, %u breaks counting rollbacks' re-runs, %u mended by rollbacks",
+		        g_glass_seen_n, g_glass_breaks, g_glass_mended);
+	g_glass_n = g_glass_seen_n = g_glass_breaks = g_glass_mended = g_glass_full = 0;
+	g_glass_arr = glass_array();
+	if (net_active()) ONgGlassDetailLevel = ONcGlass_MaxDetail;   /* the same shards on every PC, whatever its graphics quality */
+	return r;
+}
+
+static void glass_install(void)
+{
+	/* mov eax,[esi+0x30]; test eax,0x40000; jne +0x89b; or eax,0x40000; cmp ebp,ebx; mov [esi+0x30],eax */
+	static const u8 site[] = { 0x8b, 0x46, 0x30, 0xa9, 0x00, 0x00, 0x04, 0x00, 0x0f, 0x85, 0x9b, 0x08, 0x00, 0x00,
+	                           0x0d, 0x00, 0x00, 0x04, 0x00, 0x3b, 0xeb, 0x89, 0x46, 0x30 };
+	/* ONrParticle3_LevelBegin: call ONrPersist_GetGraphicsQuality; cmp eax,2 */
+	static const u8 begin[] = { 0xe8, 0xfb, 0x62, 0x00, 0x00, 0x83, 0xf8, 0x02 };
+	const u8 *c = (const u8 *)ONcParticle3_LevelBeginCall;
+	if (!code_matches(ONcGlass_FlagSet - 14, site, sizeof site) || !code_matches(ONrParticle3_LevelBegin, begin, sizeof begin) ||
+	    c[0] != 0xe8 || ONcParticle3_LevelBeginCall + 5 + *(const u32 *)(c + 1) != ONrParticle3_LevelBegin) {
+		log_msg("glass: 0x%x changed: a rollback over a pane's break leaves it broken (network games can desync)", ONcGlass_FlagSet);
+		return;
+	}
+	u8 call[5] = { 0xe8 };
+	*(u32 *)(call + 1) = (u32)glass_flag_stub - (ONcGlass_FlagSet + 5);
+	patch_write(ONcGlass_FlagSet, call, sizeof call);
+	patch_call(ONcParticle3_LevelBeginCall, ONrParticle3_LevelBegin, (u32)glass_level_begin);
+	g_glass_on = 1;
+	log_msg("glass: in network games a rollback mends the panes it takes back, and every PC breaks a pane into as many shards");
+}
+
 /* Logged once a level: how many classes were worked out so far, and how many only look */
 void lockstep_decor_level_log(void)
 {
@@ -1831,6 +2022,8 @@ static void session_begin(u32 level)
 /* One tick of the game, with its input record (rollback.c may run it twice) */
 static void tick_body(void *action)
 {
+	/* Konoko's aim (net.c "Aim held back while unarmed"): here, after the tick's snapshot (rollback_test_tick) */
+	if (action && ONgGameState) net_aim_tick(0, *(u8 **)(ONgGameState + 0xac), action);
 	visited_wipe();                /* the same empty visited marks on every PC (see visited_wipe) */
 	players_tick_record(action);   /* Konoko's F2 choice */
 	g_tick_tid = GetCurrentThreadId();
@@ -2000,6 +2193,7 @@ void lockstep_install(void)
 	two_sided_install();
 	frame_state_install();
 	col_install();
+	glass_install();
 	/* the tick hook tells the local RNG when a tick is running, so it's always in */
 	if (tick_ok) {
 		patch_call(ONcGameState_TickCall, (u32)ONrGameState_Tick, (u32)tick_hook);
