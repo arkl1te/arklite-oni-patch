@@ -40,7 +40,8 @@
  *
  * The same window procedure keeps F10 from Windows: it's the system menu key, and DefWindowProc
  * would go into menu mode on it (WM_SYSKEYDOWN, then SC_KEYMENU), which can swallow the next key.
- * Oni has no menu, and F10 is photo mode's key; Oni reads its own keys without these messages. */
+ * Oni has no menu, and F10 is a key of Oni's developer mode (stop_record); Oni reads its own keys
+ * without these messages. (Photo mode had F10 up to 0.6.0, F4 now.) */
 #include "arklite.h"
 
 #define WM_MOUSEWHEEL   0x20a

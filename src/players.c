@@ -68,7 +68,10 @@
  * In a network match (not the warm-up: players_set_limits on) a living player's new choice waits
  * for their respawn; only the first choice the tick sees for them in the match (the one they made
  * in the warm-up, or before joining in progress) still changes them at once, so nobody starts the
- * match as the map's class. Elsewhere (the warm-up, a game alone) a living player doesn't have to
+ * match as the map's class. With One Character (NET_MUT_ONE_CHARACTER, players_one_family) a
+ * match picks one character from its spawn seed, and every choice the tick notes that isn't one
+ * of its variations becomes its main class: everyone changes into it at the match's start, and
+ * picks only among its variations, at the next respawn, until the match ends. Elsewhere (the warm-up, a game alone) a living player doesn't have to
  * die: a new choice changes their class at once, wherever they are, as the shapeshifter cheat does (0x4d7c30: ECX the character, EDX the ONCC; called from
  * utility input at 0x4f62fb). It swaps the class (char +0xc) and its animations in place, so
  * position, health, weapons and inventory stay. Choosing the map's class goes back to the class
@@ -574,6 +577,11 @@ static void note_choice(int who, const u32 *rec)
 		}
 		g_class[who] = -1;
 	}
+	/* One Character (char_menu.c): a match holds every choice to its character's variations */
+	{
+		int f = players_one_family(), main;
+		if (f >= 0 && !char_menu_family_has(f, g_class[who]) && (main = char_menu_family_main(f)) >= 0) g_class[who] = main;
+	}
 	g_noted[who] = 1;
 	daodan_log(who);
 	emote_tick(who, rec[11]);
@@ -746,6 +754,7 @@ void players_level_begin(void)
 	g_spawn_seed_due = 1;
 	char_menu_level_begin();   /* the map scripts' F2 settings start over, before main() */
 	mp_rules_level_begin();    /* and ark_characters_alwaystaunt */
+	dialog_level_begin();
 }
 
 static u8 ONI_FC collect_spawn(u8 *obj, u32 unused)
@@ -1405,6 +1414,25 @@ void players_set_limits(int on, u32 ticks, int score)
 }
 
 u32 players_over_tick(void) { return g_limits_on ? g_over_tick : 0; }
+
+/* One Character: the match's character, from its spawn seed (the same on every PC: set before the
+ * level loads from the host's match seed, net.c); -1 in the warm-up, the lobby, or without the
+ * mutator. Picked again when the seed or the host's rules change, so a new match picks anew. */
+int players_one_family(void)
+{
+	static u32 seed, rules;
+	static int family = -1, known;
+
+	if (!g_limits_on || !net_mutator(NET_MUT_ONE_CHARACTER)) return -1;
+	if (!known || seed != g_spawn_seed || rules != net_char_rules()) {
+		known = 1;
+		seed = g_spawn_seed;
+		rules = net_char_rules();
+		family = char_menu_pick_family(seed ^ 0x6a09e667u);
+		log_msg("players: One Character: everyone plays %s this match", family >= 0 ? char_menu_family_label(family) : "(no character found)");
+	}
+	return family;
+}
 
 int players_time_left(void)
 {

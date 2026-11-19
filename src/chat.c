@@ -59,13 +59,21 @@
  * Their answers are this screen's lines only, in light blue (INFO). After /help and /movelist
  * the chat stays open, scrolled to the list's first line.
  *
- * The move list is arklite/moves.md, put into the DLL whole at build time (build.sh): its section
- * whose "Animation sets:" line starts with the character's animation collection (ONCC +0xc80,
- * the TRAC's name without "_animations"), so every version of a character, and any class sharing
- * its collection, finds the same table. Each row is a line with a tab between the move's name
- * (empty when the game doesn't name it) and its input; rows every table has (find_common) are
- * left out unless the character names the move, and one line says what everyone has. Tabbed lines draw the part after the tab
- * in a column (Message.tab_ref, the list's widest name, sets where), wrapping inside it. */
+ * The move list is read from the character's animation collection in memory (ONCC +0xc80 and the
+ * collections it inherits; "The move list" below), so it's right for every class, a mod's too: each
+ * input of moves.md (moves_table.h, generated from the data behind it) is looked up the way the game
+ * looks it up. Each row is a line with a tab between the move's name (empty when the game doesn't
+ * name it) and its input; the game's own unnamed moves on the inputs every fighter has are left out
+ * when the character has them all, and one line says what everyone has. The title names the set
+ * as moves.md does ("Konoko's set"), or a mod's collection by name. Tabbed lines draw the part after
+ * the tab in a column (Message.tab_ref, the list's widest name, sets where), wrapping inside it.
+ *
+ * Inputs show in a fighting game's notation (move_icons, 2026-11-16): P punch, K kick, the arrows
+ * (text.c's two-byte characters; Tahoma has them) for forward, back, left and right, "+" for keys
+ * pressed together, "," for one after another, "x4" as "×4". Crouch, Jump and Action stay words:
+ * Oni's default keys put kick on C, so a letter for them would read as a key. What comes before a
+ * ": " is the situation ("Running:", "Behind an opponent:") and stays as written, and so does a
+ * note after " - ". A line at the top says what the signs mean. moves.md itself stays in words. */
 #include "arklite.h"
 
 #define ONgGameWindow (*(void **)0x63100c)   /* ONgPlatformData.gameWindow */
@@ -113,6 +121,7 @@ __declspec(dllimport) long WINAPI CallWindowProcW(WNDPROC, void *, u32, u32, lon
 #define VK_RIGHT        0x27
 #define VK_DOWN         0x28
 #define VK_DELETE       0x2e
+#define VK_T            0x54
 
 #define CHAT_KEEP       160       /* messages kept (a move list is up to ~60) */
 #define CHAT_LINES      10        /* history lines while open */
@@ -147,6 +156,7 @@ typedef struct {
 static Message g_msg[CHAT_KEEP];
 static int g_nmsg;                  /* g_msg[0] the oldest */
 static int g_open, g_hold, g_scroll;
+static int g_list_top;              /* a list's message count: draw scrolls to its first line (wrapped lines counted) */
 static char g_in[CHAT_MAX];
 static int g_cur, g_anchor, g_view;
 static u32 g_fade_ms = 10000;
@@ -154,6 +164,7 @@ static WNDPROC g_old_proc;
 static u8 *g_black, *g_white, *g_blue;
 static u32 g_blink_from;
 static u32 g_bold;                  /* the HUD's (bold) style, while chat_draw draws plain */
+static int g_skip_char;             /* the WM_CHAR of the T that opened the chat (developer mode) */
 
 static int clamp(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
@@ -342,11 +353,25 @@ void chat_whisper_receive(int who, const char *text)
 #define CHR_CLASS(c)            (*(u8 **)((c) + 0xc))      /* the ONCC */
 #define ONCC_ANIMATIONS(c)      (*(u8 **)((c) + 0xc80))    /* TRAC */
 
-/* arklite/moves.md, whole, with a 0 at the end (build.sh writes it to build/moves.inc as bytes) */
-static const char g_moves_md[] = {
-#include "moves.inc"
-	0
-};
+#define ONCC_LEFT_HANDED(o)     (*(u8 *)((o) + 0xc8c))     /* WeaponHand */
+#define ONCC_SOUND(o, k)        ((const char *)(o) + 0x2b4 + 32 * (k))   /* AI vocalizations: 6 super punch, 7 super kick */
+#define TRAC_PARENT(t)          (*(u8 **)((t) + 0x10))     /* the next collection the lookup tries */
+#define TRAC_SHORTCUTS_ONLY(t)  (*(u16 *)((t) + 0x14))     /* the game's own: the shortcuts of the one before */
+#define TRAC_COUNT(t)           (*(u16 *)((t) + 0x16))
+#define TRAC_STATE(t, i)        (*(u16 *)((t) + 0x1a + 12 * (i)))   /* the situation it's looked up from */
+#define TRAC_ANIMATION(t, i)    (*(u8 **)((t) + 0x20 + 12 * (i)))
+#define TRAM_VOCALIZATION(a)    (*(u16 *)((a) + 0x4e))
+#define TRAM_TYPE(a)            (*(u16 *)((a) + 0x15a))
+#define TRAM_VARIENT(a)         (*(u16 *)((a) + 0x168))
+#define TRAM_FIRST_LEVEL(a)     (*(u16 *)((a) + 0x176))
+#define TRgLevelNumber          (*(u16 *)0x6b8744)
+#define STATE_ANYTHING          1
+#define VAR_FIGHT               0x0200
+#define VAR_RIFLE_RIGHT         0x2000
+#define VAR_RIFLE_LEFT          0x4000
+#define TYPE_PUNCH_RIFLE        226
+
+#include "moves_table.h"
 
 static int ieq(const char *a, const char *b)
 {
@@ -373,180 +398,291 @@ static const char *class_name(u8 *c)
 	return n ? n : "this character";
 }
 
-/* moves.md's text between s and e as plain ASCII: dashes, arrows and the times sign spelled out,
- * Markdown's * dropped, no spaces at either end */
-static void md_ascii(char *d, int size, const char *s, const char *e)
+/* ---- The move list ----
+ * Read from the character's animation collection as it is in memory, so the moves a mod adds
+ * (an AE package's set, a new character) are there too. Each row of moves_table.h (moves.md's
+ * inputs) is one of the game's lookups: the move type from the situation, in its collection and
+ * the ones it inherits, like Oni.exe's 0x427fd0 (TRrCollection_Lookup) without its random pick
+ * among equals (it would draw the game's random numbers). A combo shows only when the move it
+ * follows is there (Oni_Combos.c). Names are by animation, so a mod's new animation has none. */
+
+/* The animation col (and the ones after it) plays for type from state with the variant bits var,
+ * as 0x427fd0 picks it: the highest variant that fits, the next collection's when it fits better */
+static u8 *col_lookup(u8 *col, u32 type, u32 state, u32 var, int depth)
 {
-	int n = 0;
-	while (s < e && *s == ' ') s++;
-	while (s < e && n < size - 3) {
-		const u8 *u = (const u8 *)s;
-		if (u[0] == 0xe2 && s + 2 < e && u[1] == 0x80 && (u[2] == 0x93 || u[2] == 0x94)) d[n++] = '-', s += 3;
-		else if (u[0] == 0xe2 && s + 2 < e && u[1] == 0x86 && u[2] == 0x92) d[n++] = '-', d[n++] = '>', s += 3;
-		else if (u[0] == 0xe2 && s + 2 < e && u[1] == 0x80 && (u[2] == 0x98 || u[2] == 0x99)) d[n++] = '\'', s += 3;
-		else if (u[0] == 0xc3 && s + 1 < e && u[1] == 0x97) d[n++] = 'x', s += 2;
-		else if (u[0] >= 0x80) s++;
-		else if (*s == '*') s++;
-		else d[n++] = *s++;
+	u8 *res = 0, *r;
+	if (!col || depth > 32) return 0;
+	for (u32 i = 0; i < TRAC_COUNT(col); i++) {
+		u8 *a = TRAC_ANIMATION(col, i);
+		if (!a || TRAC_STATE(col, i) != state || TRAM_TYPE(a) != type) continue;
+		if ((TRAM_VARIENT(a) & ~var) || TRAM_FIRST_LEVEL(a) > TRgLevelNumber) continue;
+		if (!res || TRAM_VARIENT(a) > TRAM_VARIENT(res)) res = a;
 	}
-	while (n && d[n - 1] == ' ') n--;
+	if ((!res || TRAM_VARIENT(res) != var) && TRAC_PARENT(col)) {
+		r = col_lookup(TRAC_PARENT(col), type, state, var, depth + 1);
+		if (!r) r = col_lookup(TRAC_PARENT(col), type, STATE_ANYTHING, var, depth + 1);
+		if (r && (!res || TRAM_VARIENT(r) > TRAM_VARIENT(res))) res = r;
+	}
+	return res;
+}
+
+static u8 *anim_lookup(u8 *trac, u32 type, u32 state, u32 var)
+{
+	u8 *a = col_lookup(trac, type, state, var, 0);
+	return a ? a : col_lookup(trac, type, STATE_ANYTHING, var, 0);
+}
+
+#define MOVE_ROWS (int)(sizeof g_move_rows / sizeof g_move_rows[0])
+
+/* The animation each row plays for the class (0: it hasn't the move); returns whether it has every
+ * common row (then the unnamed game's own moves on those rows are left out) */
+static int class_moves(u8 *oncc, u8 *anim[MOVE_ROWS])
+{
+	u8 *trac = ONCC_ANIMATIONS(oncc);
+	u32 rifle = (ONCC_LEFT_HANDED(oncc) ? VAR_RIFLE_LEFT : VAR_RIFLE_RIGHT) | VAR_FIGHT;
+	int all = 1, dropped;
+
+	for (int i = 0; i < MOVE_ROWS; i++) {
+		const MoveRow *r = &g_move_rows[i];
+		anim[i] = 0;
+		for (int k = 0; k < 2 && !anim[i] && r->alt[k].type; k++)
+			for (int j = 0; j < (int)sizeof r->alt[k].states && r->alt[k].states[j] && !anim[i]; j++)
+				anim[i] = anim_lookup(trac, r->alt[k].type, r->alt[k].states[j],
+				                      r->alt[k].type == TYPE_PUNCH_RIFLE ? rifle : VAR_FIGHT);
+	}
+	/* a combo needs the move before it: one of that type, in any situation */
+	do {
+		dropped = 0;
+		for (int i = 0; i < MOVE_ROWS; i++) {
+			int has = 0;
+			if (!anim[i] || !g_move_rows[i].prereq) continue;
+			for (int j = 0; j < MOVE_ROWS && !has; j++) has = anim[j] && TRAM_TYPE(anim[j]) == g_move_rows[i].prereq;
+			if (!has) anim[i] = 0, dropped = 1;
+		}
+	} while (dropped);
+	for (int i = 0; i < MOVE_ROWS; i++) if (g_move_rows[i].common && !anim[i]) all = 0;
+	return all;
+}
+
+static const char *table_find(const char *const t[][2], int n, const char *key)
+{
+	for (int i = 0; key && i < n; i++) if (ieq(t[i][0], key)) return t[i][1];
+	return 0;
+}
+
+/* The move's name (gen_md.py's rule): the animation's, and what the class shouts with it */
+static void move_name(char *d, int size, u8 *oncc, u8 *a)
+{
+	const char *n = table_find(g_move_names, sizeof g_move_names / sizeof g_move_names[0], TMrInstance_GetInstanceName(a));
+	const char *s = 0;
+	u32 v = TRAM_VOCALIZATION(a);
+	if (v == 6 || v == 7) {
+		char snd[33];
+		memcpy(snd, ONCC_SOUND(oncc, v), 32);
+		snd[32] = 0;
+		s = table_find(g_move_shouts, sizeof g_move_shouts / sizeof g_move_shouts[0], snd);
+	}
+	if (s && n && !ieq(s, n) && !starts_i(n, s)) fmt(d, "%s (shouts %s)", n, s);
+	else str_cpy(d, size, n ? n : s ? s : "");
+}
+
+static int is_stock(u8 *a)
+{
+	const char *n = TMrInstance_GetInstanceName(a);
+	for (u32 i = 0; n && i < sizeof g_move_stock / sizeof g_move_stock[0]; i++)
+		if (ieq(g_move_stock[i], n)) return 1;
+	return 0;
+}
+
+/* The collection's set name ("konoko" of TRACkonoko_animations) */
+static void set_name(char *d, int size, u8 *trac)
+{
+	const char *tn = trac && !TRAC_SHORTCUTS_ONLY(trac) ? TMrInstance_GetInstanceName(trac) : 0;
+	int n;
+	str_cpy(d, size, tn ? tn : "?");
+	n = str_len(d);
+	if (n > 11 && ieq(d + n - 11, "_animations")) d[n - 11] = 0;
+}
+
+/* ---- The notation (see the top) ---- */
+
+#define SYM_FORWARD 0x2191   /* up arrow */
+#define SYM_BACK    0x2193   /* down arrow */
+#define SYM_LEFT    0x2190
+#define SYM_RIGHT   0x2192
+#define SYM_TIMES   0x00d7
+
+/* c (Unicode) into d[*n], or the ASCII fallback when Arklite's text can't hold it */
+static void put_sym(char *d, int *n, int size, u32 c, const char *fallback)
+{
+	char two[2];
+	int k = text_put(two, c);
+	if (k && *n + k < size) {
+		for (int i = 0; i < k; i++) d[(*n)++] = two[i];
+		return;
+	}
+	while (*fallback && *n < size - 1) d[(*n)++] = *fallback++;
+}
+
+static void put_str(char *d, int *n, int size, const char *t)
+{
+	while (*t && *n < size - 1) d[(*n)++] = *t++;
+}
+
+static int is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+/* s starts with word w (any case), not followed by a letter */
+static int word_at(const char *s, const char *w)
+{
+	int n = str_len(w);
+	return str_ieq_n(s, w, n) && !is_alpha(s[n]);
+}
+
+/* The keys part of an input ("Back, then forward + kick") in the notation ("↓, ↑+K") */
+static void keys_icons(char *d, int *n, int size, const char *s)
+{
+	static const struct { const char *w; u32 sym; const char *text; } words[] = {
+		{ "punch", 0, "P" }, { "kick", 0, "K" },
+		{ "forward", SYM_FORWARD, "Fwd" }, { "back", SYM_BACK, "Back" },
+		{ "left", SYM_LEFT, "Left" }, { "right", SYM_RIGHT, "Right" },
+		{ "crouch", 0, "Crouch" }, { "jump", 0, "Jump" }, { "action", 0, "Action" },
+	};
+	int at_word = 1;   /* s is at the start of a word */
+
+	while (*s && *n < size - 1) {
+		int done = 0;
+		if (str_ieq_n(s, "Dash (double-tap forward)", 25)) {
+			put_sym(d, n, size, SYM_FORWARD, "Fwd");
+			put_sym(d, n, size, SYM_FORWARD, "Fwd");
+			put_str(d, n, size, " (dash)");
+			s += 25;
+			continue;
+		}
+		if (str_ieq_n(s, " + ", 3)) { put_str(d, n, size, "+"); s += 3; at_word = 1; continue; }
+		if (str_ieq_n(s, ", then ", 7)) { put_str(d, n, size, ", "); s += 7; at_word = 1; continue; }
+		if (at_word && str_ieq_n(s, "let go of crouch", 16) && !is_alpha(s[16])) { put_str(d, n, size, "let go"); s += 16; continue; }
+		/* "×4" (moves_table.h has it as "x4") */
+		if (at_word && (*s == 'x' || *s == 'X') && s[1] >= '0' && s[1] <= '9') {
+			put_sym(d, n, size, SYM_TIMES, "x");
+			s++;
+			continue;
+		}
+		if (at_word && is_alpha(*s)) {
+			for (u32 i = 0; i < sizeof words / sizeof words[0] && !done; i++) {
+				if (!word_at(s, words[i].w)) continue;
+				if (words[i].sym) put_sym(d, n, size, words[i].sym, words[i].text);
+				else put_str(d, n, size, words[i].text);
+				s += str_len(words[i].w);
+				done = 1;
+			}
+			if (done) { at_word = 0; continue; }
+		}
+		at_word = !is_alpha(*s);
+		d[(*n)++] = *s++;
+	}
+}
+
+/* An input of moves.md (plain ASCII, md_row's) in the notation: the situation before the last
+ * ": " and a note after " - " as they are, the keys between them converted */
+static void move_icons(char *d, int size, const char *s)
+{
+	char keys[CHAT_MAX];
+	const char *note = 0, *start = s;
+	int n = 0, k = 0;
+
+	for (const char *p = s; *p; p++) if (p[0] == ' ' && p[1] == '-' && p[2] == ' ') { note = p; break; }
+	for (const char *p = s; *p && (!note || p < note); p++) if (p[0] == ':' && p[1] == ' ') start = p + 2;
+	while (s < start && n < size - 1) d[n++] = *s++;
+	while (*s && (!note || s < note) && k < (int)sizeof keys - 1) keys[k++] = *s++;
+	keys[k] = 0;
+	keys_icons(d, &n, size, keys);
+	if (note) put_str(d, &n, size, note);
 	d[n] = 0;
 }
 
-static const char *line_end(const char *s)
+/* The line on top that says what the signs mean */
+static void icons_legend(void)
 {
-	while (*s && *s != '\n') s++;
-	return s;
-}
-
-/* The section of moves.md for the animation collection set ("konoko"): its "## Title" line, or 0 */
-static const char *moves_section(const char *set, char *title, int size)
-{
-	const char *sec = 0;
-	for (const char *s = g_moves_md; *s; s = *line_end(s) ? line_end(s) + 1 : line_end(s)) {
-		const char *e = line_end(s);
-		if (s[0] == '#' && s[1] == '#' && s[2] == ' ') {
-			sec = s;
-			md_ascii(title, size, s + 3, e > s + 3 && e[-1] == '\r' ? e - 1 : e);
-		} else if (sec && starts_i(s, "Animation sets: ")) {
-			char first[64];
-			const char *a = s + 16, *b = a;
-			while (b < e && *b != ' ' && *b != '.' && *b != ',') b++;
-			md_ascii(first, sizeof first, a, b);
-			if (ieq(first, set)) return sec;
-		}
-	}
-	return 0;
-}
-
-static const char *next_line(const char *s) { s = line_end(s); return *s ? s + 1 : s; }
-
-/* A table row of moves.md: its input and name (plain ASCII); 0 if s isn't one */
-static int md_row(const char *s, char *input, int isize, char *name, int nsize)
-{
-	const char *e = line_end(s), *p1, *p2, *p3, *n1, *n2;
-	if (s[0] != '|' || s[1] == '-' || starts_i(s, "| Input")) return 0;
-	for (p1 = s + 1; p1 < e && *p1 != '|'; p1++);
-	for (p2 = p1 + 1; p2 < e && *p2 != '|'; p2++);
-	for (p3 = p2 + 1; p3 < e && *p3 != '|'; p3++);
-	if (p3 >= e) return 0;
-	md_ascii(input, isize, s + 1, p1);
-	md_ascii(name, nsize, p1 + 1, p2);
-	/* a note in the damage column ("- (regenerates 8%...; the pose holds...)"): its first part after the input */
-	for (n1 = p2 + 1; n1 < p3 && *n1 != '('; n1++);
-	for (n2 = n1; n2 < p3 && *n2 != ';' && *n2 != ')'; n2++);
-	if (n1 < p3 && n2 > n1 + 1) {
-		int k = str_len(input);
-		if (k + 4 < isize) {
-			memcpy(input + k, " - ", 4);
-			md_ascii(input + k + 3, isize - k - 3, n1 + 1, n2);
-		}
-	}
-	return 1;
-}
-
-/* The inputs every table in moves.md has (Punch, Kick, Forward + punch...): left out of the
- * lists, but for a move a character names (its own move on a common input) */
-#define COMMON_MAX 96
-static char g_common[COMMON_MAX][64];
-static int g_ncommon = -1;
-
-static int is_common(const char *input)
-{
-	for (int i = 0; i < g_ncommon; i++)
-		if (ieq(g_common[i], input)) return 1;
-	return 0;
-}
-
-static void find_common(void)
-{
-	char in[CHAT_MAX], name[48], seen[COMMON_MAX];
-	int tables = 0, in_table = 0;
-
-	if (g_ncommon >= 0) return;
-	g_ncommon = 0;
-	for (const char *s = g_moves_md;; s = next_line(s)) {
-		int row = *s ? md_row(s, in, sizeof in, name, sizeof name) : 0;
-		if (in_table && !row) {   /* a table ended: keep what it had */
-			int k = 0;
-			for (int i = 0; i < g_ncommon; i++)
-				if (seen[i] && k++ != i) str_cpy(g_common[k - 1], sizeof g_common[0], g_common[i]);
-			g_ncommon = k;
-			in_table = 0;
-		}
-		if (!*s) break;
-		if (!row) continue;
-		if (!in_table) {
-			in_table = 1;
-			tables++;
-			for (int i = 0; i < COMMON_MAX; i++) seen[i] = 0;
-		}
-		if (tables == 1) {   /* the first table's inputs are the start */
-			if (g_ncommon < COMMON_MAX) seen[g_ncommon] = 1, str_cpy(g_common[g_ncommon++], sizeof g_common[0], in);
-		} else {
-			for (int i = 0; i < g_ncommon; i++)
-				if (ieq(g_common[i], in)) seen[i] = 1;
-		}
-	}
-	if (tables < 2) g_ncommon = 0;
-	log_msg("chat: %d inputs every move list has are left out of /moves", g_ncommon);
+	char line[160];
+	int n = 0;
+	put_str(line, &n, sizeof line, "P punch, K kick, ");
+	put_sym(line, &n, sizeof line, SYM_FORWARD, "Fwd");
+	put_str(line, &n, sizeof line, " forward, ");
+	put_sym(line, &n, sizeof line, SYM_BACK, "Back");
+	put_str(line, &n, sizeof line, " back, ");
+	put_sym(line, &n, sizeof line, SYM_LEFT, "Left");
+	put_str(line, &n, sizeof line, " left, ");
+	put_sym(line, &n, sizeof line, SYM_RIGHT, "Right");
+	put_str(line, &n, sizeof line, " right; a+b: together, a, b: one after the other");
+	line[n] = 0;
+	info(line, 0, GRAY);
 }
 
 /* full: /movelist, with the gray lines on what everyone has and on blocking; /moves: the moves only */
 static int move_list(int full)
 {
-	u8 *c = my_char(), *trac = c && CHR_CLASS(c) ? ONCC_ANIMATIONS(CHR_CLASS(c)) : 0;
-	const char *tn = trac ? TMrInstance_GetInstanceName(trac) : 0;
-	char set[64], title[64], ref[48] = "", row[CHAT_MAX + 64];
-	const char *sec, *s;
-	int n, rows = 0;
+	u8 *c = my_char(), *oncc = c ? CHR_CLASS(c) : 0, *trac = oncc ? ONCC_ANIMATIONS(oncc) : 0;
+	u8 *anim[MOVE_ROWS];
+	char set[64], ref[48] = "", row[CHAT_MAX + 64], name[MOVE_ROWS][48];
+	const char *title;
+	int rows = 0, all;
 
 	if (!c) {
 		info("You have no character right now.", 0, INFO);
 		return 0;
 	}
-	if (!tn) {
+	if (!trac) {
 		info("Can't tell which moves your character has.", 0, INFO);
 		return 0;
 	}
-	str_cpy(set, sizeof set, tn);
-	n = str_len(set);
-	if (n > 11 && ieq(set + n - 11, "_animations")) set[n - 11] = 0;
-	if (!(sec = moves_section(set, title, sizeof title))) {
-		fmt(row, "No move list for %s (animation set %s).", class_name(c), set);
-		info(row, 0, INFO);
-		return 0;
+	all = class_moves(oncc, anim);
+	set_name(set, sizeof set, trac);
+	title = table_find(g_move_titles, sizeof g_move_titles / sizeof g_move_titles[0], set);
+	/* the names; the game's own unnamed moves on the inputs everyone has are left out (when the
+	 * character has them all: the gray line says so); the widest name, for the column */
+	for (int i = 0; i < MOVE_ROWS; i++) {
+		name[i][0] = 0;
+		if (!anim[i]) continue;
+		move_name(name[i], sizeof name[i], oncc, anim[i]);
+		if (all && g_move_rows[i].common && !name[i][0] && is_stock(anim[i])) anim[i] = 0;
+		else if (mp_hud_text_width(name[i], str_len(name[i])) > mp_hud_text_width(ref, str_len(ref))) str_cpy(ref, sizeof ref, name[i]);
 	}
-	find_common();
-	/* the widest name, for the column */
-	for (int pass = 0; pass < 2; pass++) {
-		for (s = next_line(sec); *s && !(s[0] == '#' && s[1] == '#'); s = next_line(s)) {
-			char input[CHAT_MAX], name[48];
-			if (!md_row(s, input, sizeof input, name, sizeof name)) continue;
-			if (!*name && is_common(input)) continue;
-			if (!pass) {
-				if (mp_hud_text_width(name, str_len(name)) > mp_hud_text_width(ref, str_len(ref))) str_cpy(ref, sizeof ref, name);
-				continue;
-			}
-			fmt(row, "%s\t%s", name, input);
-			info(row, ref, WHITE)->ref_bold = ieq(ref, "Move");   /* names no wider than the bold header: its width */
-			rows++;
-		}
-		if (!pass) {
-			if (mp_hud_text_width(ref, str_len(ref)) < mp_hud_text_width("Move", 4)) str_cpy(ref, sizeof ref, "Move");
-			fmt(row, "Moves of %s (%s's set):", class_name(c), title);
-			bold_text(info(row, 0, INFO), class_name(c));
-			Message *head = info("Move\tInput", ref, GRAY);
-			bold(head, 0, str_len(head->line));
-			head->ref_bold = ieq(ref, "Move");
-		}
+	if (mp_hud_text_width(ref, str_len(ref)) < mp_hud_text_width("Move", 4)) str_cpy(ref, sizeof ref, "Move");
+	/* "Konoko's set", an AE package's set as moves.md names it ("Konoko: New Combat Moves"), or a
+	 * mod's collection by name */
+	if (!title) fmt(row, "Moves of %s (animation set %s):", class_name(c), set);
+	else fmt(row, find(title, ":") >= 0 ? "Moves of %s (%s):" : "Moves of %s (%s's set):", class_name(c), title);
+	bold_text(info(row, 0, INFO), class_name(c));
+	icons_legend();
+	{
+		Message *head = info("Move\tInput", ref, GRAY);
+		bold(head, 0, str_len(head->line));
+		head->ref_bold = ieq(ref, "Move");
 	}
-	if (!rows) info("Nothing but the moves everyone has.", 0, GRAY);
-	if (!full) return rows + 2;
-	if (g_ncommon)
-		bold_text(info("Everyone also has: up to 3 punches and 2 kicks in a row; punch or kick with a direction, crouched, running, "
-		     "sidestepping or in the air; kick on the ground; forward + punch up close or from behind (throws); "
-		     "crouch, let go, punch; dash then crouch; taunt.", 0, GRAY), "Everyone also has:");
+	for (int i = 0; i < MOVE_ROWS; i++) {
+		char icons[CHAT_MAX];
+		if (!anim[i]) continue;
+		move_icons(icons, sizeof icons, g_move_rows[i].input);
+		fmt(row, "%s\t%s", name[i], icons);
+		info(row, ref, WHITE)->ref_bold = ieq(ref, "Move");   /* names no wider than the bold header: its width */
+		rows++;
+	}
+	if (!rows) info(all ? "Nothing but the moves everyone has." : "No hand-to-hand moves.", 0, GRAY), rows = 1;   /* (the lines added, for the scroll) */
+	if (!full) return rows + 3;
+	if (all) {   /* (two lines: a message holds MP_NAME_MAX + 16 + CHAT_MAX bytes, and one line cut it short) */
+		char line[CHAT_MAX];
+		int n = 0;
+		bold_text(info("Everyone also has: P, P, P and K, K in a row; P or K with a direction, crouched, running, sidestepping "
+		               "or in the air; K on the ground;", 0, GRAY), "Everyone also has:");
+		put_sym(line, &n, sizeof line, SYM_FORWARD, "Fwd");
+		put_str(line, &n, sizeof line, "+P up close or from behind (throws); Crouch, let go, P; ");
+		put_sym(line, &n, sizeof line, SYM_FORWARD, "Fwd");
+		put_sym(line, &n, sizeof line, SYM_FORWARD, "Fwd");
+		put_str(line, &n, sizeof line, " (dash), Crouch; taunt.");
+		line[n] = 0;
+		info(line, 0, GRAY);
+		rows += 2;
+	}
 	{
 		Message *m = info("Blocking: stand still facing the attacker (crouch for low attacks). Escape roll: crouch + any direction.", 0, GRAY);
 		bold_text(m, "Blocking:");
@@ -687,6 +823,7 @@ static int help(void)
 		"/idle, /i\ta special idle (most characters have one)",
 		"/spectate\twatch without playing: a spectator's place, no one waits for you",
 		"/join\tplay again after /spectate or Spectate (your score starts at 0)",
+		"/ready, /unready\tready up for the match, or not (as F3 does)",
 		"/players\tthe players and their numbers (one per internet address, from 1)",
 		"/callvote map Name\tvote to change the map (its folder or its name)",
 		"/callvote kick Who [why]\tvote to kick a player (name or number from /players)",
@@ -831,6 +968,11 @@ static int command(const char *t)
 		return 0;
 	}
 	if (ieq(cmd, "movelist") || ieq(cmd, "moves")) return move_list(ieq(cmd, "movelist"));
+	if (ieq(cmd, "ready") || ieq(cmd, "unready")) {   /* (what F3 does; F3 is a developer key in developer mode) */
+		const char *why = net_ready_command(ieq(cmd, "ready"));
+		if (why) info(why, 0, INFO);
+		return 0;
+	}
 	if (ieq(cmd, "sneeze")) {
 		emote(PLAYERS_EMOTE_SNEEZE, "sneeze");
 		return 0;
@@ -898,7 +1040,7 @@ static void close_chat(int hold)
 	if (!g_open && !g_hold) return;
 	g_open = 0;
 	g_in[0] = 0;
-	g_scroll = 0;
+	g_scroll = g_list_top = 0;
 	g_hold = hold;
 }
 
@@ -999,7 +1141,8 @@ static void key(u32 vk, int lines_page)
 		if (*g_in && (shift || listed)) {
 			g_in[0] = 0;
 			g_cur = g_anchor = g_view = 0;
-			g_scroll = listed > lines_page + 1 ? listed - lines_page - 1 : 0;
+			g_scroll = 0;
+			g_list_top = listed;
 		} else {
 			close_chat(1);
 		}
@@ -1047,14 +1190,24 @@ static void typed(u32 c)
 static long WINAPI window_proc(void *hwnd, u32 msg, u32 wp, long lp)
 {
 	if (!g_open) {
-		if (msg == WM_KEYDOWN && wp == VK_RETURN && !(lp & 0x40000000) && allowed()) {
+		if (msg == WM_KEYDOWN && wp == VK_RETURN && !(lp & 0x40000000) && allowed() && !dev_mode()) {   /* (developer mode: Enter is its camera key) */
 			open_chat();
+			return 0;
+		}
+		/* developer mode (a test build's network game): T opens the chat, and its letter isn't typed */
+		if (msg == WM_KEYDOWN && wp == VK_T && !(lp & 0x40000000) && allowed() && dev_mode()) {
+			open_chat();
+			g_skip_char = 1;
 			return 0;
 		}
 	} else if (msg == WM_KEYDOWN) {
 		key(wp, CHAT_LINES - 1);
 		return 0;
 	} else if (msg == WM_CHAR) {
+		if (g_skip_char) {   /* the T that opened it */
+			g_skip_char = 0;
+			if (wp == 't' || wp == 'T') return 0;
+		}
 		typed(wp);
 		return 0;
 	} else if (msg == WM_MOUSEWHEEL) {
@@ -1083,6 +1236,22 @@ void chat_frame(void)
 	if (g_open && !allowed()) close_chat(0);
 	if (g_hold && !down(VK_RETURN) && !down(VK_ESCAPE)) close_chat(0);
 	if (!net_active() && !g_open) g_nmsg = 0;   /* out of the network game: a new chat next time */
+	{   /* Oni's developer mode: Arklite's keys that clash with its keys step aside (common.c dev_mode) */
+		static int dev = -1;
+#ifndef ARKLITE_TEST
+		if (dev_mode() && net_active()) {   /* a release build: no developer mode in network games (user, 2026-11-16) */
+			dev_mode_off();
+			log_msg("developer mode: turned off again, a release build allows it in no network game");
+			chat_server("Developer mode is off in network games (test builds only).");
+		}
+#endif
+		if (dev_mode() != dev) {
+			if (dev >= 0 || dev_mode())
+				log_msg("developer mode %s: Arklite's F2, F3, F4 and Enter %s", dev_mode() ? "on" : "off",
+				        dev_mode() ? "do nothing (developer keys; T chats, /ready readies)" : "work again");
+			dev = dev_mode();
+		}
+	}
 }
 
 /* ---- Drawing ------------------------------------------------------------------------------ */
@@ -1264,7 +1433,8 @@ void chat_draw(int width, int height)
 		if (x + dx + w > width - x) dx = width - x - w - x;
 		if (dx > 0) x += dx;
 	}
-	if (hint) mp_hud_text_plain("Press ENTER to chat", x + PAD, hint_y, MP_LEFT, GRAY);
+	if (hint) mp_hud_text_plain(dev_mode() ? "Press T to chat (developer mode: ENTER is its camera key)" : "Press ENTER to chat",
+	                            x + PAD, hint_y, MP_LEFT, GRAY);
 	else if (g_open) mp_hud_text_plain("ESC: close | ENTER: send", x + PAD, hint_y, MP_LEFT, GRAY);
 
 	/* the field under the history */
@@ -1294,6 +1464,12 @@ void chat_draw(int width, int height)
 			}
 		}
 		total += m->nlines;
+	}
+	if (g_open && g_list_top) {   /* the list's lines as drawn (a long one wraps), its first on top */
+		int shown = 0;
+		for (int i = g_nmsg - g_list_top < 0 ? 0 : g_nmsg - g_list_top; i < g_nmsg; i++) shown += g_msg[i].nlines;
+		g_scroll = shown > lines ? shown - lines : 0;
+		g_list_top = 0;
 	}
 	if (g_open) {
 		g_scroll = clamp(g_scroll, 0, total > lines ? total - lines : 0);

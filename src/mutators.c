@@ -46,18 +46,22 @@
  * then a player's body isn't drawn (players_hidden, net.c's draw-pass hook) and leaves no corpse
  * when they respawn (NoCorpse).
  *
- * Jamming Guns (NET_MUT_JAMMING): each shot a player fires has a 5% chance of jamming the gun.
- * Every shot passes through WPiPulseShooter (0x519c50: ECX weapon, DX shooter index, the shooter
- * attachment on the stack, ret 4), which spends the ammo: from the trigger's first pull (the
- * Start event in WPiDoEvent, 0x51a104), from an autofire weapon's held trigger (WPiFireShooter,
- * 0x51a354) and from the update's continuous fire (WPiUpdate, 0x5194e6). Those three calls come
- * here. A jamming shot isn't fired: its round is lost (so a full magazine can still be reloaded;
- * an empty weapon stops its background effects as Oni does, event 5 to every attachment) and the
+ * Jamming Guns (NET_MUT_JAMMING): every JAM_ROLL_TICKS (300 ms) a gun a player holds has a
+ * JAM_CHANCE (5%) chance to get a jam ready, and its next shot jams it (user, 2026-11-16; up to then
+ * each shot had the 5%). Every shot passes through WPiPulseShooter (0x519c50: ECX weapon, DX shooter
+ * index, the shooter attachment on the stack, ret 4), which spends the ammo: from the trigger's
+ * first pull (the Start event in WPiDoEvent, 0x51a104), from an autofire weapon's held trigger
+ * (WPiFireShooter, 0x51a354) and from the update's continuous fire (WPiUpdate, 0x5194e6). Those
+ * three calls come here. A jamming shot isn't fired and its round stays in the gun, and the
  * trigger lets go at the weapon's next update (flag DeferUpdate_StopFiring 0x4000; the event
- * loop that called us mustn't get Stop events in the middle). The jam asks for 1 to 3 drops and 0
- * or 1 reload (none for an unreloadable class, flag 0x800), in any order: a drop counts when the
+ * loop that called us mustn't get Stop events in the middle). The jam asks for 1 to 3 reloads and 0
+ * or 1 drop (user, 2026-11-16; it was 1-3 drops and 0-1 reload), in any order; an unreloadable
+ * class (flag 0x800) 1 to 3 drops and no reload. A drop counts when the
  * dropped gun touches the ground (weapon flag HitGround 0x2, which picking it up clears), a reload
- * when the reload animation reloads it (WPrNotifyReload 0x5181e0, called once at 0x4dfb7d). While
+ * when the reload animation reloads it (WPrNotifyReload 0x5181e0, called once at 0x4dfb7d).
+ * Reloading a jammed gun that wants its reload only clears the jam: it works with a full magazine and
+ * with no clip in the inventory, spends no clip, and leaves the rounds as they were (the reload
+ * section below); one that only wants drops reloads as any gun does. While
  * it's jammed, WPrDepressTrigger (0x51a1b0, from the character's fire at 0x4e912f and the update's
  * forced autofire at 0x5193cb) doesn't fire, and the character's pull clicks (WPrOutOfAmmoSound
  * 0x51d080) at most every JAM_CLICK_TICKS. The jam stays with the gun, whoever picks it up; only
@@ -65,7 +69,29 @@
  * the dice are a hash of the tick, the weapon and the game's RNG seed, so every PC, replay and
  * rollback gets the same jams without drawing from the game's RNG. Weapon (0x170 bytes, at
  * 0x6221c0): +2 flags u16, +4 class, +8 holder, +0x48 birth, +0x56 ammo; class: +0xc2 attachment
- * count, +0xcc flags; character: +4 flags (0x40 infinite ammo), +0x194 the weapon in hand. */
+ * count, +0xcc flags; character: +4 flags (0x40 infinite ammo), +0x194 the weapon in hand.
+ *
+ * Reloads (the reload section): WPrTryReload (0x51c560: ECX the character, EDX the weapon, two
+ * out-flag pointers on the stack, ret 8; called at 0x4ddea4, the reload key, and 0x4e916b, the
+ * trigger on an empty gun) turns back a full gun (ammo +0x56 equal to the class's +0xc0) and one
+ * whose holder has no clip for it (ONrCharacter_HasAmmoForReload 0x4edc90 at 0x51c60c and
+ * 0x51c673), then spends the clip (WPrPowerup_Use 0x51c770: ECX the character, EDX the ammo type,
+ * 0 ballistic or 1 energy, called at 0x51c704) and starts the reload animation on the inventory
+ * overlay (ONrOverlay_Set 0x4d7b80 at 0x51c716: ECX active +0x1c64, EDX the animation, flags on
+ * the stack, ret 4). The rounds come at the animation's action frame (WPrNotifyReload at 0x4dfb7d),
+ * and only if the gun is still in hand.
+ *   - A jammed gun that wants a reload (Jamming Guns): its full magazine reads as empty during the
+ *     call, the clip check says yes and no clip is spent; at the action frame its rounds are put
+ *     back as they were.
+ *   - Interrupted reloads, on a multiplayer map (user, 2026-11-16): stock Oni loses the clip a
+ *     reload spent when the animation never reaches its action frame (a knockdown clears the
+ *     overlay, a disarm or drop takes the gun, a holster replaces the animation, death). Each
+ *     reload that spent a clip is noted (g_reloads, tick state: character, gun, animation, ammo
+ *     type); the action frame clears it, and every tick (mutators_tick) one whose character is
+ *     dead, has another gun in hand, or another animation (or none) on the overlay drops that
+ *     clip as a power-up (WPrPowerup_Drop 0x51bd80: ECX type, EDX amount, then the character and
+ *     "in front" 0, ret 8: as a death drops its items, with the last hit's push), so it can be
+ *     picked up again. In the tick, from the game's RNG: every PC drops the same clip. */
 #include "arklite.h"
 
 void *memset(void *, int, unsigned);
@@ -163,15 +189,18 @@ static u8 *g_scorch;                        /* d_SCORCH */
 #define WPrDepressTrigger       0x51a1b0
 #define WPrNotifyReload         0x5181e0
 #define WPrOutOfAmmoSound       ((void (ONI_FC *)(u8 *))0x51d080)
+#define WCLASS_MAX_AMMO(k)      (*(u16 *)((k) + 0xc0))
 
-#define JAM_CHANCE              5     /* percent, each shot */
+#define JAM_CHANCE              5     /* percent, each roll */
+#define JAM_ROLL_TICKS          18    /* a roll every 300 ms */
 #define JAM_CLICK_TICKS         15    /* a held trigger clicks this often */
 
 typedef struct {
-	u32 born;           /* the weapon's birth time: another weapon in the slot isn't jammed */
+	u32 born;           /* the weapon's birth time: another weapon in the slot isn't jammed (or armed) */
 	u8 jammed, held;    /* held: in a hand since its last drop counted */
 	u8 drops, reloads;  /* still needed */
 	u32 click;          /* the tick of its last click */
+	u8 armed;           /* a roll hit: the gun's next shot by a player jams it */
 } Jam;
 
 static Jam g_jam[WP_WEAPON_SLOTS] TICK_STATE;
@@ -310,26 +339,27 @@ static void jam_check(const u8 *w, Jam *j)
 	if (!net_rerun()) log_msg("mutators: %s works again (tick %u)", weapon_name(w), GS_TICK(ONgGameState));
 }
 
-/* The shot jams the gun: it isn't fired, and its round is lost */
-static void jam_start(u8 *w, Jam *j, const u8 *owner, const u8 *attachment, u32 r)
+/* The shot jams the gun: it isn't fired, and its round stays (a reload clears the jam, not the
+ * magazine: see "Reloads") */
+static void jam_start(u8 *w, Jam *j, const u8 *owner, u32 r)
 {
 	u8 *k = WEAPON_CLASS(w);
-	u16 used = ATTACH_AMMO_USED(attachment);
 
 	j->born = WEAPON_BORN(w);
 	j->jammed = 1;
+	j->armed = 0;
 	j->held = 1;
-	j->drops = (u8)(1 + mix(r ^ 0x68e31da4u) % 3);
-	j->reloads = WCLASS_FLAGS(k) & WCLASS_UNRELOADABLE ? 0 : (u8)(mix(r ^ 0xb5297a4du) & 1);
-	j->click = GS_TICK(ONgGameState);
-	if (!(CHR_FLAGS(owner) & CHR_INFINITE_AMMO) && WEAPON_AMMO(w) >= used) WEAPON_AMMO(w) -= used;
-	if (!WEAPON_AMMO(w) && (WEAPON_FLAGS(w) & WEAPON_BACKGROUND_FX)) {   /* empty: as WPiPulseShooter does */
-		WEAPON_FLAGS(w) &= ~WEAPON_BACKGROUND_FX;
-		for (u32 i = 0; i < WCLASS_ATTACHMENTS(k); i++) WPiDoEvent(w, EVENT_BACKGROUND_STOP, i);
+	if (WCLASS_FLAGS(k) & WCLASS_UNRELOADABLE) {   /* nothing to reload: drops alone, as many as before */
+		j->drops = (u8)(1 + mix(r ^ 0x68e31da4u) % 3);
+		j->reloads = 0;
+	} else {
+		j->reloads = (u8)(1 + mix(r ^ 0xb5297a4du) % 3);
+		j->drops = (u8)(mix(r ^ 0x68e31da4u) & 1);
 	}
+	j->click = GS_TICK(ONgGameState);
 	WPrOutOfAmmoSound(w);
 	if (!net_rerun())
-		log_msg("mutators: %s's %s jammed (tick %u): %d drop%s and %d reload to fix it, %d rounds left",
+		log_msg("mutators: %s's %s jammed (tick %u): %d drop%s and %d reload(s) to fix it, %d rounds left",
 		        (const char *)owner + 0x14, weapon_name(w), GS_TICK(ONgGameState), j->drops, j->drops == 1 ? "" : "s",
 		        j->reloads, WEAPON_AMMO(w));
 }
@@ -345,14 +375,12 @@ static void ONI_FC pulse_hook(u8 *w, u32 shooter, u8 *attachment)
 			WEAPON_FLAGS(w) |= WEAPON_DEFER_STOP;
 			return;
 		}
-		if (CHR_TYPE(owner) == 0) {   /* players' shots */
+		if (CHR_TYPE(owner) == 0 && j->armed && j->born == WEAPON_BORN(w)) {   /* a player's shot, and a roll hit */
 			u32 slot = (u32)(j - g_jam);
 			u32 r = mix(GS_TICK(gs) * 0x9e3779b9u ^ mix(UUgRandomSeed ^ slot << 24 ^ WEAPON_BORN(w) ^ (u32)WEAPON_AMMO(w) << 8));
-			if (r % 100 < JAM_CHANCE) {
-				jam_start(w, j, owner, attachment, r);
-				WEAPON_FLAGS(w) |= WEAPON_DEFER_STOP;   /* the trigger lets go at the weapon's next update */
-				return;
-			}
+			jam_start(w, j, owner, r);
+			WEAPON_FLAGS(w) |= WEAPON_DEFER_STOP;   /* the trigger lets go at the weapon's next update */
+			return;
 		}
 	}
 	((void (ONI_FC *)(u8 *, u32, u8 *))WPiPulseShooter)(w, shooter, attachment);
@@ -376,26 +404,53 @@ static u32 ONI_FC depress_hook(u8 *w, u32 forced, u32 alternate, u8 *no_ammo)
 	return ((u32 (ONI_FC *)(u8 *, u32, u32, u8 *))WPrDepressTrigger)(w, forced, alternate, no_ammo);
 }
 
-/* The reload animation reloaded the weapon in hand */
+static void reload_done(const u8 *w);
+
+/* The reload animation reloaded the weapon in hand (a jammed one: only the jam, its rounds stay) */
 static void ONI_FC reload_hook(u8 *w)
 {
 	Jam *j = jam_of(w);
+	u16 ammo = WEAPON_AMMO(w);
 
 	((void (ONI_FC *)(u8 *))WPrNotifyReload)(w);
+	reload_done(w);
+	if (j && j->reloads) WEAPON_AMMO(w) = ammo;   /* (a jam that only wants drops: a reload is an ordinary one) */
 	if (j && j->reloads) {
 		j->reloads--;
-		if (!net_rerun()) log_msg("mutators: %s reloaded while jammed (%d drop%s to go)", weapon_name(w), j->drops, j->drops == 1 ? "" : "s");
+		if (!net_rerun()) log_msg("mutators: %s reloaded while jammed (%d reload(s) and %d drop%s to go; %d rounds in it, %d clips left)",
+		                          weapon_name(w), j->reloads, j->drops, j->drops == 1 ? "" : "s", WEAPON_AMMO(w),
+		                          WEAPON_HOLDER(w) ? *(u16 *)(WEAPON_HOLDER(w) + 0x1a2) : -1);
 		jam_check(w, j);
 	}
 }
 
 /* Every tick: a jammed gun that was let go counts a drop when it touches the ground */
+/* Every JAM_ROLL_TICKS: a gun a player holds, not jammed or armed, gets its jam ready JAM_CHANCE of
+ * the time. The dice are a hash of the tick, the slot, the gun and the game's RNG seed, as for
+ * the jam itself: the same on every PC, nothing drawn from the RNG. */
+static void jam_roll(u32 slot, u8 *w, Jam *j)
+{
+	u8 *gs = ONgGameState, *owner = WEAPON_HOLDER(w);
+	u32 r;
+
+	if (j->armed && (!(WEAPON_FLAGS(w) & WEAPON_INUSE) || WEAPON_BORN(w) != j->born)) j->armed = 0;   /* the gun is gone */
+	if (j->armed || GS_TICK(gs) % JAM_ROLL_TICKS || !(WEAPON_FLAGS(w) & WEAPON_INUSE) || !owner || CHR_TYPE(owner) != 0) return;
+	r = mix(GS_TICK(gs) * 0x85ebca6bu ^ mix(UUgRandomSeed ^ slot << 24 ^ WEAPON_BORN(w) ^ 0x3c6ef372u));
+	if (r % 100 >= JAM_CHANCE) return;
+	j->armed = 1;
+	j->born = WEAPON_BORN(w);
+	if (!net_rerun()) log_msg("mutators: %s's %s will jam at its next shot (tick %u)", (const char *)owner + 0x14, weapon_name(w), GS_TICK(gs));
+}
+
 static void jams_tick(void)
 {
 	for (u32 i = 0; i < WP_WEAPON_SLOTS; i++) {
 		Jam *j = &g_jam[i];
 		u8 *w = WP_WEAPONS + i * WP_WEAPON_SIZE;
-		if (!j->jammed) continue;
+		if (!j->jammed) {
+			jam_roll(i, w, j);
+			continue;
+		}
 		if (!(WEAPON_FLAGS(w) & WEAPON_INUSE) || WEAPON_BORN(w) != j->born) {   /* the weapon is gone */
 			j->jammed = 0;
 			continue;
@@ -404,7 +459,7 @@ static void jams_tick(void)
 		else if (j->held && (WEAPON_FLAGS(w) & WEAPON_HIT_GROUND)) {
 			j->held = 0;
 			if (j->drops) j->drops--;
-			if (!net_rerun()) log_msg("mutators: %s dropped while jammed (%d drop%s and %d reload to go)", weapon_name(w),
+			if (!net_rerun()) log_msg("mutators: %s dropped while jammed (%d drop%s and %d reload(s) to go)", weapon_name(w),
 			                          j->drops, j->drops == 1 ? "" : "s", j->reloads);
 			jam_check(w, j);
 		}
@@ -421,6 +476,113 @@ int mutators_jammed(const u8 *c, int *drops, int *reloads)
 	return 1;
 }
 
+/* ---- Reloads (see the top: Jamming Guns' jammed guns, and interrupted reloads) ---- */
+
+#define WPrTryReload            0x51c560
+#define ONrCharacter_HasAmmoForReload 0x4edc90
+#define WPrPowerup_Use          0x51c770
+#define ONrOverlay_Set          0x4d7b80
+#define WPrPowerup_Drop         ((u8 *(ONI_FC *)(u32, u32, u8 *, u32))0x51bd80)
+#define ONrCharacter_GetActive  ((u8 *(ONI_FC *)(u8 *))0x4f1180)
+#define ACT_INVENTORY_ANIMATION(a) (*(void **)((a) + 0x1c64))   /* the inventory overlay's animation, 0: none */
+#define RELOADS_MAX             32
+
+typedef struct {
+	u8 *c, *weapon;     /* c 0: a free entry */
+	void *animation;    /* the reload's, on the inventory overlay */
+	u32 type;           /* the clip's power-up type: 0 ballistic, 1 energy */
+} Reload;
+static Reload g_reloads[RELOADS_MAX] TICK_STATE;
+static u8 *g_jam_reload;     /* the jammed gun WPrTryReload runs for (within one call) */
+static Reload *g_reload_new; /* the entry WPrPowerup_Use just made, for ONrOverlay_Set's animation (within one call) */
+static int g_reloads_ok;     /* every reload call was as expected */
+
+typedef u8 (ONI_FC *TryReloadFn)(u8 *, u8 *, u8 *, u8 *);
+
+static u8 ONI_FC try_reload_hook(u8 *c, u8 *w, u8 *full, u8 *no_ammo)
+{
+	Jam *j = jam_of(w);
+	u16 ammo;
+	u8 r;
+
+	if (!j || !j->reloads || (WCLASS_FLAGS(WEAPON_CLASS(w)) & WCLASS_UNRELOADABLE)) return ((TryReloadFn)WPrTryReload)(c, w, full, no_ammo);
+	ammo = WEAPON_AMMO(w);
+	if (ammo == WCLASS_MAX_AMMO(WEAPON_CLASS(w))) WEAPON_AMMO(w) = 0;   /* not "full" (only the full check reads it) */
+	g_jam_reload = w;
+	r = ((TryReloadFn)WPrTryReload)(c, w, full, no_ammo);
+	g_jam_reload = 0;
+	WEAPON_AMMO(w) = ammo;
+	return r;
+}
+
+static u8 ONI_FC has_clip_hook(u8 *c, u8 *w)
+{
+	if (g_jam_reload) return 1;   /* a jammed gun's reload needs no clip */
+	return ((u8 (ONI_FC *)(u8 *, u8 *))ONrCharacter_HasAmmoForReload)(c, w);
+}
+
+static u8 ONI_FC clip_use_hook(u8 *c, u32 type)
+{
+	u8 r;
+
+	g_reload_new = 0;
+	if (g_jam_reload) return 1;   /* ...and spends none */
+	r = ((u8 (ONI_FC *)(u8 *, u32))WPrPowerup_Use)(c, type);
+	if (!r || !g_reloads_ok || !multiplayer_map() || (type != 0 && type != 1)) return r;
+	for (u32 i = 0; i < RELOADS_MAX; i++) {
+		Reload *e = &g_reloads[i];
+		if (e->c && e->c != c) continue;
+		e->c = c;
+		e->weapon = CHR_WEAPON(c);
+		e->animation = 0;
+		e->type = type;
+		g_reload_new = e;
+		return r;
+	}
+	if (!net_rerun()) log_msg("mutators: %d reloads at once: %s's clip isn't kept if it's interrupted", RELOADS_MAX, (const char *)c + 0x14);
+	return r;
+}
+
+static void ONI_FC overlay_hook(void **overlay, void *animation, u32 flags)
+{
+	((void (ONI_FC *)(void **, void *, u32))ONrOverlay_Set)(overlay, animation, flags);
+	if (g_reload_new) g_reload_new->animation = animation;
+	g_reload_new = 0;
+}
+
+/* The action frame reloaded w: its clip is in */
+static void reload_done(const u8 *w)
+{
+	for (u32 i = 0; i < RELOADS_MAX; i++)
+		if (g_reloads[i].c && g_reloads[i].weapon == w) memset(&g_reloads[i], 0, sizeof g_reloads[i]);
+}
+
+/* Every tick: a reload that can no longer reach its action frame drops its clip */
+static void reloads_tick(void)
+{
+	for (u32 i = 0; i < RELOADS_MAX; i++) {
+		Reload *e = &g_reloads[i];
+		u8 *c = e->c, *a;
+		const char *why;
+
+		if (!c) continue;
+		if (!(CHR_FLAGS(c) & CHR_INUSE)) {   /* the character is gone (the clip with it) */
+			memset(e, 0, sizeof *e);
+			continue;
+		}
+		a = ONrCharacter_GetActive(c);
+		if (CHR_FLAGS(c) & CHR_DEAD) why = "died";
+		else if (CHR_WEAPON(c) != e->weapon) why = "lost the gun";
+		else if (!a || !e->animation || ACT_INVENTORY_ANIMATION(a) != e->animation) why = "was stopped";
+		else continue;
+		WPrPowerup_Drop(e->type, 1, c, 0);
+		if (!net_rerun())
+			log_msg("mutators: %s %s while reloading: the %s drops (tick %u)", (const char *)c + 0x14, why,
+			        e->type ? "energy cell" : "ammo clip", GS_TICK(ONgGameState));
+		memset(e, 0, sizeof *e);
+	}
+}
+
 void mutators_install(void)
 {
 	static const u32 pulses[] = { 0x5194e6, 0x51a104, 0x51a354 };
@@ -430,7 +592,15 @@ void mutators_install(void)
 	ok &= patch_call(0x4e912f, WPrDepressTrigger, (u32)depress_hook);
 	ok &= patch_call(0x5193cb, WPrDepressTrigger, (u32)depress_hook);
 	ok &= patch_call(0x4dfb7d, WPrNotifyReload, (u32)reload_hook);
+	ok &= patch_call(0x4ddea4, WPrTryReload, (u32)try_reload_hook);
+	ok &= patch_call(0x4e916b, WPrTryReload, (u32)try_reload_hook);
+	ok &= patch_call(0x51c60c, ONrCharacter_HasAmmoForReload, (u32)has_clip_hook);
+	ok &= patch_call(0x51c673, ONrCharacter_HasAmmoForReload, (u32)has_clip_hook);
+	g_reloads_ok = patch_call(0x51c704, WPrPowerup_Use, (u32)clip_use_hook);
+	g_reloads_ok &= patch_call(0x51c716, ONrOverlay_Set, (u32)overlay_hook);
 	if (!ok) log_msg("mutators: some of Jamming Guns' calls weren't as expected (see the patch lines above)");
+	if (g_reloads_ok) log_msg("mutators: an interrupted reload drops its clip on multiplayer maps");
+	else log_msg("mutators: the reload's clip calls weren't as expected: interrupted reloads lose their clip as in stock Oni");
 }
 
 /* ---- Level load and unload ---- */
@@ -459,6 +629,7 @@ void mutators_level_end(void)
 void mutators_level(void)
 {
 	mutators_level_end();   /* (a level end that never came) */
+	memset(g_reloads, 0, sizeof g_reloads);   /* (every level: the last one's characters are gone) */
 	g_bomb_class = P3rGetParticleClass(BOMB_PARTICLE);
 	g_scorch = P3rGetParticleClass(SCORCH_DECAL);
 	if (!multiplayer_map()) return;
@@ -485,7 +656,7 @@ void mutators_level(void)
 	memset(g_jam, 0, sizeof g_jam);
 	if (net_mutator(NET_MUT_JAMMING)) {
 		g_jam_on = 1;
-		log_msg("mutators: Jamming Guns: each player's shot jams the gun %d%% of the time", JAM_CHANCE);
+		log_msg("mutators: Jamming Guns: a gun a player holds gets a jam ready %d%% of the time every %d ticks", JAM_CHANCE, JAM_ROLL_TICKS);
 	}
 }
 
@@ -551,6 +722,7 @@ void mutators_tick(void)
 	u8 *gs = ONgGameState;
 	u32 slots = ONgCharacterSlots;
 	if (gs && g_jam_on) jams_tick();
+	if (gs) reloads_tick();
 	if (!gs || !g_bomb_class) return;
 	/* the live count, as lockstep.c and photo.c use: char_limit.c skips its raise when something
 	 * else changed its sites, and slots 128.. are then not characters (a crash after a death) */

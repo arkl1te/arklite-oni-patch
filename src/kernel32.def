@@ -72,3 +72,8 @@ EXPORTS
   MultiByteToWideChar@24
   HeapCreate@12
   GetWindowsDirectoryA@8
+  CreateFileMappingA@24
+  MapViewOfFile@20
+  UnmapViewOfFile@4
+  HeapAlloc@12
+  HeapFree@12

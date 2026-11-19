@@ -267,6 +267,7 @@ static u8 g_bsl_instant TICK_STATE;      /* ark_characterscreen_instant_swap */
 static u8 g_instant_kept TICK_STATE;     /* its last accepted value (a console change is put back) */
 static int g_bsl_flags = -1;             /* ark_characterscreen_flags: a bit per g_families entry, -1 every one */
 static int g_flags_applied = -1;         /* the roster was resolved with these */
+static int g_family_applied = -1;        /* ...and One Character's family (players_one_family), -1 none */
 static u8 g_level_loading;               /* from the level's start to its first update: main() runs */
 static u8 g_enabled_due;                 /* the level's spawns aren't counted yet */
 static int screen_on(void) { return g_bsl_enabled; }
@@ -549,6 +550,66 @@ int char_menu_class_allowed(int number)
 	return name_allowed(TMrInstance_GetInstanceName(p), rules);
 }
 
+/* ---- One Character (NET_MUT_ONE_CHARACTER) ---- *
+ * In a match everyone plays one character: players.c asks for it with the match's spawn seed
+ * (the same on every PC) and holds every choice to its variations. The candidates are the
+ * g_families entries (the game's characters and the mods Arklite knows) with a loaded biped
+ * class the host's rules allow, in the table's order: level0 is the same on every PC (net.c
+ * compares it), and Arklite.ini's own roster plays no part. The F2 menu shows that character
+ * alone while it holds (roster_resolve). */
+
+/* f's class to start as: its main one, else its first loaded, allowed biped; -1 none */
+int char_menu_family_main(int f)
+{
+	u32 rules = net_char_rules();
+	const char *l;
+	u8 *p = 0;
+
+	if (f < 0 || f >= FAMILIES) return -1;
+	if (name_allowed(g_families[f].main, rules) && !TMrInstance_GetDataPtr(TAG_ONCC, g_families[f].main, &p) && p && biped(p))
+		return (int)class_number(p);
+	for (l = g_families[f].classes; *l;) {
+		char name[64];
+		unsigned n = 0;
+		while (l[n] && l[n] != '|') n++;
+		if (n < sizeof name) {
+			memcpy(name, l, n);
+			name[n] = 0;
+			p = 0;
+			if (name_allowed(name, rules) && !TMrInstance_GetDataPtr(TAG_ONCC, name, &p) && p && biped(p)) {
+				u32 k = class_number(p);
+				if (k != 0xffffffffu) return (int)k;
+			}
+		}
+		l += n + (l[n] == '|');
+	}
+	return -1;
+}
+
+int char_menu_family_has(int f, int number)
+{
+	u8 *p = 0;
+	const char *name;
+	if (f < 0 || f >= FAMILIES || number < 0) return 0;
+	if (TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, (u32)number, (void **)&p) || !p || !(name = TMrInstance_GetInstanceName(p)))
+		return 0;
+	return in_list(g_families[f].classes, name) && name_allowed(name, net_char_rules()) && biped(p);
+}
+
+const char *char_menu_family_label(int f) { return f >= 0 && f < FAMILIES ? g_families[f].label : "?"; }
+
+int char_menu_pick_family(u32 seed)
+{
+	int cand[FAMILIES], n = 0;
+	u32 h = seed;
+
+	for (int f = 0; f < FAMILIES; f++)
+		if (char_menu_family_main(f) >= 0) cand[n++] = f;
+	if (!n) return -1;
+	h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+	return cand[h % (u32)n];
+}
+
 /* The variations the game's rules leave out go; the entry too when none is left */
 static int entry_allowed(Entry *e)
 {
@@ -677,6 +738,23 @@ static void roster_resolve(void)
 		log_msg("char menu: the map's ark_characterscreen_flags %d keep %d of %d characters", g_flags_applied, n, g_count);
 		g_count = n;
 	}
+	/* One Character: that character alone, made from its family whatever the roster has */
+	g_family_applied = players_one_family();
+	if (g_family_applied >= 0) {
+		const Family *fam = &g_families[g_family_applied];
+		int main = char_menu_family_main(g_family_applied);
+		u8 *p = 0;
+		Entry *e = &g_roster[0];
+		g_count = 0;
+		if (main >= 0 && !TMrInstance_GetDataPtr_ByNumber(TAG_ONCC, (u32)main, (void **)&p) && p) {
+			memset(e, 0, sizeof *e);
+			str_cpy(e->cls, sizeof e->cls, TMrInstance_GetInstanceName(p));
+			entry_names(e);
+			e->family = fam->classes;   /* (every variation, even a class listed in another family first) */
+			if (entry_resolve(e)) g_count = 1;
+		}
+		log_msg("char menu: One Character: %s alone in the F2 menu", fam->label);
+	}
 	for (int i = 0; i < g_count; i++)
 		if (g_roster[i].nvar > 1) log_msg("char menu: %s has %d variations", g_roster[i].cls, g_roster[i].nvar);
 	pick_poses();
@@ -692,6 +770,12 @@ static void roster_resolve(void)
 				g_choice_var = v;
 			}
 		}
+	/* One Character, the choice not one of its variations: its main one (the name stays the
+	 * player's own pick, found again when the match is over) */
+	if (g_family_applied >= 0 && g_choice < 0 && g_count) {
+		g_choice = 0;
+		g_choice_var = g_roster[0].var;
+	}
 	log_msg("char menu: %d characters in the F2 menu", g_count);
 }
 
@@ -1156,6 +1240,12 @@ static int choice_kept(void)
 
 u32 char_menu_record_word(void)
 {
+	/* One Character began or ended (a match's start or end): the roster follows at once, so the
+	 * records carry one of its variations (players.c holds them to it anyway) */
+	if (g_resolved && g_family_applied != players_one_family()) {
+		char_menu_level0_changed();
+		roster_resolve();
+	}
 	return PLAYERS_CHOICE_TAG | (choice_kept() ? g_roster[g_choice].vnumber[g_choice_var] + 1 : 0);
 }
 
@@ -1255,7 +1345,7 @@ void char_menu_frame(void)
 	click = key(VK_LBUTTON, focus, 0);
 
 	if (!g_open) {
-		if (f2 && allowed()) open_menu();
+		if (f2 && allowed() && !dev_mode()) open_menu();   /* (developer mode: F2 is cutscene1) */
 		return;
 	}
 	if (!allowed() || ONrLevel_GetCurrent() != g_level) {
@@ -1683,7 +1773,8 @@ void char_menu_rules_changed(void)
 /* Resolved with the rules in force (a game's end puts every character back) */
 static void roster_ready(void)
 {
-	if (g_resolved && (g_rules_applied != net_char_rules() || g_flags_applied != flags_now())) char_menu_level0_changed();
+	if (g_resolved && (g_rules_applied != net_char_rules() || g_flags_applied != flags_now() ||
+	                   g_family_applied != players_one_family())) char_menu_level0_changed();
 	if (!g_resolved) roster_resolve();
 }
 
@@ -1775,6 +1866,7 @@ static u16 ONI_FC command_table_hook(void *table)
 	bsl_var_register("ark_characterscreen_flags", BSL_INT, &g_bsl_flags, flags_assigned);
 	log_msg("char menu: map script variables ark_characterscreen_enabled, _instant_swap, _flags registered");
 	mp_rules_bsl_register();
+	dialog_bsl_register();
 	return r;
 }
 

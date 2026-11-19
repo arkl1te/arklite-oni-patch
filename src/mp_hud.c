@@ -23,7 +23,8 @@
  * 1440, 14 at 1080, 10 at 720). Oni's own Tahoma has 7, 9, 10, 12 and 14; big_font.c makes the
  * other sizes from the system's Tahoma (Windows', or Wine's) and puts them in a copy of the
  * context's family while we draw (corner_begin/corner_end). Without Tahoma the context falls back
- * to Oni's nearest smaller size. "FIGHT!" is its own size, 1.5 times that. Margins and gaps follow
+ * to Oni's nearest smaller size. "FIGHT!" is its own size, 3 times that (at most FIGHT_MAX_POINTS),
+ * and a vote's first line too, 1.35 times it (VOTE_SCALE). Margins and gaps follow
  * the screen too (mp_hud_px), and so does everything that lays out by the line height (chat.c,
  * char_menu.c, obituary.c, mp_names.c, photo.c).
  *
@@ -32,7 +33,9 @@
  * (the two PCs' files differ, net.c). Match (or a two-player game on one PC): the score in the
  * top right corner with the players' names (mp_names.c), this PC's player in yellow, the match's
  * time left under it when it has a time limit (red in the last 30 s), the result once a limit
- * was reached ("Press fire to go back to the lobby"), "FIGHT!" for 2 s as a match begins, the name of
+ * was reached ("Press fire to go back to the lobby", after net.c's END_GUARD_MS: until then the fire
+ * button does nothing and the line counts down in gray), "FIGHT!" for 2 s as a match begins, a vote
+ * on a dark panel with its first line bigger (draw_vote), the name of
  * the player this PC's player faces over their head, and "Out of sync" when a state check failed. The chat
  * (chat.c) in the lower left, in the lobby too. In the warm-up, "Press F2 to change character
  * and name." at the very top, centered, in the chat hint's plain gray. The F2 character menu
@@ -92,7 +95,8 @@ __declspec(dllimport) int WINAPI QueryPerformanceFrequency(unsigned long long *)
 
 static int g_line_height;         /* on screen, set by corner_begin */
 static float g_screen = 1.0f;     /* the screen's height / REFERENCE_HEIGHT, set by corner_begin */
-static int g_points, g_fight_points;   /* the text's size, and "FIGHT!"'s */
+static int g_points, g_fight_points, g_vote_points;   /* the text's size, "FIGHT!"'s and a vote's first line's */
+static u8 *g_shade;               /* a vote's panel: black, drawn see-through (hud_solid) */
 static void *g_family_was;        /* the context's family, put back by corner_end */
 
 /* HUD Centering: the top right block's widest line while it shows, the FPS line's, and whether
@@ -146,8 +150,10 @@ static void text(const char *s, int x, int y, int align, u32 color)
 /* "FIGHT!" as a match begins (net.c fight_ms): the HUD's bold font at FIGHT_SCALE times the
  * text's size (a size of its own, big_font.c), centered; it fades out over its last
  * FIGHT_FADE_MS. Returns the y under it. */
-#define FIGHT_SCALE   1.5f
-#define FIGHT_FADE_MS 500
+#define FIGHT_SCALE      3.0f
+#define FIGHT_MAX_POINTS 96     /* (a glyph's cell must fit big_font.c's 1024 x 1024 texture) */
+#define FIGHT_FADE_MS    500
+#define VOTE_SCALE       1.35f
 
 static int draw_fight(int ms, int width, int y)
 {
@@ -172,6 +178,8 @@ static void sizes(void)
 	if (g_points < 7) g_points = 7;
 	if (g_points > MAX_POINTS) g_points = MAX_POINTS;
 	g_fight_points = (int)(g_points * FIGHT_SCALE + 0.5f);
+	if (g_fight_points > FIGHT_MAX_POINTS) g_fight_points = FIGHT_MAX_POINTS;
+	g_vote_points = (int)(g_points * VOTE_SCALE + 0.5f);
 }
 
 /* Between corner_begin and corner_end the context has the family with this screen's sizes and
@@ -183,7 +191,7 @@ static u32 corner_begin(void *ctx)
 	sizes();
 	text_multibyte_begin();   /* names and chat beyond ASCII (text.c) */
 	g_family_was = CONTEXT_FAMILY(ctx);
-	CONTEXT_FAMILY(ctx) = big_font_family(g_family_was, g_points, g_fight_points);
+	CONTEXT_FAMILY(ctx) = big_font_family(g_family_was, g_points, g_fight_points, g_vote_points);
 	TSrContext_SetSize(ctx, (u32)g_points);   /* that size, else Oni's nearest smaller one */
 	g_line_height = font_height(ctx);
 	return size;
@@ -203,9 +211,10 @@ void mp_hud_prepare(void)
 	void *ctx = ONgTextContext;
 
 	big_font_prepare();
+	if (!g_shade) g_shade = hud_solid(0x8000, "arklite_vote_shade");   /* (made now: none while rollback may rewind) */
 	if (!ctx) return;
 	sizes();
-	big_font_family(CONTEXT_FAMILY(ctx), g_points, g_fight_points);
+	big_font_family(CONTEXT_FAMILY(ctx), g_points, g_fight_points, g_vote_points);
 }
 
 int mp_hud_px(int px)
@@ -300,6 +309,8 @@ static int draw_lobby(const NetHud *h, int width, int y)
 
 	if (players_spectate_wanted() && h->state != NETHUD_LOBBY)   /* spectators don't ready up (net.c ready_frame) */
 		text("Watching: /join to play", x, y, CENTER, WHITE);
+	else if (dev_mode())   /* F3 is a developer key there (common.c dev_mode) */
+		text("Developer mode: F3 is off", x, y, CENTER, RED);
 	else
 		text(h->ready ? "Press F3 to be unready" : "Press F3 to be ready", x, y, CENTER, h->ready ? GREEN : RED);
 	y += g_line_height + GAP4;
@@ -433,40 +444,67 @@ static void draw_over(const NetHud *h, int width, int height)
 	}
 	if (h->over_ready) fmt(line, "Waiting for the others (%d of %d ready, %d s)", h->over_ready_count, h->over_players,
 	                       (h->over_left_ms + 999) / 1000);
+	else if (h->over_guard_ms > 0) fmt(line, "Fire goes back to the lobby in %d s", (h->over_guard_ms + 999) / 1000);
 	else fmt(line, "Press fire to go back to the lobby (%d s)", (h->over_left_ms + 999) / 1000);
-	text(line, x, y, CENTER, h->over_ready ? GREEN : YELLOW);
+	text(line, x, y, CENTER, h->over_ready ? GREEN : h->over_guard_ms > 0 ? HINT_GRAY : YELLOW);
 }
 
 /* A vote (net.c "Votes"): what it's about, the count and the time left, how to answer; then
- * "Vote passed" or "Vote failed" for a moment */
+ * "Vote passed" or "Vote failed" for a moment. On a dark panel (VOTE_SHADE), its first line in
+ * the vote's bigger size (VOTE_SCALE), so it stands apart from the lobby's lines and the chat. */
+#define VOTE_SHADE 150   /* the panel's alpha */
 static int draw_vote(int width, int y)
 {
+	void *ctx = ONgTextContext;
 	NetVote v;
-	char what[160], line[224];
-	int x = width / 2;
+	char what[160], first[224], line[2][96];
+	u32 first_color, color[2] = { WHITE, WHITE };
+	int x = width / 2, lines = 2, big_h, w, pad = mp_hud_px(8), top;
 
 	if (!net_vote(&v)) return y;
 	net_vote_what(what, sizeof what, v.kind, v.subject, v.reason);
-	if (v.state != NET_VOTE_OPEN) {
-		fmt(line, v.state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
-		text(line, x, y, CENTER, v.state == NET_VOTE_PASSED ? GREEN : RED);
-		y += g_line_height + GAP2;
-		fmt(line, "Yes %d   No %d   of %d player%s", v.yes, v.no, v.voters, v.voters == 1 ? "" : "s");
-		text(line, x, y, CENTER, WHITE);
-		return y + g_line_height + LINE_GAP;
+	if (v.state != NET_VOTE_OPEN) {   /* the result alone, no count (user, 2026-11-16) */
+		if (v.state == NET_VOTE_FAILED) fmt(first, "Vote failed: %s", what);
+		else if (v.kind == NET_VOTE_RESTART) str_cpy(first, sizeof first, "Vote passed: Restarting match");
+		else if (v.kind == NET_VOTE_MAP) fmt(first, "Vote passed: Changing map to %s", v.subject);
+		else fmt(first, "Vote passed: Kicking %s", v.subject);
+		first_color = v.state == NET_VOTE_PASSED ? GREEN : RED;
+		lines = 0;
+	} else {
+		fmt(first, "Vote: %s", what);
+		first_color = YELLOW;
+		fmt(line[0], "Yes:%d No:%d (%ds)", v.yes, v.no, (v.ms_left + 999) / 1000);
+		color[0] = WHITE;
+		if (!v.may) str_cpy(line[1], sizeof line[1], "Spectators don't vote"), color[1] = HINT_GRAY;
+		else if (v.mine == 1) str_cpy(line[1], sizeof line[1], "You said Yes"), color[1] = GREEN;
+		else if (v.mine == 2) str_cpy(line[1], sizeof line[1], "You said No"), color[1] = RED;
+		else str_cpy(line[1], sizeof line[1], "Press: Y -or- N"), color[1] = WHITE;
 	}
-	fmt(line, "Vote: %s", what);
-	text(line, x, y, CENTER, WHITE);
-	y += g_line_height + GAP2;
-	fmt(line, "Yes %d   No %d   of %d player%s   %d s", v.yes, v.no, v.voters, v.voters == 1 ? "" : "s",
-	    (v.ms_left + 999) / 1000);
-	text(line, x, y, CENTER, YELLOW);
-	y += g_line_height + GAP2;
-	if (!v.may) text("Spectators don't vote", x, y, CENTER, HINT_GRAY);
-	else if (v.mine == 1) text("You voted Yes (N: No)", x, y, CENTER, GREEN);
-	else if (v.mine == 2) text("You voted No (Y: Yes)", x, y, CENTER, RED);
-	else text("Press Y for Yes, N for No (or F1)", x, y, CENTER, WHITE);
-	return y + g_line_height + LINE_GAP;
+	/* the first line's size and width, then the panel as wide as the widest line */
+	TSrContext_SetSize(ctx, (u32)g_vote_points);
+	big_h = font_height(ctx);
+	w = mp_hud_text_width(first, -1);
+	TSrContext_SetSize(ctx, (u32)g_points);
+	for (int i = 0; i < lines; i++) {
+		int lw = mp_hud_text_width(line[i], -1);
+		if (lw > w) w = lw;
+	}
+	if (!g_shade) g_shade = hud_solid(0x8000, "arklite_vote_shade");
+	top = y;
+	y += pad;
+	if (g_shade)
+		hud_rect(g_shade, x - w / 2 - pad * 2, top, w + pad * 4,
+		         pad + big_h + (lines ? GAP4 + lines * (g_line_height + GAP2) - GAP2 : 0) + pad + mp_hud_px(4), VOTE_SHADE);
+	TSrContext_SetSize(ctx, (u32)g_vote_points);
+	text(first, x, y, CENTER, first_color);
+	TSrContext_SetSize(ctx, (u32)g_points);
+	y += big_h;
+	if (lines) y += GAP4;
+	for (int i = 0; i < lines; i++) {
+		text(line[i], x, y, CENTER, color[i]);
+		y += g_line_height + (i + 1 < lines ? GAP2 : 0);
+	}
+	return y + pad + mp_hud_px(4) + LINE_GAP;
 }
 
 /* Jamming Guns (mutators.c): the gun in hand of the character this screen shows is jammed. Under
@@ -475,16 +513,18 @@ static void draw_jam(int width, int height)
 {
 	static const char *const times[] = { "", "once", "twice" };
 	int drops, reloads;
-	char line[96], n[16];
+	char line[96], d[16], r[16];
 
 	if (!mutators_jammed(net_view_character(), &drops, &reloads)) return;
 	int y = height * 3 / 5;
 	text("Gun jammed!", width / 2, y, CENTER, RED);
-	if (drops < 3) str_cpy(n, sizeof n, times[drops]);
-	else fmt(n, "%d times", drops);
-	if (drops && reloads) fmt(line, "Drop it %s and reload it", n);
-	else if (drops) fmt(line, "Drop it %s", n);
-	else str_cpy(line, sizeof line, "Reload it");
+	if (drops < 3) str_cpy(d, sizeof d, times[drops]);
+	else fmt(d, "%d times", drops);
+	if (reloads < 3) str_cpy(r, sizeof r, times[reloads]);
+	else fmt(r, "%d times", reloads);
+	if (drops && reloads) fmt(line, "Reload it %s and drop it %s", r, d);
+	else if (drops) fmt(line, "Drop it %s", d);
+	else fmt(line, "Reload it %s", r);
 	text(line, width / 2, y + g_line_height + GAP2, CENTER, WHITE);
 }
 
@@ -549,7 +589,15 @@ static void ONI_FC timer_display(void *timer)
 		text(h.warmup ? "Starting the warm-up..." : "Starting the match...", width / 2, y, CENTER, WHITE);
 		y += g_line_height + LINE_GAP;
 	} else draw_score(&h, h.state == NETHUD_MATCH ? h.local_player : -1, width);
-	if (h.state == NETHUD_MATCH && h.fight_ms > 0 && !h.over) y = draw_fight(h.fight_ms, width, y);
+	if (h.state == NETHUD_MATCH && h.fight_ms > 0 && !h.over) {
+		y = draw_fight(h.fight_ms, width, y);
+		if (players_one_family() >= 0) {   /* One Character: who everyone plays */
+			char line[80];
+			fmt(line, "Everyone plays %s", char_menu_family_label(players_one_family()));
+			text(line, width / 2, y, CENTER, YELLOW);
+			y += g_line_height + LINE_GAP;
+		}
+	}
 	if (h.state == NETHUD_MATCH && h.warmup && !char_menu_open()) y = draw_lobby(&h, width, y);
 	if (h.state == NETHUD_MATCH && h.joining == 2) {   /* in sync, its player comes in a moment later */
 		text("Joining the game...", width / 2, y, CENTER, WHITE);
@@ -568,7 +616,7 @@ static void ONI_FC timer_display(void *timer)
 	if (h.state == NETHUD_LOBBY || h.state == NETHUD_STARTING || h.warmup) y = draw_problem(&h, width, y);
 	/* the warm-up's F2 hint at the very top, in the chat hint's style (F2 does nothing while the
 	 * chat or the pause menu has the keyboard) */
-	if (h.state == NETHUD_MATCH && h.warmup && !h.over && !chat_blocking() && !live_menu_open() && !char_menu_open())
+	if (h.state == NETHUD_MATCH && h.warmup && !h.over && !chat_blocking() && !live_menu_open() && !char_menu_open() && !dev_mode())
 		mp_hud_text_plain("Press F2 to change character and name.", width / 2, WARMUP_HINT_Y, MP_CENTER, HINT_GRAY);
 	chat_draw(width, height);
 	if (h.desynced) {

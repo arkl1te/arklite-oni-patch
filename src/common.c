@@ -1,6 +1,8 @@
 /* Log, patching and string helpers shared by Arklite's patches. */
 #include "arklite.h"
 
+__declspec(dllimport) short WINAPI GetAsyncKeyState(int);
+
 /* The MSVC target emits a reference to this whenever floats are used. */
 int _fltused;
 
@@ -270,4 +272,25 @@ int parse_float(const char **ps, float *out)
 	*out = neg ? -v : v;
 	*ps = s;
 	return 1;
+}
+
+/* Oni's developer mode (ONgDeveloperAccess, 0x5ece8e: the thedayismine cheat toggles it at
+ * 0x4f5da5 and binds the developer keys, 0x404730: F2-F11, Enter, ~, U, N, M, L, the arrows and
+ * the number pad...). Arklite's keys that are developer keys too do nothing while it's on. */
+int dev_mode(void) { return *(volatile u8 *)0x5ece8e != 0; }
+
+/* Developer mode off, as the cheat's second use does (0x4f5dd2: the developer keys unbound, 0x404910;
+ * the console back to subtitle priority, 0x42f3d0 with ECX 1) */
+void dev_mode_off(void)
+{
+	if (!dev_mode()) return;
+	*(volatile u8 *)0x5ece8e = 0;
+	((void (ONI_FC *)(void))0x404910)();
+	((void (ONI_FC *)(u32))0x42f3d0)(1);
+}
+
+/* ...and Ctrl, which the developer keys on letters need (with Shift or Alt: Ctrl+Shift+O, Y...) */
+int dev_mode_ctrl(void)
+{
+	return dev_mode() && ((GetAsyncKeyState(0xa2) | GetAsyncKeyState(0xa3) | GetAsyncKeyState(0x11)) & 0x8000) != 0;
 }

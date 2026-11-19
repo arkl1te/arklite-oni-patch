@@ -66,7 +66,21 @@
  * matches, so it moves as unarmed and no aiming screen applies: it never aims. On a multiplayer
  * map the class is right-handed (0x2000/0x0800, comguy's), set when the level's characters are
  * made (mp_rules_level, from the player spawn walk before the game spawns them) and put back
- * on other maps: stock levels 1 and 10 place ninjabots. */
+ * on other maps: stock levels 1 and 10 place ninjabots.
+ *
+ * Melee auto-facing (2026-11-16): a player's attack that starts on the ground turns the attacker
+ * toward the opponent nearest the attack's direction (OniFoxed ONiCharacter_FaceOpponent, inlined
+ * in the animation start at 0x4e9a85..0x4e9b5c: the direction from the animation, forward for
+ * most, back or a side for the others). It searches with 0x4ea2b0 (ONiCharacter_FindNearestOpponent:
+ * ECX the character, EDX &facing offset out, then the attack's direction, the distance
+ * chr_auto_aim_dist 0x54e160 = 40, the arc chr_auto_aim_arc 0x54e15c = 90 degrees times 0x529550
+ * (pi / 180) to each side, skip-invulnerable 0; ret 0x10), called at 0x4e9ae9, which skips dead
+ * characters (+4 flag 1) first. On a multiplayer map the arc is MELEE_ARC_DEGREES to each side of
+ * the attack's direction (for most attacks where the player looks), and a character cloaked as
+ * other players see it (more than the cloak's last 120 ticks left, +0x1ba: invis.c, its body
+ * isn't drawn for them) is no target: it reads as dead during the search, its flag put back
+ * right after. The throw search (0x4eaa40: 24 units, 45 degrees) is left as it is. All game state,
+ * in the tick: every PC turns the same. */
 #include "arklite.h"
 
 void *memset(void *, int, unsigned);
@@ -146,6 +160,52 @@ static void free_for_all_install(void)
 	}
 	for (u32 i = 0; i < n; i++) patch_call(sites[i].site, TEAM_RELATION, (u32)sites[i].stub);
 	log_msg("mp rules: players can hurt each other on multiplayer maps (free for all)");
+}
+
+/* ---- Melee auto-facing (see the top) ---- */
+
+#define ONiCharacter_FindNearestOpponent 0x4ea2b0
+#define ONcFaceOpponent_FindCall         0x4e9ae9
+#define ONrGameState_ActiveList          ((u8 **(ONI_FC *)(void))0x4fc9b0)
+#define ONrGameState_ActiveCount         ((u32 (ONI_FC *)(void))0x4fc9c0)
+#define MELEE_ARC_DEGREES                30      /* to each side (stock 90; user, 2026-11-16) */
+#define MELEE_ARC_RADIANS                0.52359877559829887f   /* pi / 6, a constant: no float math that could round apart */
+#define CHR_FLAGS_OF(c)                  (*(u32 *)((u8 *)(c) + 4))
+#define CHR_FLAG_DEAD                    0x1
+#define CHR_INVIS_LEFT(c)                (*(u16 *)((u8 *)(c) + 0x1ba))
+#define INVIS_SEEN_TICKS                 120     /* the cloak's last ticks fade the body back in (invis.c) */
+#define HIDDEN_MAX                       256
+
+typedef u8 *(ONI_FC *FindOpponent)(u8 *, float *, float, float, float, u32);
+
+static u8 *ONI_FC melee_target(u8 *c, float *offset, float facing, float distance, float arc, u32 skip)
+{
+	FindOpponent find = (FindOpponent)ONiCharacter_FindNearestOpponent;
+	u8 **list, *hidden[HIDDEN_MAX], *found;
+	u32 n, nhidden = 0;
+
+	if (!multiplayer_map()) return find(c, offset, facing, distance, arc, skip);
+	arc = MELEE_ARC_RADIANS;
+	list = ONrGameState_ActiveList();
+	n = list ? ONrGameState_ActiveCount() : 0;
+	for (u32 i = 0; i < n && nhidden < HIDDEN_MAX; i++) {
+		u8 *o = list[i];
+		if (!o || o == c || (CHR_FLAGS_OF(o) & CHR_FLAG_DEAD) || CHR_INVIS_LEFT(o) <= INVIS_SEEN_TICKS) continue;
+		CHR_FLAGS_OF(o) |= CHR_FLAG_DEAD;
+		hidden[nhidden++] = o;
+	}
+	found = find(c, offset, facing, distance, arc, skip);
+	for (u32 i = 0; i < nhidden; i++) CHR_FLAGS_OF(hidden[i]) &= ~CHR_FLAG_DEAD;
+	return found;
+}
+
+static void melee_facing_install(void)
+{
+	if (patch_call(ONcFaceOpponent_FindCall, ONiCharacter_FindNearestOpponent, (u32)melee_target))
+		log_msg("mp rules: melee auto-facing on multiplayer maps: %d degrees to each side, never toward a cloaked player",
+		        MELEE_ARC_DEGREES);
+	else
+		log_msg("mp rules: 0x%x isn't the melee target search: melee auto-facing stays stock", ONcFaceOpponent_FindCall);
 }
 
 #define ONrOwner_Character  ((u8 *(ONI_FC *)(u32))0x51cda0)   /* owner handle -> character, or 0 */
@@ -677,6 +737,7 @@ void mp_rules_install(void)
 	}
 
 	free_for_all_install();
+	melee_facing_install();
 	taunt_install();
 	taunt_line_install();
 	aim_clip_install();

@@ -1,5 +1,6 @@
-/* Photo mode, single player only: F10 stops the game and frees the camera; F10 again (or Esc)
- * puts everything back as it was.
+/* Photo mode, single player only: F4 stops the game and frees the camera; F4 again (or Esc)
+ * puts everything back as it was (F10 up to 0.6.0; user, 2026-11-16). Not in Oni's developer mode,
+ * where F4 is a developer key (common.c dev_mode).
  *
  * Never in multiplayer: not in a network game (net_active, the lobby included), not with a local
  * player 2 on a multiplayer map (multiplayer_active, multiplayer_map), and not while lockstep.c
@@ -59,7 +60,7 @@
  * dialog is (mp_menu.c), moved to the left edge without its background picture, so the frozen
  * scene shows beside it and the field of view and tilt change on it as they're typed. It runs as
  * the pause menu does (UI mode, game input off, the psui_oniUI part set). Tab, Esc or Resume
- * close it; F10 or Exit Photo leave photo mode. The panel's toggles and flight speed are kept in
+ * close it; F4 or Exit Photo leave photo mode. The panel's toggles and flight speed are kept in
  * Arklite.ini [photo]; the field of view and tilt start from the game's every time.
  *
  * Only this PC's view and settings: in single player, nothing here is game state except a frame
@@ -242,8 +243,8 @@ static int focused(void)
 
 /* ---- Keys ----------------------------------------------------------------------------------- */
 
-enum { K_F10, K_TAB, K_ESC, K_Q, K_E, K_R, K_F, K_LMB, K_RMB, K_CTRL, K_COUNT };
-static const int g_vk[K_COUNT] = { 0x79, 0x09, 0x1b, 'Q', 'E', 'R', 'F', 0x01, 0x02, 0x11 };
+enum { K_F4, K_TAB, K_ESC, K_Q, K_E, K_R, K_F, K_LMB, K_RMB, K_CTRL, K_COUNT };
+static const int g_vk[K_COUNT] = { 0x73, 0x09, 0x1b, 'Q', 'E', 'R', 'F', 0x01, 0x02, 0x11 };
 static u32 g_keyDown, g_keyHit;
 
 /* Every frame, the panel's too, so a key that closed the panel isn't a new press after it */
@@ -655,12 +656,12 @@ int photo_update(u32 count, void *actions, u32 *ticks_run, u32 *err)
 	unsigned long long now;
 	float dt;
 
-	int notches = menu_wheel_photo_take();   /* (also puts the window procedure that keeps F10 from Windows in place) */
+	int notches = menu_wheel_photo_take();   /* (also puts menu_wheel.c's window procedure in place) */
 
 	keys_poll();
 	if (g_on && (!gs || ONrLevel_GetCurrent() != g_level || GS_TICK(gs) < g_startTick || GS_CAMERA(gs) != g_cam)) leave(0);
 	if (g_on && !allowed()) leave(1);
-	if (hit(K_F10)) {
+	if (hit(K_F4) && !dev_mode()) {   /* (developer mode: F4 is its key) */
 		if (g_on) leave(1);
 		else if (allowed()) enter();
 		else if (gs && ONrLevel_GetCurrent()) log_msg("photo: not in multiplayer");
@@ -755,8 +756,8 @@ void photo_draw(int width, int height)
 	}
 	mp_hud_text_plain("Mouse: look   Move keys: fly   Jump/Crouch: up/down   Walk or Ctrl: slow   Wheel: zoom",
 	                  width / 2, y + lh, MP_CENTER, 0xffe0e0e0u);
-	mp_hud_text_plain(g_orbit ? "Q/E: tilt   R: level   F: free fly   Clicks: next character   Tab: settings   F10: exit"
-	                          : "Q/E: tilt   R: level   F: orbit a character   Tab: settings   F10: exit",
+	mp_hud_text_plain(g_orbit ? "Q/E: tilt   R: level   F: free fly   Clicks: next character   Tab: settings   F4: exit"
+	                          : "Q/E: tilt   R: level   F: orbit a character   Tab: settings   F4: exit",
 	                  width / 2, y + 2 * lh, MP_CENTER, 0xffe0e0e0u);
 }
 
@@ -1055,14 +1056,14 @@ static u8 ONI_FC panel_proc(WMtWindow *dialog, u32 msg, u32 p1, u32 p2)
 	return 1;
 }
 
-/* Every frame of the panel: Tab closes it, F10 leaves photo mode */
+/* Every frame of the panel: Tab closes it, F4 leaves photo mode */
 static void panel_frame(void)
 {
 	ui_frame_hook_call(g_hookOld);
 	ui_fields_frame();
 	keys_poll();
 	if (!g_dialog) return;
-	if (hit(K_F10)) {
+	if (hit(K_F4)) {
 		g_leaveAfter = 1;
 		panel_close(g_dialog);
 	} else if (hit(K_TAB)) {
@@ -1104,7 +1105,7 @@ static void panel_open(void)
 	/* the press that closed the panel (Esc, Tab, a click on Resume) can reach the window manager
 	 * before GetAsyncKeyState shows it: counted as held, it isn't a new press once the panel's gone
 	 * (Esc would leave photo mode, a click would change the orbit's character) */
-	g_keyDown |= 1u << K_ESC | 1u << K_TAB | 1u << K_F10 | 1u << K_LMB | 1u << K_RMB;
+	g_keyDown |= 1u << K_ESC | 1u << K_TAB | 1u << K_F4 | 1u << K_LMB | 1u << K_RMB;
 	if (g_leaveAfter) leave(1);
 	else g_hintUntil = GetTickCount() + (g_shotIn ? 0 : HINT_MS);
 }
@@ -1124,5 +1125,5 @@ void photo_install(void)
 		log_msg("photo: letterbox call 0x%x changed, a cutscene's bars stay in photos", ONcLetterBox_Call);
 	if (!patch_call(ONcLaserSight_Call, (u32)ONrLaserSight_Display, (u32)laser_sight))
 		log_msg("photo: laser sight call 0x%x changed, it stays in photos", ONcLaserSight_Call);
-	log_msg("photo: F10 (single player)");
+	log_msg("photo: F4 (single player)");
 }

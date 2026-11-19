@@ -15,6 +15,9 @@
  * at a -(points * 96 / 72) px em. Windows has Tahoma, and Wine ships its own; when the face found
  * isn't Tahoma, nothing is made and the text keeps Oni's sizes (log line "big font").
  *
+ * The sizes (mp_hud.c): the HUD text's, plain and bold; "FIGHT!"'s, bold; a vote's first line's,
+ * bold (SLOTS, one font each).
+ *
  * A family picks a font by exact size and style (0x42ed50 -> GetBestFont: the size asked, then
  * smaller ones, plain if the style is missing). mp_hud.c puts a copy of the context's family
  * with the made fonts appended on the context while it draws (big_font_family) and puts the
@@ -125,7 +128,7 @@ typedef struct {
 	Cell  *cell;
 } Private;   /* TStFont_PrivateData */
 
-#define SLOTS     3        /* the size's plain and bold, the big size's bold ("FIGHT!") */
+#define SLOTS     4        /* the size's plain and bold, the big size's bold ("FIGHT!"), the vote's bold */
 #define SPARE     256      /* empty cells for characters beyond ASCII (text.c), drawn when first used */
 #define MAX_SIDE  1024     /* Arklite's upload limit (texture_clamp.c) */
 
@@ -428,10 +431,10 @@ static u8 *family_font(u8 *family, int points, int style)
 	return 0;
 }
 
-void *big_font_family(void *family_in, int points, int big_points)
+void *big_font_family(void *family_in, int points, int big_points, int vote_points)
 {
 	u8 *family = family_in, *header = 0;
-	int want_points[SLOTS] = { points, points, big_points }, want_style[SLOTS] = { 0, 1, 1 };
+	int want_points[SLOTS] = { points, points, big_points, vote_points }, want_style[SLOTS] = { 0, 1, 1, 1 };
 	int changed = 0, ours = 0;
 
 	if (!family || g_failed || FAMILY_COUNT(family) == 0 || FAMILY_COUNT(family) > 256) return family;

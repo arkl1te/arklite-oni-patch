@@ -1,5 +1,5 @@
-/* The phase cloak in network games: the cloaked player sees themselves half there (the body at
- * 50% opacity, no shimmer); every other player sees nothing of them at all, except the shimmer
+/* The phase cloak in network games: the cloaked player sees themselves barely there (the body at
+ * the opacity knob, 5% by default, with its outline and tones; no shimmer); every other player sees nothing of them at all, except the shimmer
  * flashing up when the cloaked player lands a blow. Being hit shows nothing.
  *
  * Oni (ONrCharacter_Invis_Update 0x4ef530, the character draw around 0x4e1d00 with ESI the active
@@ -24,8 +24,9 @@
  *     does what it did). Its opacity is the one Oni would have given the body for the blow: 0.6,
  *     fading 0.0085 a tick, gone ~71 ticks (1.2 s) later (Oni's own shimmer never passes 0.22).
  * For the character this screen belongs to (in a network game, not a spectator's screen): the
- * body and shadow alpha are at least 0.5 while invis_active (Oni's fade from 1 at pickup stops at
- * 0.5, and its fade back in at the end starts once it passes 0.5; a blow's 0.6 still shows), and
+ * body and shadow alpha are at least the opacity knob while invis_active (Oni's fade from 1 at
+ * pickup stops there, and its fade back in at the end starts once it passes it; a blow's 0.6 still
+ * shows; 0.5 up to 2026-11-19, 0.05 now), and
  * the shimmer isn't drawn (user request, 2026-11-13). How that body is drawn (user request,
  * 2026-11-14: only its front surfaces, and the textures' white showing) is "The see-through body".
  * Off the network everything is as in Oni (single player's cloaked ninjas keep their shimmer and
@@ -148,33 +149,37 @@ void float_text(char *out, u32 size, float v, int decimals)
  * always before every filter. */
 static InvisFx g_fx[FX_COUNT] = {
 	/* key                  label                         filter        def      min      max     decimals */
-	{ "opacity",            "Opacity",                    FXF_OPACITY,  0.5f,    0.05f,   1.0f,   2 },
-	{ "water_period_s",     "Loop length (s)",            FXF_WATER,    20.0f,   2.0f,    120.0f, 1 },
-	{ "water_loop_radius",  "Speed",                      FXF_WATER,    1.6f,    0.0f,    6.0f,   2 },
-	{ "water_vertex",       "Warp",                       FXF_WATER,    0.008f,  0.0f,    0.05f,  4 },
-	{ "water_vertex_cells", "Warp swells",                FXF_WATER,    8.0f,    0.5f,    40.0f,  1 },
-	{ "water_texture",      "Texture slide",              FXF_WATER,  0.02f,   0.0f,    0.2f,   3 },
-	{ "water_texture_cells","Texture swells",             FXF_WATER,    8.0f,    0.5f,    40.0f,  1 },
+	/* (def: the values the user set in the menu, Arklite.ini [cloak_fx] of 2026-11-18; up to then
+	 * opacity 0.5, loop 20, speed 1.6, warp 0.008 / 8 swells, slide 0.02 / 8, tones 3 / 0.08, outline
+	 * 0.0025 pale blue 0.55 0.85 1 at 0.8, fringe 0.003 at 20 degrees, zoom 1.2) */
+	{ "opacity",            "Opacity",                    FXF_OPACITY,  0.05f,   0.05f,   1.0f,   2 },
+	{ "water_period_s",     "Loop length (s)",            FXF_WATER,    2.0f,    2.0f,    120.0f, 1 },
+	{ "water_loop_radius",  "Speed",                      FXF_WATER,    1.55f,   0.0f,    6.0f,   2 },
+	{ "water_vertex",       "Warp",                       FXF_WATER,    0.0012f, 0.0f,    0.05f,  4 },
+	{ "water_vertex_cells", "Warp swells",                FXF_WATER,    40.0f,   0.5f,    40.0f,  1 },
+	{ "water_texture",      "Texture slide",              FXF_WATER,    0.2f,    0.0f,    0.2f,   3 },
+	{ "water_texture_cells","Texture swells",             FXF_WATER,    11.1f,   0.5f,    40.0f,  1 },
 	{ "stencil",            "Strength",                   FXF_TONES,    1.0f,    0.0f,    1.0f,   2 },
-	{ "stencil_levels",     "Tones",                      FXF_TONES,    3.0f,    1.0f,    12.0f,  0 },
-	{ "stencil_soft",       "Edge softness",              FXF_TONES,    0.08f,   0.0f,    1.0f,   2 },
-	{ "outline_px",         "Width",                      FXF_OUTLINE,  0.0025f, 0.0f,    0.02f,  4 },
-	{ "outline_r",          "Red",                        FXF_OUTLINE,  0.55f,   0.0f,    1.0f,   2 },
-	{ "outline_g",          "Green",                      FXF_OUTLINE,  0.85f,   0.0f,    1.0f,   2 },
+	{ "stencil_levels",     "Tones",                      FXF_TONES,    12.0f,   1.0f,    12.0f,  0 },
+	{ "stencil_soft",       "Edge softness",              FXF_TONES,    1.0f,    0.0f,    1.0f,   2 },
+	{ "outline_px",         "Width",                      FXF_OUTLINE,  0.0004f, 0.0f,    0.02f,  4 },
+	{ "outline_r",          "Red",                        FXF_OUTLINE,  1.0f,    0.0f,    1.0f,   2 },
+	{ "outline_g",          "Green",                      FXF_OUTLINE,  1.0f,    0.0f,    1.0f,   2 },
 	{ "outline_b",          "Blue",                       FXF_OUTLINE,  1.0f,    0.0f,    1.0f,   2 },
-	{ "outline_alpha",      "Solidity",                   FXF_OUTLINE,  0.8f,    0.0f,    1.0f,   2 },
-	{ "fringe_px",          "Split",                      FXF_FRINGE,   0.003f,  0.0f,    0.03f,  4 },
-	{ "fringe_angle",       "Angle (degrees)",            FXF_FRINGE,   20.0f,   -180.0f, 180.0f, 0 },
-	{ "zoom",               "Zoom (field of view)",       FXF_ZOOM,     1.2f,    1.0f,    3.0f,   2 },
+	{ "outline_alpha",      "Solidity",                   FXF_OUTLINE,  0.11f,   0.0f,    1.0f,   2 },
+	{ "fringe_px",          "Split",                      FXF_FRINGE,   0.0027f, 0.0f,    0.03f,  4 },
+	{ "fringe_angle",       "Angle (degrees)",            FXF_FRINGE,   -92.0f,  -180.0f, 180.0f, 0 },
+	{ "zoom",               "Zoom (field of view)",       FXF_ZOOM,     1.18f,   1.0f,    3.0f,   2 },
 	{ "zoom_pulse",         "Pulse",                      FXF_ZOOM,     0.0f,    0.0f,    1.0f,   2 },
 };
 static const char *const g_filter_name[FXF_COUNT] = { "Opacity", "Water", "Stencil tones", "Outline", "Color fringe", "Zoom" };
 static const char *const g_filter_key[FXF_COUNT] = { "opacity", "water", "tones", "outline", "fringe", "zoom" };
-/* The default order: the body faded first, its own colors toned, then the zoomed view behind it
- * shows through its other half (after the tones, so the view isn't toned), the water waves the
- * body and that view together, then the outline, and the fringes on top */
-static const int g_order_def[FXF_COUNT] = { FXF_OPACITY, FXF_TONES, FXF_ZOOM, FXF_WATER, FXF_OUTLINE, FXF_FRINGE };
-static int g_order[FXF_COUNT] = { FXF_OPACITY, FXF_TONES, FXF_ZOOM, FXF_WATER, FXF_OUTLINE, FXF_FRINGE };
+/* The default order (the user's, 2026-11-18): the outline first, so the fading takes it too, then
+ * the body faded, the zoomed view behind it showing through, the water waving body and view
+ * together, the tones over all of it, and the fringes on top. (Up to then: opacity, tones, zoom,
+ * water, outline, fringe.) */
+static const int g_order_def[FXF_COUNT] = { FXF_OUTLINE, FXF_OPACITY, FXF_ZOOM, FXF_WATER, FXF_TONES, FXF_FRINGE };
+static int g_order[FXF_COUNT] = { FXF_OUTLINE, FXF_OPACITY, FXF_ZOOM, FXF_WATER, FXF_TONES, FXF_FRINGE };
 
 const char *invis_fx_filter_name(int f) { return f >= 0 && f < FXF_COUNT ? g_filter_name[f] : "?"; }
 int invis_fx_order(int k) { return k >= 0 && k < FXF_COUNT ? g_order[k] : -1; }
@@ -247,6 +252,7 @@ static void fx_load(void)
 	if (g_fx_loaded) return;
 	g_fx_loaded = 1;
 	invis_fx_reset();
+	if (!CLOAK_FX_MENU) return;   /* (no menu: the defaults, whatever an older Arklite.ini kept) */
 	for (int i = 0; i < FX_COUNT; i++) {
 		float f;
 		GetPrivateProfileStringA("cloak_fx", g_fx[i].key, "", v, sizeof v, ini_path());
@@ -404,7 +410,7 @@ float invis_shimmer_amount(u8 *act, u8 *c)
  *      surfaces are drawn, each once; blended GL_CONSTANT_ALPHA / GL_ONE_MINUS_CONSTANT_ALPHA at
  *      the alpha (glBlendColor), whatever the texture's alpha. Below 255 Oni draws no reflection
  *      (the environment map needs the constant color's alpha at 0xff), so this is the base
- *      texture's colors, lit, at 50%. Oni sets its blend factors through its GL table (*0x560604
+ *      texture's colors, lit, at that alpha. Oni sets its blend factors through its GL table (*0x560604
  *      +0x1c, glBlendFunc; the last ones it set in 0x530954 / 0x56061c), so that slot answers with
  *      the constant-alpha factors for this pass and Oni's own are set again after it.
  * Drawn later because its depth (pass 1) would hide whatever is drawn after it behind the body,
@@ -472,7 +478,7 @@ static int load_gl(void)
 	get = GetProcAddress(m, "wglGetProcAddress");   /* (asked while Oni's context is current: we're in its draw) */
 	if (get && !(gl.BlendColor = get("glBlendColor"))) gl.BlendColor = get("glBlendColorEXT");
 	gl.ok = gl.ColorMask && gl.BlendFunc && gl.BlendColor && GLgFuncs;
-	log_msg("invis: %s", gl.ok ? "the cloaked player's own body is drawn as its nearest surfaces, its colors at 50%"
+	log_msg("invis: %s", gl.ok ? "the cloaked player's own body is drawn as its nearest surfaces, its colors at the cloak's opacity"
 	                           : "OpenGL 1.4's glBlendColor is missing: the cloaked player's own body is drawn as in Oni");
 	return gl.ok;
 }
@@ -1415,7 +1421,7 @@ void invis_install(void)
 		}
 	}
 	call_at(ONcThrow_Attacker, throw_attacker, 6);
-	{   /* the cloaked player's own body: its nearest surfaces, colors at 50% (see "The see-through body") */
+	{   /* the cloaked player's own body: its nearest surfaces, colors at the cloak's opacity (see "The see-through body") */
 		u8 call[5] = { 0xe8 };
 		u32 rel = 0x427630 - (ONcDraw_BodyDrawCall + 5);
 		int ok = 0;

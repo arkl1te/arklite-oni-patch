@@ -1,4 +1,7 @@
-/* The cloak effect's debug menu (user request, 2026-11-14): O opens a panel on the right of the
+/* Off since 2026-11-19 (CLOAK_FX_MENU 0 in arklite.h: O does nothing; the values the user set here
+ * are invis.c's defaults). 1 brings it back as described below.
+ *
+ * The cloak effect's debug menu (user request, 2026-11-14): O opens a panel on the right of the
  * screen, so the player's character stays in view, with a slider and a number field for each of
  * invis.c's knobs (the cloaked player's own look: opacity, water, stencil tones, outline, color
  * fringe). Changes show at once. Preview puts the look on this PC's player while the menu is up,
@@ -180,7 +183,7 @@ void fx_menu_frame(void)
 	enter = key(VK_RETURN, focus);
 	click = key(VK_LBUTTON, focus);
 	if (!g_open) {
-		if (o && allowed()) open_menu();
+		if (CLOAK_FX_MENU && o && allowed() && !dev_mode_ctrl()) open_menu();   /* (developer mode: Ctrl+Shift+O is its key) */
 		return;
 	}
 	if (!ONgGameState || !ONrLevel_GetCurrent() || ONrLevel_GetCurrent() != g_level || live_menu_open() || photo_active()) {

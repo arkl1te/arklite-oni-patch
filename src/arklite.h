@@ -67,6 +67,9 @@ void log_msg(const char *f, ...);              /* one line, CRLF appended */
 /* Rewrite an instruction after checking its current bytes; logs and returns 0 on a mismatch. */
 int patch_push_imm32(u32 addr, u32 expected, u32 value);
 int patch_call(u32 addr, u32 expected, u32 target);
+int dev_mode(void);        /* Oni's developer mode is on: Arklite's keys that are developer keys too do nothing */
+int dev_mode_ctrl(void);   /* ...and Ctrl is down (the developer keys on letters need it) */
+void dev_mode_off(void);   /* as the cheat turns it off: a release build allows it in no network game */
 int patch_byte(u32 addr, u8 expected, u8 value);
 /* Unchecked building blocks, for patches that verify many sites before writing any. */
 int  code_matches(u32 addr, const u8 *expected, u32 n);
@@ -236,6 +239,10 @@ void rollback_check_stats(u32 *checks, u32 *bad);
 void rollback_keep(const void *p, u32 n); /* memory a rewind never puts back (HUD textures) */
 #define ROLLBACK_KEPT_TICKS 12            /* RB_SLOTS: how far back the game can go */
 #define NET_UPDATE_MAX      ROLLBACK_KEPT_TICKS   /* ticks in one update at most (a rollback's re-run: net.c update_cap) */
+/* level0 patches (level0_patch.c): a level0 file as zstd frames against one the other PC has */
+int  l0p_make(const char *base, u32 base_hash, const char *target, u32 target_hash, const char *out, const char **why);
+int  l0p_check(const char *patch, u32 base_size, u32 base_hash, u32 size, u32 hash);
+int  l0p_apply(const char *patch, const char *base, u32 base_hash, const char *out, int (*progress)(u32, u32), const char **why);
 void lockstep_get_seeds(u32 *game, u32 *tick_local);   /* the game RNG and the tick-local stream */
 void lockstep_set_seeds(u32 game, u32 tick_local);
 int  lockstep_replay_spawn_seed(u32 *seed);   /* replaying: the recording's spawn seed (1), else 0 */
@@ -277,7 +284,8 @@ void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, 
 #define NET_MUT_BOMBS         128 /* everyone dies as the Mad Bomber: a blast 3 s later */
 #define NET_MUT_FAST_BALL     256 /* the Super Ball Gun's ball flies twice as fast */
 #define NET_MUT_JAMMING       512 /* each shot may jam the gun: drops and a reload fix it (mutators.c) */
-#define NET_MUTATORS_ALL      1023
+#define NET_MUT_ONE_CHARACTER 1024 /* a match: everyone plays one character the match picks (players.c, char_menu.c) */
+#define NET_MUTATORS_ALL      2047
 int  net_mutator(u32 bit);             /* the game has that mutator (never when not networked) */
 u32  net_char_rules(void);             /* NET_CHARS_*: the game's (every one when not networked) */
 int  net_mutator_daodan(void);         /* the game has the Daodan mutator (never when not networked) */
@@ -395,6 +403,7 @@ typedef struct {
 	int over_ready;            /* this PC's player pressed fire */
 	u32 over_players, over_ready_count;
 	int over_left_ms;          /* until everyone goes back to the lobby anyway */
+	int over_guard_ms;         /* fire does nothing yet (net.c END_GUARD_MS): the result is read first */
 	int joining;               /* joiner: 1 catching up with the session in progress, 2 in sync, not in the game yet */
 	int joining_pct;           /* joining 1: how far (0..100) */
 	int fight_ms;              /* match (not warm-up) just began on this PC: "FIGHT!" this much longer */
@@ -423,7 +432,7 @@ typedef struct {
 	char subject[64];          /* the map's name, or the player's */
 	char reason[64];           /* kick: why ("" none) */
 } NetVote;
-void net_vote_what(char *out, u32 size, int kind, const char *subject, const char *reason);   /* "change the map to X", "kick X", ... */
+void net_vote_what(char *out, u32 size, int kind, const char *subject, const char *reason);   /* on screen: "Restart match", "Map: X", "Kick X" */
 int  net_vote(NetVote *v);                 /* 1: a vote to show (open, or its result for a moment) */
 const char *net_vote_call(const char *args);   /* "map <name>" / "kick <player> [reason]": 0 asked, else why not */
 const char *net_vote_cast(int yes);        /* 0: answered, else why not */
@@ -572,9 +581,9 @@ void mp_hud_prepare(void);      /* hud_textures_prepare: the fonts' textures and
 
 void  big_font_install(void);   /* from mp_hud_install */
 void  big_font_prepare(void);   /* every font texture made (before rollback starts) */
-/* The family to draw with: family itself, or a copy with Tahoma points (plain and bold) and
- * big_points (bold) appended where family lacks them, made from the system's Tahoma */
-void *big_font_family(void *family, int points, int big_points);
+/* The family to draw with: family itself, or a copy with Tahoma points (plain and bold),
+ * big_points and vote_points (bold) appended where family lacks them, made from the system's Tahoma */
+void *big_font_family(void *family, int points, int big_points, int vote_points);
 int  mp_hud_text_width(const char *s, int n);   /* the first n characters (n < 0: all), trailing spaces included */
 int  mp_hud_text_width_plain(const char *s, int n);   /* the same in mp_hud_text_plain's style */
 
@@ -610,7 +619,7 @@ int  menu_wheel_photo_take(void);    /* menu_wheel.c: whole notches turned while
 
 /* ---- photo.c ----------------------------------------------------------------------------- */
 
-/* Photo mode (single player only): F10 stops the game and frees the camera */
+/* Photo mode (single player only): F4 stops the game and frees the camera */
 void photo_install(void);
 int  photo_update(u32 count, void *actions, u32 *ticks_run, u32 *err);   /* lockstep.c's update hook, first: 1 if it ran the frame */
 int  photo_active(void);
@@ -669,6 +678,12 @@ void char_menu_install(void);
 void char_menu_level0_changed(void);   /* class numbers changed: the roster is resolved again */
 void char_menu_rules_changed(void);    /* net_char_rules() changed: the roster is resolved again */
 int  char_menu_class_allowed(int number);   /* ONCC instance number: may a player pick it (net_char_rules) */
+int  char_menu_pick_family(u32 seed);       /* One Character: a character (family) for this seed, the same on every PC; -1 none */
+int  char_menu_family_main(int family);     /* ...its first class (ONCC number), -1 none */
+int  char_menu_family_has(int family, int number);   /* ...the class is one of its variations, allowed */
+const char *char_menu_family_label(int family);
+int  players_one_family(void);              /* One Character in a match: the family everyone plays, -1 none */
+const char *net_ready_command(int on);      /* /ready (1), /unready (0): 0 asked, else why not */
 int  char_menu_class_female(const char *name);   /* a woman (the Daodan mutator's particles) */
 void respawn_fx_level0_changed(void);  /* its base classes come from the new level 0 */
 void level0_swap_install(void);
@@ -748,6 +763,11 @@ void mp_rules_level(void);     /* a level's characters are about to be made: Nin
 void mp_rules_level_end(void); /* a level unloads: the classes the Daodan mutator changed are put back */
 void mp_rules_level_begin(void);  /* a level loads: ark_characters_alwaystaunt starts over */
 void mp_rules_bsl_register(void); /* ark_characters_alwaystaunt (char_menu.c registers Arklite's variables) */
+
+/* ---- dialog.c ---------------------------------------------------------------------------- */
+void dialog_install(void);
+void dialog_bsl_register(void);   /* ark_sound_dialog_play_interrupt, _stop_all, _play_overlap (char_menu.c calls it with the game's table) */
+void dialog_level_begin(void);    /* players.c: a level loads (the overlapping lines and subtitles known start over) */
 /* mutators.c: the gameplay mutators' data, set at a level's load and put back at its unload; bombs going off */
 void mutators_level(void);
 void mutators_level_end(void);
@@ -880,10 +900,12 @@ void invis_fx_preview(int on);          /* this PC's player shows the look, cloa
 int  invis_cloak_me(void);              /* off the network: this PC's player cloaked for 30 s (0: can't) */
 int  float_parse(const char *s, float *out);           /* 1 if s is a number */
 void float_text(char *out, u32 size, float v, int decimals);
-/* fx_menu.c: O opens the cloak effect's menu on the right of the screen */
+/* fx_menu.c: O opens the cloak effect's menu on the right of the screen. Off (0, user, 2026-11-19):
+ * O does nothing and Arklite.ini [cloak_fx] isn't read, so everyone gets invis.c's defaults */
+#define CLOAK_FX_MENU 0
 void fx_menu_frame(void);               /* every frame after the update (live_menu.c) */
 void fx_menu_draw(int width, int height);   /* inside mp_hud.c's text setup */
-int  fx_menu_open(void);              /* the cloaked player sees themselves at 50% */
+int  fx_menu_open(void);
 void sprite_aspect_install(void);      /* sprite_aspect.c: screen-facing sprites keep their shape on wide screens */
 int  invis_hidden(u8 *c);              /* cloaked (or still fading back in): no name tag over it */
 

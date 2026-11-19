@@ -1414,7 +1414,8 @@ static const Mutator g_mutatorList[] = {
 	{ NET_MUT_FAST_PLASMA, "Fast Plasma", "The Plasma Rifle fires twice as fast." },
 	{ NET_MUT_FAST_BALL, "Fast Ball", "The Super Ball Gun's ball flies twice as fast." },
 	{ NET_MUT_BOMBS, "Bombs For Days", "Everyone dies as the Mad Bomber does: a blast 3 seconds later." },
-	{ NET_MUT_JAMMING, "Jamming Guns", "A shot can jam the gun (5%): drop it 1-3 times, maybe reload too." },
+	{ NET_MUT_JAMMING, "Jamming Guns", "A gun may jam (5% every 0.3 s): reload it 1-3 times, maybe drop it." },
+	{ NET_MUT_ONE_CHARACTER, "One Character", "A match picks one random character for all: any of its variations." },
 };
 #define MUTATORS ((int)(sizeof g_mutatorList / sizeof g_mutatorList[0]))
 enum { ID_MUT_OK = 1, ID_MUT_CANCEL = 2, ID_MUT_AVAILABLE = 100, ID_MUT_ENABLED = 101 };
@@ -1739,6 +1740,12 @@ static void host_init(WMtWindow *dialog)
 /* The fields, checked and saved; 0 (and why, on the dialog) if one isn't right */
 static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32 *minutes, int *score, u32 *rules)
 {
+#ifndef ARKLITE_TEST
+	if (dev_mode()) {   /* Oni's developer mode: in network games only in test builds (user, 2026-11-16) */
+		host_status("Developer mode is on: turn it off to host.");
+		return 0;
+	}
+#endif
 	char value[16];
 	int v;
 
@@ -1787,6 +1794,7 @@ static int host_read(WMtWindow *dialog, char *name, u32 *port, u32 *players, u32
 	WritePrivateProfileStringA("host", "bombs", *rules & NET_MUT_BOMBS ? "1" : "0", ini_path());
 	WritePrivateProfileStringA("host", "fast_ball", *rules & NET_MUT_FAST_BALL ? "1" : "0", ini_path());
 	WritePrivateProfileStringA("host", "jamming_guns", *rules & NET_MUT_JAMMING ? "1" : "0", ini_path());
+	WritePrivateProfileStringA("host", "one_character", *rules & NET_MUT_ONE_CHARACTER ? "1" : "0", ini_path());
 	{
 		char motd[NET_MOTD_MAX];
 		edit_text(WMrDialog_GetItemByID(dialog, ID_HOST_MOTD), motd, sizeof motd);
@@ -2000,6 +2008,12 @@ static void show_once(int slot, WMtWindow *w, const char *text)
 /* spectate: for the Spectate button (a spectator's place: net.c "Spectators"); the line shown is Play's */
 static int join_status(const Bookmark *b, u32 now, char *text, int spectate)
 {
+#ifndef ARKLITE_TEST
+	if (dev_mode()) {   /* Oni's developer mode: in network games only in test builds (user, 2026-11-16) */
+		str_cpy(text, TEXT_MAX, "Developer mode is on: turn it off to join.");
+		return 0;
+	}
+#endif
 	if (!b) {
 		str_cpy(text, TEXT_MAX, "Select a server, or add one with +.");
 		return 0;

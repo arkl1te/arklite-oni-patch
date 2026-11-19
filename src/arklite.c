@@ -58,7 +58,7 @@
  *     Arklite helper, without addresses, chat or absolute paths ([reports] send=0: off).
  *   - Lens flares without stalls (flare_depth.c): on NVIDIA every flare read the depth buffer on its
  *     own, waiting for the GPU each time (Muro's combo: 170 FPS to 15); now one read a frame.
- *   - Photo mode (photo.c): F10 in single player stops the game, frees the camera (free fly or
+ *   - Photo mode (photo.c): F4 in single player stops the game, frees the camera (free fly or
  *     orbiting a character) and opens a settings panel on Tab; leaving puts everything back. */
 
 #include "arklite.h"
@@ -273,6 +273,7 @@ int WINAPI DllMain(void *instance, u32 reason, void *reserved)
 	rollback_install();
 	live_menu_install();
 	char_menu_install();
+	dialog_install();
 	mp_names_install();
 	chat_install();
 	text_install();

@@ -211,6 +211,7 @@ typedef unsigned long long u64;
 #define VK_RBUTTON      0x02
 #define VK_F1           0x70
 #define END_MS          30000        /* after a match ends: back to the lobby when everyone pressed fire, or after this */
+#define END_GUARD_MS    8000         /* ...but fire counts only after this: players still mashing punch see the score first */
 #define END_SEND_MS     200
 #define GS_HELP_REQUEST 0x138        /* u8: the main loop opens the F1 screen (0x5018c0) after the frame */
 #define ACTION_HELP     4            /* record word 0: "pausescreen", F1 */
@@ -1096,12 +1097,12 @@ static void set_char_rules(u32 rules, const char *whose)
 	if (rules == g_char_rules) return;
 	g_char_rules = rules;
 	log_msg("net: %s mutators %03x: Mutant Muro %s, Shinatama and Hasegawa %s, Mini Striker %s, Daodan %s, No Weapons %s, "
-	        "Fast Screamer %s, Fast Plasma %s, Fast Ball %s, Bombs For Days %s, Jamming Guns %s", whose, rules,
+	        "Fast Screamer %s, Fast Plasma %s, Fast Ball %s, Bombs For Days %s, Jamming Guns %s, One Character %s", whose, rules,
 	        rules & NET_CHARS_MUTANT_MURO ? "on" : "off", rules & NET_CHARS_SHINATAMA ? "on" : "off",
 	        rules & NET_CHARS_MINI_STRIKER ? "on" : "off", rules & NET_MUT_DAODAN ? "on" : "off",
 	        rules & NET_MUT_NO_WEAPONS ? "on" : "off", rules & NET_MUT_FAST_SCREAMER ? "on" : "off",
 	        rules & NET_MUT_FAST_PLASMA ? "on" : "off", rules & NET_MUT_FAST_BALL ? "on" : "off",
-	        rules & NET_MUT_BOMBS ? "on" : "off", rules & NET_MUT_JAMMING ? "on" : "off");
+	        rules & NET_MUT_BOMBS ? "on" : "off", rules & NET_MUT_JAMMING ? "on" : "off", rules & NET_MUT_ONE_CHARACTER ? "on" : "off");
 	char_menu_rules_changed();
 }
 
@@ -2567,7 +2568,12 @@ static void on_input(int l, const PktInput *p, u32 size)
 #define MAP_PATH        112
 #define L0_SET          0x10000u     /* MAP_LIST_REQ / MAP_REQ "level" for the host's level0 pair (see "level0 download") */
 #define L0_SIG          0x10001u     /* ...for the pair's block lists (see "level0 sync") */
+#define L0_BASES        0x10002u     /* ...for the pairs the host can make a level0 patch from (see "level0 patches") */
+#define L0_PATCH        0x10010u     /* ...+ one's index in that list: the patches from it */
+#define L0P_ASK_MS      3000         /* a joiner's wait for the L0_BASES list (an older host never answers) */
+#define L0P_WAIT_MS     120000       /* ...and for the host to make the patches */
 #define MAP_LIST_PAGE   11           /* (with the folder name the list stays under the 1500-byte MTU) */
+#define L0P_BASES       MAP_LIST_PAGE  /* bases listed at most: one page */
 #define MAP_MAX_FILES   512
 #define MAP_CHUNK       1400
 #define MAP_REQ_MAX     32           /* pieces per request */
@@ -2934,6 +2940,8 @@ static void zs_serve_ranges(const PktL0Req *q, const SOCKADDR_IN *to)
 	}
 }
 
+static void l0p_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to, u32 level);   /* ("level0 patches") */
+
 static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 {
 	const PktHead *h = (const PktHead *)buf;
@@ -2945,6 +2953,11 @@ static void map_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to)
 	}
 	if (n >= sizeof *h + 4 && *(const u32 *)(buf + sizeof *h) == L0_SIG) {
 		zs_serve(buf, n, to, g_l0_active[0] ? g_l0_active : "GameDataFolder");
+		return;
+	}
+	if (n >= sizeof *h + 4 && (*(const u32 *)(buf + sizeof *h) == L0_BASES ||
+	                           *(const u32 *)(buf + sizeof *h) - L0_PATCH < L0P_BASES)) {   /* (level0 patches) */
+		l0p_serve(buf, n, to, *(const u32 *)(buf + sizeof *h));
 		return;
 	}
 	if (!map_can_serve()) return;
@@ -3047,6 +3060,11 @@ static int g_l0_restart_said;
 #define L0_SWAPS_MAX    3   /* level0_swap.c's GHOSTS_MAX */
 static char g_l0_dir[64];
 
+/* A swap may happen: one to a host's level0 only while one is left after it for the way back, so
+ * this PC can always return to its own level0 (single player, hosting) without restarting Oni
+ * (2026-11-16: up to then the third swap could be a host's, and Oni stayed on it) */
+static int l0_swap_room(int back) { return level0_swaps() < L0_SWAPS_MAX - (back ? 0 : 1); }
+
 /* This PC's own level0, back after a host's: not GameDataFolder's files again (the first level 0
  * stays loaded as a ghost with them open, and a second load of the same path drew every texture
  * white), but the same pair under cache\\<its hashes>\\, hard links to the installed files (a copy
@@ -3103,11 +3121,11 @@ static int level0_swap_start(const u32 *want)
 	g_l0_tried[0] = want[0];
 	g_l0_tried[1] = want[1];
 	fmt(g_l0_dir, "cache\\%08x-%08x", want[0], want[1]);
-	if (level0_swaps() >= L0_SWAPS_MAX) {
+	r = level0_swap_ready(want);
+	if (!l0_swap_room(r == 2)) {
 		log_msg("net: this host's level0 (%08x %08x) isn't the one this Oni switched to: restart Oni to join it", want[0], want[1]);
 		return 0;
 	}
-	r = level0_swap_ready(want);
 	if (r < 0) return 0;
 	if (r == 2) {
 		log_msg("net: the host has this PC's own level0: reloading level %d with it", level);
@@ -3145,9 +3163,8 @@ void net_join_level0(const u32 *l0)
 
 	if (g_mode != NET_JOIN || (!l0[0] && !l0[1])) return;
 	if (l0[0] == g_files[2] && l0[1] == g_files[3]) return;   /* on it already */
-	if (level0_swaps() >= L0_SWAPS_MAX) return;   /* (the refusal says why) */
 	r = level0_swap_ready(l0);
-	if (r <= 0) return;
+	if (r <= 0 || !l0_swap_room(r == 2)) return;   /* (the refusal says why) */
 	g_l0_tried[0] = l0[0];
 	g_l0_tried[1] = l0[1];
 	g_l0_pending = 1;
@@ -3367,7 +3384,8 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 	u32 ntheirs = 0, nmine = 0, total = 0xffffffffu, their_map = 0, nneed = 0, nextra = 0, need_bytes = 0, biggest = 0;
 	u32 now, last_heard, last_req = 0, last_draw = 0, bytes_all = 0, began;
 	HANDLE out = INVALID_HANDLE_VALUE;
-	const char *why = 0, *what = level == L0_SET ? "level0" : level == L0_SIG ? "level0 block list" : "map";
+	int patch = level - L0_PATCH < L0P_BASES;   /* (a level0 patch: the host may take seconds to make it) */
+	const char *why = 0, *what = level == L0_SET ? "level0" : level == L0_SIG ? "level0 block list" : patch ? "level0 patch" : "map";
 	int ok = 0, cur = -1;
 
 	if (!g_link[0].used) return 0;
@@ -3391,7 +3409,7 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 		u32 n;
 		now = GetTickCount();
 		if (dl_cancelled()) { why = "cancelled"; goto done; }
-		if (now - last_heard > LOST_MS) { why = "the host stopped answering"; goto done; }
+		if (now - last_heard > (patch ? L0P_WAIT_MS : LOST_MS)) { why = "the host stopped answering"; goto done; }
 		if (!last_req || now - last_req >= DL_RTO_MS) {
 			PktMapListReq q;
 			head(&q.h, PKT_MAP_LIST_REQ);
@@ -3433,10 +3451,11 @@ static int map_download_to(u32 level, const char *dir, const char *folder)
 			continue;
 		}
 		if (now - last_draw >= DL_DRAW_MS) {
-			dl_draw("Connecting to the host...", "", 10);
+			dl_draw(patch ? "The host is making a small patch of its level0 for you..." : "Connecting to the host...", "", 10);
 			last_draw = now;
 		} else Sleep(1);
 	}
+	if (patch && !ntheirs) { why = "the host has no patch from that level0"; goto done; }
 
 	/* 2. what differs: files to fetch, and files the host doesn't have */
 	if (!list_tree(dir, "", 0, mine, &nmine)) log_msg("net: %s download: couldn't list every file in %s", what, dir);
@@ -3961,6 +3980,456 @@ done:
 	return result;
 }
 
+/* The stock AE level0 pairs ("A new player's download", "level0 patches") */
+static const u32 g_l0_stock[][2] = {
+	{ 0xf40ec301u, 0x6091538bu },   /* AE core, XML patches in (Linux, 2026-11-01) */
+	{ 0xe19686a1u, 0xae11addfu },   /* AE core without its XML patches (an install whose XmlTools didn't run) */
+};
+
+/* ---- level0 patches: the host's pair from one this PC has (level0_patch.c) --------------------- *
+ * Before the sync, a joiner asks the host which level0 pairs it can make a patch from (L0_BASES:
+ * stock AE pairs first, then its GameDataFolder pair and its cache's, each as "<dat>-<raw>"
+ * hashes), takes the first one it has itself, and downloads the patches from that pair to the
+ * host's (L0_PATCH + its index: "level0_Final.dat.zp" and ".raw.zp", as a map's files). The host
+ * makes them on a thread the first time (a few seconds; the joiner waits up to L0P_WAIT_MS) and
+ * keeps them in AE\cache\.patch\<its pair>-<base>\. The joiner rebuilds the host's files from its
+ * own (level0_patch.c l0p_apply, checked against the host's hashes) into the cache folder the sync
+ * and the full download use. Anything that doesn't work out: the sync, then the full download, as
+ * before. Measured with the same settings (zstd CLI): a 197.6 MB modded pair from a stock one is
+ * 8.2 MB of patches where the sync sent 35 MB. A host without patches (older Arklite) doesn't
+ * answer L0_BASES: the joiner goes on after L0P_ASK_MS. */
+
+static struct {
+	char target[20], tdir[64];          /* the pair being sent ("%08x-%08x") and its folder */
+	u32 thash[2];
+	char name[L0P_BASES][20], dir[L0P_BASES][64];   /* the bases: cache folder names, where their files are */
+	u32 bhash[L0P_BASES][2], n;
+	volatile int state[L0P_BASES];      /* 0 not made, 1 making, 2 ready, -1 can't be */
+	MapFile file[L0P_BASES][2];
+	volatile int busy;                  /* a thread is making one */
+	int had_van;                        /* the list was made with vanilla's pair known */
+	HANDLE f;                           /* the patch file being sent */
+	int f_base, f_file;
+} g_l0p = { .f = INVALID_HANDLE_VALUE, .f_base = -1 };
+
+static int pair_name_parse(const char *s, u32 *h)
+{
+	u32 v[2] = { 0, 0 };
+	for (int k = 0; k < 2; k++) {
+		for (int i = 0; i < 8; i++) {
+			char c = *s++;
+			u32 d = c >= '0' && c <= '9' ? (u32)(c - '0') : c >= 'a' && c <= 'f' ? (u32)(c - 'a' + 10) : 16;
+			if (d > 15) return 0;
+			v[k] = v[k] << 4 | d;
+		}
+		if (k == 0 && *s++ != '-') return 0;
+	}
+	if (*s) return 0;
+	h[0] = v[0];
+	h[1] = v[1];
+	return 1;
+}
+
+static u32 file_size_of(const char *path)
+{
+	WIN32_FIND_DATAA fd;
+	HANDLE f = FindFirstFileA(path, &fd);
+	if (f == INVALID_HANDLE_VALUE) return 0xffffffffu;
+	FindClose(f);
+	return fd.nFileSizeLow;
+}
+
+/* Both files of a pair in dir */
+static int pair_here(const char *dir)
+{
+	char path[MAX_PATH];
+	for (int i = 0; i < 2; i++) {
+		fmt(path, "%s\\%s", dir, g_l0_names[i]);
+		if (file_size_of(path) == 0xffffffffu) return 0;
+	}
+	return 1;
+}
+
+/* AEInstaller\vanilla's level0 pair: every AE install keeps it (the AE Installer makes the game's
+ * files from it), so it's the base a host offers first. Its hashes, worked out once on a thread from
+ * Arklite's start and kept in Arklite.ini [net] vanilla_level0 with the files' sizes and times
+ * (2026-11-16: ca88ebe7 c95d2e7c in three AE installs; a 197.6 MB mod's patch from it 7.45 MB, from a
+ * stock AE pair 7.36 MB) */
+#define VANILLA_DIR "AEInstaller\\vanilla"
+static struct { volatile int state; u32 h[2]; char key[64]; } g_van;   /* state: 0 not asked, 1 hashing, 2 known, -1 none */
+
+static int van_key(char *key)
+{
+	u32 v[6];
+	for (int fi = 0; fi < 2; fi++) {
+		WIN32_FIND_DATAA fd;
+		char path[64];
+		HANDLE f;
+		fmt(path, VANILLA_DIR "\\%s", g_l0_names[fi]);
+		if ((f = FindFirstFileA(path, &fd)) == INVALID_HANDLE_VALUE) return 0;
+		FindClose(f);
+		v[3 * fi] = fd.nFileSizeLow;
+		v[3 * fi + 1] = fd.ftLastWriteTime[0];
+		v[3 * fi + 2] = fd.ftLastWriteTime[1];
+	}
+	fmt(key, "%08x%08x%08x-%08x%08x%08x", v[0], v[1], v[2], v[3], v[4], v[5]);
+	return 1;
+}
+
+static u32 WINAPI van_thread(void *unused)
+{
+	u8 *buf = VirtualAlloc(0, 1 << 20, 0x3000, 4);
+	u32 h[2] = { 0x811c9dc5u, 0x811c9dc5u }, got, t0 = GetTickCount();
+	int ok = buf != 0;
+	char path[64], line[96];
+	for (int fi = 0; fi < 2 && ok; fi++) {   /* (hash_file's way, with a buffer of its own: this is another thread) */
+		HANDLE f;
+		fmt(path, VANILLA_DIR "\\%s", g_l0_names[fi]);
+		f = CreateFileA(path, 0x80000000, 3, 0, 3, 0x80, 0);
+		if (f == INVALID_HANDLE_VALUE) { ok = 0; break; }
+		while (ReadFile(f, buf, 1 << 20, &got, 0) && got) h[fi] = hash_words(h[fi], buf, got);
+		CloseHandle(f);
+	}
+	if (buf) VirtualFree(buf, 0, 0x8000);
+	if (ok) {
+		g_van.h[0] = h[0];
+		g_van.h[1] = h[1];
+		fmt(line, "%s %08x %08x", g_van.key, h[0], h[1]);
+		WritePrivateProfileStringA("net", "vanilla_level0", line, ini_path());
+		log_msg("net: " VANILLA_DIR "'s level0 is %08x %08x (%u ms): level0 patches can be made from it", h[0], h[1], GetTickCount() - t0);
+	}
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	g_van.state = ok ? 2 : -1;
+	return 0;
+}
+
+/* AEInstaller\vanilla's pair hashes: 1 when known (from Arklite.ini, or the thread this starts) */
+static int vanilla_pair(u32 *h)
+{
+	char saved[160];
+	u32 n;
+	if (g_van.state == 2) {
+		__atomic_thread_fence(__ATOMIC_SEQ_CST);
+		h[0] = g_van.h[0];
+		h[1] = g_van.h[1];
+		return 1;
+	}
+	if (g_van.state) return 0;
+	if (!van_key(g_van.key)) { g_van.state = -1; return 0; }
+	GetPrivateProfileStringA("net", "vanilla_level0", "", saved, sizeof saved, ini_path());
+	n = str_len(g_van.key);
+	if (str_ieq_n(saved, g_van.key, n) && saved[n] == ' ' && str_len(saved) == n + 18 && saved[n + 9] == ' ') {
+		saved[n + 9] = '-';
+		if (pair_name_parse(saved + n + 1, g_van.h)) {
+			g_van.state = 2;
+			h[0] = g_van.h[0];
+			h[1] = g_van.h[1];
+			return 1;
+		}
+	}
+	g_van.state = 1;
+	if (!CreateThread(0, 0, van_thread, 0, 0, 0)) g_van.state = -1;
+	return 0;
+}
+
+/* This PC's GameDataFolder pair (what it runs when it hasn't switched to a host's) */
+static void installed_pair(u32 *h)
+{
+	h[0] = g_l0_active[0] ? g_l0_installed[0] : g_files[2];
+	h[1] = g_l0_active[0] ? g_l0_installed[1] : g_files[3];
+}
+
+/* The folder of the pair named so on this PC (GameDataFolder or the cache), 1 when it's here */
+static int pair_dir(const char *name, char *dir, u32 size)
+{
+	u32 h[2], mine[2];
+	if (!pair_name_parse(name, h)) return 0;
+	fmt(dir, "cache\\%s", name);
+	if (pair_here(dir)) return 1;
+	installed_pair(mine);
+	if (h[0] == mine[0] && h[1] == mine[1] && (mine[0] || mine[1])) {
+		str_cpy(dir, size, "GameDataFolder");
+		return 1;
+	}
+	if (vanilla_pair(mine) && h[0] == mine[0] && h[1] == mine[1] && pair_here(VANILLA_DIR)) {
+		str_cpy(dir, size, VANILLA_DIR);
+		return 1;
+	}
+	return 0;
+}
+
+static void l0p_add(const char *name, const char *dir)
+{
+	u32 h[2];
+	if (g_l0p.n >= L0P_BASES || !pair_name_parse(name, h) || str_ieq_n(name, g_l0p.target, sizeof g_l0p.target)) return;
+	for (u32 i = 0; i < g_l0p.n; i++)
+		if (str_ieq_n(g_l0p.name[i], name, sizeof g_l0p.name[i])) return;
+	str_cpy(g_l0p.name[g_l0p.n], sizeof g_l0p.name[0], name);
+	str_cpy(g_l0p.dir[g_l0p.n], sizeof g_l0p.dir[0], dir);
+	g_l0p.bhash[g_l0p.n][0] = h[0];
+	g_l0p.bhash[g_l0p.n][1] = h[1];
+	g_l0p.state[g_l0p.n] = 0;
+	g_l0p.n++;
+}
+
+/* The host's bases for the pair it runs now (made again when that changed); 0 while a thread works */
+static int l0p_bases(void)
+{
+	char name[20], dir[64];
+	u32 mine[2];
+	fmt(name, "%08x-%08x", g_files[2], g_files[3]);
+	if (g_l0p.n && str_ieq_n(name, g_l0p.target, sizeof name) && (g_l0p.had_van || g_van.state != 2)) return 1;
+	if (g_l0p.busy) return 0;
+	g_l0p.had_van = g_van.state == 2;
+	if (g_l0p.f != INVALID_HANDLE_VALUE) CloseHandle(g_l0p.f);
+	g_l0p.f = INVALID_HANDLE_VALUE;
+	g_l0p.f_base = -1;
+	g_l0p.n = 0;
+	str_cpy(g_l0p.target, sizeof g_l0p.target, name);
+	str_cpy(g_l0p.tdir, sizeof g_l0p.tdir, g_l0_active[0] ? g_l0_active : "GameDataFolder");
+	g_l0p.thash[0] = g_files[2];
+	g_l0p.thash[1] = g_files[3];
+	installed_pair(mine);
+	if (vanilla_pair(mine) && pair_here(VANILLA_DIR)) {   /* every AE install has it */
+		fmt(name, "%08x-%08x", mine[0], mine[1]);
+		l0p_add(name, VANILLA_DIR);
+	}
+	installed_pair(mine);
+	for (u32 i = 0; i < sizeof g_l0_stock / sizeof g_l0_stock[0]; i++) {   /* then stock AE: most joiners have one */
+		fmt(name, "%08x-%08x", g_l0_stock[i][0], g_l0_stock[i][1]);
+		if (pair_dir(name, dir, sizeof dir)) l0p_add(name, dir);
+	}
+	fmt(name, "%08x-%08x", mine[0], mine[1]);
+	if (!g_l0_active[0] ? 0 : pair_here("GameDataFolder")) l0p_add(name, "GameDataFolder");
+	{
+		WIN32_FIND_DATAA fd;
+		HANDLE fh = FindFirstFileA("cache\\*", &fd);
+		if (fh != INVALID_HANDLE_VALUE) {
+			do {
+				if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || str_len(fd.cFileName) != 17) continue;
+				fmt(dir, "cache\\%s", fd.cFileName);
+				if (pair_here(dir)) l0p_add(fd.cFileName, dir);
+			} while (FindNextFileA(fh, &fd));
+			FindClose(fh);
+		}
+	}
+	log_msg("net: level0 patches: %u level0 pair(s) here to make one from for %s", g_l0p.n, g_l0p.target);
+	return 1;
+}
+
+/* One patch made at a time (the Host page's measure and a joiner's request): memory, and the same files */
+static volatile long g_l0p_making;
+static void l0p_lock(void) { while (__sync_lock_test_and_set(&g_l0p_making, 1)) Sleep(50); }
+static void l0p_unlock(void) { __sync_lock_release(&g_l0p_making); }
+
+/* The thread: base k's two patches, made or found from before */
+static u32 WINAPI l0p_thread(void *arg)
+{
+	int k = (int)(u32)arg, ok = 1;
+	char dir[MAX_PATH], out[MAX_PATH], base[MAX_PATH], target[MAX_PATH];
+	const char *why = "?";
+	u32 t0 = GetTickCount(), made = 0;
+	fmt(dir, "cache\\.patch\\%s-%s\\", g_l0p.target, g_l0p.name[k]);
+	l0p_lock();
+	for (int i = 0; i < 2 && ok; i++) {
+		u32 bsize, tsize;
+		fmt(out, "%s%s.zp", dir, g_l0_names[i]);
+		make_dirs(out);
+		fmt(base, "%s\\%s", g_l0p.dir[k], g_l0_names[i]);
+		fmt(target, "%s\\%s", g_l0p.tdir, g_l0_names[i]);
+		bsize = file_size_of(base);
+		tsize = file_size_of(target);
+		if (bsize == 0xffffffffu || tsize == 0xffffffffu) { ok = 0; why = "a level0 file is missing"; break; }
+		if (!l0p_check(out, bsize, g_l0p.bhash[k][i], tsize, g_l0p.thash[i])) {
+			ok = l0p_make(base, g_l0p.bhash[k][i], target, g_l0p.thash[i], out, &why);
+			made = 1;
+		}
+		if (ok) {
+			str_cpy(g_l0p.file[k][i].path, MAP_PATH, g_l0_names[i]);
+			str_cpy(g_l0p.file[k][i].path + str_len(g_l0_names[i]), MAP_PATH - str_len(g_l0_names[i]), ".zp");
+			g_l0p.file[k][i].size = file_size_of(out);
+			g_l0p.file[k][i].hash = hash_file(out);
+		}
+	}
+	l0p_unlock();
+	if (ok) log_msg("net: level0 patches from %s ready%s: %u + %u bytes (%u ms)", g_l0p.name[k], made ? "" : " (made before)",
+	                g_l0p.file[k][0].size, g_l0p.file[k][1].size, GetTickCount() - t0);
+	else log_msg("net: level0 patches from %s can't be made: %s", g_l0p.name[k], why);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	g_l0p.state[k] = ok ? 2 : -1;
+	g_l0p.busy = 0;
+	return 0;
+}
+
+/* L0_BASES and L0_PATCH + k requests */
+static void l0p_serve(const u8 *buf, u32 n, const SOCKADDR_IN *to, u32 level)
+{
+	const PktHead *h = (const PktHead *)buf;
+	PktMapList p;
+	u32 k = level - L0_PATCH;
+	if (!g_files[2] && !g_files[3]) return;
+	if (!l0p_bases()) return;   /* (a thread works: the joiner asks again) */
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (level == L0_BASES) {
+		if (h->type != PKT_MAP_LIST_REQ || n < sizeof(PktMapListReq)) return;
+		memset(&p, 0, sizeof p);
+		head(&p.h, PKT_MAP_LIST);
+		p.level = L0_BASES;
+		p.total = p.count = g_l0p.n;
+		for (u32 i = 0; i < g_l0p.n; i++) str_cpy(p.f[i].path, MAP_PATH, g_l0p.name[i]);
+		send_to(&p, sizeof p, to);
+		return;
+	}
+	if (k < g_l0p.n && g_l0p.state[k] == 0 && !g_l0p.busy) {
+		g_l0p.busy = 1;
+		g_l0p.state[k] = 1;
+		log_msg("net: level0 patches: making the ones from %s for a joiner", g_l0p.name[k]);
+		if (!CreateThread(0, 0, l0p_thread, (void *)k, 0, 0)) g_l0p.state[k] = -1, g_l0p.busy = 0;
+	}
+	if (k < g_l0p.n && (g_l0p.state[k] == 1 || (g_l0p.state[k] == 0 && g_l0p.busy))) return;   /* (the joiner waits) */
+	if (h->type == PKT_MAP_LIST_REQ && n >= sizeof(PktMapListReq)) {
+		const PktMapListReq *q = (const PktMapListReq *)buf;
+		memset(&p, 0, sizeof p);
+		head(&p.h, PKT_MAP_LIST);
+		p.level = level;
+		p.first = q->first;
+		if (k < g_l0p.n && g_l0p.state[k] == 2) {   /* (otherwise no files: there's no patch from that pair) */
+			p.total = 2;
+			for (u32 i = q->first; i < 2; i++) p.f[p.count++] = g_l0p.file[k][i];
+		}
+		send_to(&p, sizeof p, to);
+	} else if (h->type == PKT_MAP_REQ && n >= sizeof(PktMapReq) && k < g_l0p.n && g_l0p.state[k] == 2) {
+		const PktMapReq *q = (const PktMapReq *)buf;
+		char path[MAX_PATH];
+		if (q->file >= 2 || !q->count || q->count > MAP_REQ_MAX) return;
+		if (g_l0p.f == INVALID_HANDLE_VALUE || g_l0p.f_base != (int)k || g_l0p.f_file != (int)q->file) {
+			if (g_l0p.f != INVALID_HANDLE_VALUE) CloseHandle(g_l0p.f);
+			fmt(path, "cache\\.patch\\%s-%s\\%s", g_l0p.target, g_l0p.name[k], g_l0p.file[k][q->file].path);
+			g_l0p.f = CreateFileA(path, 0x80000000, 3, 0, 3, 0x80, 0);
+			g_l0p.f_base = (int)k;
+			g_l0p.f_file = (int)q->file;
+		}
+		if (g_l0p.f != INVALID_HANDLE_VALUE) send_chunks(g_l0p.f, g_l0p.file[k][q->file].size, q, to);
+	}
+}
+
+/* -- The joiner's side -- */
+
+static const char *g_l0p_what;   /* (l0p_progress's line) */
+
+static int l0p_progress(u32 piece, u32 pieces)
+{
+	char b[64];
+	fmt(b, "piece %u of %u", piece, pieces);
+	dl_draw(g_l0p_what, b, pieces ? piece * 100 / pieces : 100);
+	return dl_cancelled();
+}
+
+/* The host's pair into dir from a patch: 1, 0 (the sync's turn) or -1 (cancelled) */
+static int level0_patch(const char *dir)
+{
+	static u8 rbuf[2048];
+	MapFile bases[L0P_BASES];
+	char folder[48], rel[96], pdir[MAX_PATH], stage[MAX_PATH], bdir[64], path[MAX_PATH], patch[MAX_PATH], to[MAX_PATH], line[96];
+	u32 nb = 0, got_list = 0, last_req = 0, t0 = GetTickCount(), k, bh[2];
+	int result = 0;
+
+	/* 1. what the host can make a patch from */
+	dl_lines_create();
+	while (!got_list && GetTickCount() - t0 < L0P_ASK_MS) {
+		u32 now = GetTickCount(), n;
+		if (dl_cancelled()) { dl_lines_hide(); return -1; }
+		if (!last_req || now - last_req >= DL_RTO_MS || g_dl_rekeyed) {
+			PktMapListReq q;
+			memset(&q, 0, sizeof q);
+			head(&q.h, PKT_MAP_LIST_REQ);
+			q.level = L0_BASES;
+			send_to_host(&q, sizeof q);
+			last_req = now ? now : 1;
+			g_dl_rekeyed = 0;
+		}
+		while ((n = dl_receive(rbuf, sizeof rbuf))) {
+			const PktMapList *p = (const PktMapList *)rbuf;
+			if (p->h.type != PKT_MAP_LIST || n < sizeof *p || p->level != L0_BASES || p->count > L0P_BASES) continue;
+			for (u32 i = 0; i < p->count; i++) {
+				bases[i] = p->f[i];
+				bases[i].path[MAP_PATH - 1] = 0;
+			}
+			nb = p->count;
+			got_list = 1;
+		}
+		dl_draw("Asking the host for a small patch of its level0...", "", 10);
+		Sleep(1);
+	}
+	dl_lines_hide();
+	if (!got_list) {
+		log_msg("net: level0 patch: the host doesn't make patches (no answer in %u ms)", L0P_ASK_MS);
+		return 0;
+	}
+	/* 2. the first of them this PC has */
+	for (k = 0; k < nb && !pair_dir(bases[k].path, bdir, sizeof bdir); k++)
+		;
+	if (k == nb) {
+		log_msg("net: level0 patch: none of the host's %u level0 pair(s) to patch from is here", nb);
+		return 0;
+	}
+	pair_name_parse(bases[k].path, bh);
+	log_msg("net: level0 patch: from %s (%s)", bases[k].path, bdir);
+	/* 3. the patches, as a map's files */
+	fmt(folder, "level0-%08x-%08x", g_l0_want[0], g_l0_want[1]);
+	fmt(rel, "cache\\.patch-in\\%s\\", folder);
+	if (!GetFullPathNameA(rel, sizeof pdir, pdir, 0)) return 0;
+	{
+		char pfolder[64];
+		fmt(pfolder, "%s-from-%s", folder, bases[k].path);
+		if (!map_download_to(L0_PATCH + k, pdir, pfolder)) return g_dl_why && str_ieq_n(g_dl_why, "cancelled", 10) ? -1 : 0;
+	}
+	/* 4. the host's files out of this PC's and the patches */
+	fmt(rel, "cache\\.download\\%s\\", folder);
+	if (!GetFullPathNameA(rel, sizeof stage, stage, 0)) goto done;
+	dl_lines_create();
+	for (int fi = 0; fi < 2; fi++) {
+		const char *why;
+		char base[MAX_PATH];
+		int r;
+		u32 a = GetTickCount();
+		fmt(patch, "%s%s.zp", pdir, g_l0_names[fi]);
+		fmt(base, "%s\\%s", bdir, g_l0_names[fi]);
+		fmt(path, "%s%s", stage, g_l0_names[fi]);
+		make_dirs(path);
+		fmt(line, "Making the host's level0 from yours (%d/2)", fi + 1);
+		g_l0p_what = line;
+		r = l0p_apply(patch, base, bh[fi], path, l0p_progress, &why);
+		if (r < 0) { result = -1; goto done; }
+		if (!r) { log_msg("net: level0 patch: %s couldn't be made: %s", g_l0_names[fi], why); goto done; }
+		if (hash_file(path) != g_l0_want[fi]) { log_msg("net: level0 patch: the %s it made isn't the host's", g_l0_names[fi]); goto done; }
+		log_msg("net: level0 patch: %s made from %u bytes of patch in %u ms", g_l0_names[fi], file_size_of(patch), GetTickCount() - a);
+	}
+	/* 5. into the cache folder */
+	for (int fi = 0; fi < 2; fi++) {
+		fmt(path, "%s%s", stage, g_l0_names[fi]);
+		fmt(rel, "%s\\%s", dir, g_l0_names[fi]);
+		if (!GetFullPathNameA(rel, sizeof to, to, 0) || !move_file(path, to)) goto done;
+	}
+	RemoveDirectoryA(stage);
+	log_msg("net: level0 patch: done in %u ms", GetTickCount() - t0);
+	result = 1;
+
+done:
+	for (int fi = 0; fi < 2; fi++) {   /* the patches did their job (or failed it) */
+		fmt(patch, "%s%s.zp", pdir, g_l0_names[fi]);
+		DeleteFileA(patch);
+		if (result != 1) {
+			fmt(path, "%s%s", stage, g_l0_names[fi]);
+			DeleteFileA(path);
+		}
+	}
+	RemoveDirectoryA(pdir);
+	if (result != 1) RemoveDirectoryA(stage);
+	dl_lines_hide();
+	return result;
+}
+
 /* ---- A new player's download (the Host Game screen) ----------------------------------------- *
  * What a player with no mods (AE's stock level0, no custom maps, nothing in AE\cache) downloads the
  * first time they join this PC's game, in bytes of the files (packet headers not counted):
@@ -3977,10 +4446,6 @@ done:
  *     were within 1% (zsim: 11.58 vs 11.53 MB of the .dat, 328.4 vs 325.9 MB of the .raw).
  * The level0 part takes seconds (both pairs read), so it's kept in Arklite.ini [host] join_level0
  * as "<GameDataFolder pair's sizes and times>|<base folder> <bytes>". */
-static const u32 g_l0_stock[][2] = {
-	{ 0xf40ec301u, 0x6091538bu },   /* AE core, XML patches in (Linux, 2026-11-01) */
-	{ 0xe19686a1u, 0xae11addfu },   /* AE core without its XML patches (an install whose XmlTools didn't run) */
-};
 
 static struct {
 	volatile int state;                 /* 0 none, 1 measuring, 2 done, -1 failed */
@@ -3991,6 +4456,7 @@ static struct {
 } g_jc;
 
 static int jc_never(void) { return 0; }
+#define JC_PATCH_BASE "patch from AEInstaller\\vanilla"   /* (g_jc.base: measured as level0 patches, not the sync) */
 
 static u32 WINAPI jc_measure(void *unused)
 {
@@ -4007,7 +4473,29 @@ static u32 WINAPI jc_measure(void *unused)
 	g_jc.stock = 0;
 	for (u32 i = 0; ok && i < sizeof g_l0_stock / sizeof g_l0_stock[0]; i++)
 		if (g_jc.hash[0] == g_l0_stock[i][0] && g_jc.hash[1] == g_l0_stock[i][1]) g_jc.stock = 1;
-	if (ok && !g_jc.stock) {
+	if (ok && !g_jc.stock && str_ieq_n(g_jc.base, JC_PATCH_BASE, sizeof JC_PATCH_BASE)) {
+		/* the patches a joiner gets from vanilla (see "level0 patches"), made now and kept for them */
+		char dir[96], out[MAX_PATH], target[64], base[64];
+		const char *why = "?";
+		g_jc.lists = 0;
+		g_jc.full = full = ((const ZsHead *)list[0])->size + ((const ZsHead *)list[1])->size;
+		fmt(dir, "cache\\.patch\\%08x-%08x-%08x-%08x\\", g_jc.hash[0], g_jc.hash[1], g_van.h[0], g_van.h[1]);
+		l0p_lock();
+		for (int fi = 0; fi < 2 && ok; fi++) {
+			fmt(out, "%s%s.zp", dir, g_l0_names[fi]);
+			make_dirs(out);
+			fmt(target, "GameDataFolder\\%s", g_l0_names[fi]);
+			fmt(base, VANILLA_DIR "\\%s", g_l0_names[fi]);
+			if (!l0p_check(out, file_size_of(base), g_van.h[fi], ((const ZsHead *)list[fi])->size, g_jc.hash[fi]) &&
+			    !l0p_make(base, g_van.h[fi], target, g_jc.hash[fi], out, &why)) {
+				log_msg("net: a new player's download: no level0 patch from vanilla (%s)", why);
+				ok = 0;
+				break;
+			}
+			total += file_size_of(out);
+		}
+		l0p_unlock();
+	} else if (ok && !g_jc.stock) {
 		g_jc.lists = total = lsize[0] + lsize[1];
 		g_jc.full = full = ((const ZsHead *)list[0])->size + ((const ZsHead *)list[1])->size;
 		for (int fi = 0; fi < 2 && ok; fi++) {
@@ -4041,9 +4529,10 @@ static u32 WINAPI jc_measure(void *unused)
  * the cache, else AEInstaller\\vanilla), as the Arklite.ini entry names them; 0 if one is missing */
 static int jc_key(char *key, char *base)
 {
-	u32 v[6];
+	u32 v[6], vh[2];
 	str_cpy(base, 64, "AEInstaller\\vanilla");
-	for (u32 i = 0; i < sizeof g_l0_stock / sizeof g_l0_stock[0]; i++) {
+	if (vanilla_pair(vh)) str_cpy(base, 64, JC_PATCH_BASE);   /* (a joiner with AE's vanilla files gets a patch) */
+	for (u32 i = 0; !vanilla_pair(vh) && i < sizeof g_l0_stock / sizeof g_l0_stock[0]; i++) {
 		char dat[96], raw[96];
 		fmt(dat, "cache\\%08x-%08x\\%s", g_l0_stock[i][0], g_l0_stock[i][1], g_l0_names[0]);
 		fmt(raw, "cache\\%08x-%08x\\%s", g_l0_stock[i][0], g_l0_stock[i][1], g_l0_names[1]);
@@ -4082,8 +4571,10 @@ int net_join_level0_bytes(u32 *bytes)
 			g_jc.reported = 1;
 			if (g_jc.stock) log_msg("net: a new player's download: level0 %08x %08x is a stock AE one, nothing to download",
 			                        g_jc.hash[0], g_jc.hash[1]);
-			else log_msg("net: a new player's download: level0 %08x %08x, measured against %s: %u bytes "
-			             "(block lists %u; the whole pair is %u)", g_jc.hash[0], g_jc.hash[1], g_jc.base, g_jc.bytes, g_jc.lists, g_jc.full);
+			else log_msg("net: a new player's download: level0 %08x %08x, measured %s %s: %u bytes "
+			             "(block lists %u; the whole pair is %u)", g_jc.hash[0], g_jc.hash[1],
+			             str_ieq_n(g_jc.base, JC_PATCH_BASE, sizeof JC_PATCH_BASE) ? "as a" : "against", g_jc.base, g_jc.bytes,
+			             g_jc.lists, g_jc.full);
 			fmt(saved, "%s %u %08x %08x", key, g_jc.bytes, g_jc.hash[0], g_jc.hash[1]);
 			WritePrivateProfileStringA("host", "join_level0", saved, ini_path());
 		}
@@ -4120,7 +4611,7 @@ int net_join_level0_bytes(u32 *bytes)
 		g_jc.state = -1;
 		return -1;
 	}
-	log_msg("net: a new player's download: measuring level0 against %s", base);
+	log_msg("net: a new player's download: measuring level0 %s %s", str_ieq_n(base, JC_PATCH_BASE, sizeof JC_PATCH_BASE) ? "as a" : "against", base);
 	return 0;
 }
 
@@ -4299,7 +4790,8 @@ static u16 ONI_FC level_load(u32 level, u32 edx)
 		g_l0_fetch = 0;
 		fmt(rel, "%s\\", g_l0_dir);
 		fmt(folder, "level0-%08x-%08x", g_l0_want[0], g_l0_want[1]);
-		int synced = level0_sync(g_l0_dir);   /* only the differences; else the whole pair */
+		int synced = level0_patch(g_l0_dir);   /* a patch from a level0 this PC has; else only the differences; else the whole pair */
+		if (!synced) synced = level0_sync(g_l0_dir);
 		if (synced > 0 || (synced == 0 && GetFullPathNameA(rel, sizeof dir, dir, 0) && map_download_to(L0_SET, dir, folder))) {
 			fmt(path, "%s\\level0_Final.dat", g_l0_dir);
 			u32 d = hash_file(path);
@@ -4964,7 +5456,9 @@ static u32 over_frame(u32 count, const u8 *actions, u32 now, u32 *ticks_run)
 	/* F1 from the key itself: the records skip frames while the clock stands (and are stripped) */
 	if (help && !help_down && !live_menu_open() && !chat_blocking()) ONgGameState[GS_HELP_REQUEST] = 1;
 	help_down = help;
-	if (down && !g_fire_down && !g_end_ready && !live_menu_open() && !char_menu_open() && !chat_blocking()) {
+	/* (fire held when the guard ends doesn't count: it must go down again) */
+	if (down && !g_fire_down && !g_end_ready && now - g_over_at >= END_GUARD_MS && !live_menu_open() && !char_menu_open() &&
+	    !chat_blocking()) {
 		g_end_ready = 1;
 		log_msg("net: fire pressed: ready to go back to the lobby");
 		send_end_all();
@@ -6385,7 +6879,7 @@ static u32 run_update(u32 n, u32 *ticks_run)
 static int f3_pressed(void)
 {
 	u32 pid = 0;
-	int down = (GetAsyncKeyState(VK_F3) & 0x8000) != 0, pressed;
+	int down = (GetAsyncKeyState(VK_F3) & 0x8000) != 0 && !dev_mode(), pressed;   /* (developer mode: F3 is cutscene2) */
 	void *w = GetForegroundWindow();
 
 	if (w) GetWindowThreadProcessId(w, &pid);
@@ -6487,9 +6981,29 @@ static int newcomers(void)
 
 /* The lobby's and the warm-up's frame: F3, HELLO or LOBBY, and on the host what starts next.
  * 1: the level is being reloaded */
+static int g_ready_ask;   /* chat.c's /ready (1) or /unready (2), for the next ready_frame */
+
+/* /ready, /unready: what F3 does, typed (F3 is a developer key in Oni's developer mode, which only a
+ * test build allows in network games; user, 2026-11-16). 0: asked, else why not. */
+const char *net_ready_command(int on)
+{
+	if (g_mode == NET_OFF || g_state == S_IDLE) return "Only in a network game.";
+	if (g_state == S_RUN && !g_warm) return "The match is on: readying is for the lobby and the warm-up.";
+	if (g_state != S_LOBBY && g_state != S_RUN) return "Not now: the game is starting.";
+	if (players_spectate_wanted() && g_state != S_LOBBY) return "Spectators don't ready up (/join plays).";
+	if ((on != 0) == (g_ready != 0)) return on ? "You're ready already." : "You're not ready.";
+	g_ready_ask = on ? 1 : 2;
+	return 0;
+}
+
 static int ready_frame(u32 now)
 {
 	int f3 = f3_pressed();
+
+	if (g_ready_ask) {   /* /ready, /unready */
+		if ((g_ready_ask == 1) != (g_ready != 0)) f3 = 1;
+		g_ready_ask = 0;
+	}
 
 	/* a spectator doesn't play: no F3, and /spectate takes a "ready" back (in a session: the lobby
 	 * before one has no ready-up that counts, and mp_hud.c shows the F3 line there as ever) */
@@ -6704,6 +7218,8 @@ void net_hud(NetHud *h)
 			h->over_left_ms = (int)g_end_left_ms - (int)(now - g_end_rx);
 			if (h->over_left_ms < 0) h->over_left_ms = 0;
 		}
+		/* every PC's own (g_over_at: when it saw the match end) */
+		h->over_guard_ms = now - g_over_at < END_GUARD_MS ? (int)(END_GUARD_MS - (now - g_over_at)) : 0;
 	}
 }
 
@@ -8304,8 +8820,10 @@ void net_server_quit(void)
  * each arrives once, in order); a call it refuses gets a server line back, to that player alone.
  * The state goes to every joiner in a PKT_VOTE every VOTE_SEND_MS, with that joiner's own answer.
  * Every PC says the start and the result in the chat and plays the sounds itself, from the state
- * it sees (vote_note): objective_prompt as a vote starts, objective_complete when it passes (not
- * objective_new: the match's start and end have it), door_fail
+ * it sees (vote_note): console_locked as a vote starts (a loud triple buzz no match plays: the
+ * objective_prompt chime used up to 0.6.0 was easy to miss, 2026-11-16; level0's SNDD in retail
+ * and AE), objective_complete when it passes (not objective_new: the match's start and end have
+ * it), door_fail
  * (Oni's "that door is locked", ONcEventSound_DoorAction_Fail) when it fails. Votes are never game
  * state: nothing goes into the inputs.
  *
@@ -8337,6 +8855,7 @@ void net_server_quit(void)
 #define VOTE_SEND_MS    250
 #define VOTE_LATE_MS    2000
 #define VOTE_KICK_MIN   5
+#define VOTE_ANSWER_SOUND "compass"  /* a short blip as someone answers (level0's SNDD, retail and AE) */
 
 static struct {
 	u32 id, state, kind;
@@ -8434,7 +8953,7 @@ static void vote_note(u32 id, u32 state, u32 kind, const char *caller, const cha
 	vote_what(what, sizeof what, kind, subject, reason);
 	if (state == NET_VOTE_OPEN) {
 		fmt(t, "%s called a vote: %s. Y: yes, N: no", caller, what);
-		mp_sound("objective_prompt");
+		mp_sound("console_locked");
 	} else {
 		fmt(t, state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
 		mp_sound(state == NET_VOTE_PASSED ? "objective_complete" : "door_fail");
@@ -8555,9 +9074,13 @@ static const char *vote_check_kick(int caller, const char *args, int *target, co
 /* host: /callvote restart (and its command): a match or a warm-up running, or a match's end */
 static int restart_possible(void) { return g_mode == NET_HOST && (g_state == S_RUN || g_state == S_OVER || g_state == S_LOST); }
 
+/* On screen (the HUD, the F1 board): short, for a fast game (user, 2026-11-16): "Restart match", "Map: X",
+ * "Kick X"; the chat line says it in full (vote_what) */
 void net_vote_what(char *out, u32 size, int kind, const char *subject, const char *reason)
 {
-	vote_what(out, size, (u32)kind, subject, reason);
+	if (kind == NET_VOTE_MAP) fmt(out, "Map: %s", subject);   /* (subject is at most 63 bytes, out 160) */
+	else if (kind == NET_VOTE_RESTART) str_cpy(out, size, "Restart match");
+	else fmt(out, "Kick %s", subject);
 }
 
 /* host: player p calls a vote ("map <name>" / "kick <player> [reason]" / "restart"); 0, or why not */
@@ -8744,6 +9267,20 @@ static int vote_frame(u32 now)
 {
 	u32 yes, no, voters;
 
+	/* Every PC: a player answered (a Yes or a No more than the last state said): a short blip, not for the
+	 * caller's own Yes, which came with the vote (user, 2026-11-16) */
+	{
+		static u32 heard_id;
+		static int heard_yes, heard_no;
+		NetVote v;
+		if (net_vote(&v) && v.state == NET_VOTE_OPEN && g_vn_id) {
+			if (heard_id != g_vn_id) heard_id = g_vn_id;
+			else if (v.yes > heard_yes || v.no > heard_no) mp_sound(VOTE_ANSWER_SOUND);
+			heard_yes = v.yes;
+			heard_no = v.no;
+		}
+	}
+
 	if (g_mode == NET_JOIN) {
 		if (g_vrx.id && g_vrx.kind == NET_VOTE_MAP && g_vrx.state == NET_VOTE_PASSED && g_vrx_acted != g_vrx.id &&
 		    g_vn_id == g_vrx.id && (int)(now - g_vrx_at) > (int)g_vrx.ms_left + VOTE_LATE_MS) {
@@ -8782,7 +9319,8 @@ static int vote_frame(u32 now)
 /* Y and N answer the vote, while this window has the keyboard and nothing else takes the keys */
 static void vote_keys(void)
 {
-	int y = (GetAsyncKeyState('Y') & 0x8000) != 0, n = (GetAsyncKeyState('N') & 0x8000) != 0;
+	int ctrl = dev_mode_ctrl();   /* (developer mode: Ctrl+Shift/Alt+Y and +N are its keys) */
+	int y = !ctrl && (GetAsyncKeyState('Y') & 0x8000) != 0, n = !ctrl && (GetAsyncKeyState('N') & 0x8000) != 0;
 	int yes = y && !g_vn_y, no = n && !g_vn_n;
 	NetVote v;
 
@@ -9088,7 +9626,8 @@ u32 net_host_char_rules_saved(void)
 	       (GetPrivateProfileIntA("host", "fast_plasma", 0, ini_path()) ? NET_MUT_FAST_PLASMA : 0) |
 	       (GetPrivateProfileIntA("host", "bombs", 0, ini_path()) ? NET_MUT_BOMBS : 0) |
 	       (GetPrivateProfileIntA("host", "fast_ball", 0, ini_path()) ? NET_MUT_FAST_BALL : 0) |
-	       (GetPrivateProfileIntA("host", "jamming_guns", 0, ini_path()) ? NET_MUT_JAMMING : 0);
+	       (GetPrivateProfileIntA("host", "jamming_guns", 0, ini_path()) ? NET_MUT_JAMMING : 0) |
+	       (GetPrivateProfileIntA("host", "one_character", 0, ini_path()) ? NET_MUT_ONE_CHARACTER : 0);
 }
 
 void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules)
@@ -9367,6 +9906,23 @@ void net_query_close(void)
 
 /* ---- Install ------------------------------------------------------------------------------ */
 
+/* The stock menu's New Game (0x4d2e0b) and Load Game (0x4d2eed; from the pause menu too, which
+ * runs live in a network game) start a single player level: out of the network game first, as
+ * Custom Game's Play does (net_menu_local), so no lobby, chat, mutators or host rules come along,
+ * and the level's load puts this PC's own level0 back after a host's (level_load: "not joining any
+ * more"). Up to 0.6.0 the session stayed on and the level showed "Press F3 to be ready", the chat,
+ * and the host's level0 (2026-11-16). Only a dedicated server stays (it quits instead). */
+static void ONI_FC menu_start_level(u32 level)
+{
+	if (g_mode != NET_OFF && !g_dedicated) {
+		log_msg("net: the menu starts level %u alone: leaving the network game%s", level & 0xff,
+		        g_startup_mode ? " (set by ARKLITE_HOST/ARKLITE_JOIN or Arklite.ini [net])" : "");
+		g_startup_mode = 0;
+		net_leave();
+	}
+	ONrGame_StartLevel(level);
+}
+
 void net_install(void)
 {
 	char host_env[32], ded_env[96] = "";
@@ -9379,11 +9935,18 @@ void net_install(void)
 		log_msg("net: the camera follows this PC's player");
 		rollback_gap_allow();   /* (the frame's call ends a protection kept between ticks) */
 	}
+	if (!patch_call(0x4d2e0b, (u32)ONrGame_StartLevel, (u32)menu_start_level) ||
+	    !patch_call(0x4d2eed, (u32)ONrGame_StartLevel, (u32)menu_start_level))
+		log_msg("net: the menu's level start isn't the expected call: New Game or Load Game may keep a network game on");
 	/* also always on: photo mode hides the player with it */
 	if (!patch_call(ONcDraw_OnScreenCall, (u32)ONrCharacter_OnScreen, (u32)character_on_screen))
 		log_msg("net: draw pass call 0x%x changed, a watching host's character stays drawn", ONcDraw_OnScreenCall);
 
 	helper_set_proto(PROTO);   /* the server list shows only games of this protocol */
+	{   /* AEInstaller\\vanilla's level0 hashes, for level0 patches (once per install, on a thread) */
+		u32 vh[2];
+		vanilla_pair(vh);
+	}
 
 	/* The server's description, as the Host dialog saved it */
 	ini_text("host", "name", g_server_name, g_server_name, sizeof g_server_name);

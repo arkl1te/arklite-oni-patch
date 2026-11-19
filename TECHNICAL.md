@@ -99,7 +99,8 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `fast_plasma` | 0 | The Fast Plasma mutator: the Plasma Rifle fires twice as fast |
 | | `bombs` | 0 | The Bombs For Days mutator: everyone dies as the Mad Bomber does, a blast three seconds later. With or without it, a bomb's body vanishes when it goes off and leaves a black scorch |
 | | `fast_ball` | 0 | The Fast Ball mutator: the Super Ball Gun's ball flies twice as fast |
-| | `jamming_guns` | 0 | The Jamming Guns mutator: each shot a player fires has a 5% chance of jamming the gun (the round is lost). A jammed gun clicks instead of firing until it has been dropped 1 to 3 times (a drop counts when it lands) and reloaded 0 or 1 times, in any order; the screen says what's left. The jam stays with the gun, whoever picks it up |
+| | `jamming_guns` | 0 | The Jamming Guns mutator: every 0.3 seconds a gun a player holds has a 5% chance to jam at its next shot (that shot isn't fired, its round stays). A jammed gun clicks instead of firing until it has been reloaded 1 to 3 times and dropped 0 or 1 times (a drop counts when it lands), in any order; a gun that can't be reloaded wants 1 to 3 drops instead. Reloading a jammed gun only clears the jam: it works with a full magazine and without a clip, uses no clip and adds no rounds. The screen says what's left. The jam stays with the gun, whoever picks it up |
+| | `one_character` | 0 | The One Character mutator: each match picks one character at random (the F2 menu's game characters and the mods Arklite knows, those the other mutators allow), and everyone plays it from the match's start; the F2 menu shows only it, and you pick among its variations, as usual for your next respawn. The warm-up is free |
 | | `motd` | (empty) | The message of the day: a server line in the chat ("Server MOTD: ...") for each player who enters the game, only them. The host sees it too: a listen host in its chat when the first warm-up starts, a dedicated server on its console at the start and in `status`. The Host page's field saves it; up to 114 characters here, as many as fit in the field there. Empty: none |
 | `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by + and - |
 | `[multiplayer]` | `respawn_delay` | 1.5 | Seconds a dead player waits before an attack button brings them back at a spawn point (in a network game, the host's) |
@@ -111,8 +112,6 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | `[photo]` | `speed` | 100 | Photo mode's flight speed in hundredths (100 = 1.00 times, 160 units a second), 10–2000 (the panel saves it) |
 | | `stop_at_walls`, `pause_sounds` | 1 | Photo mode's panel toggles (it saves them) |
 | | `show_hud`, `hide_player`, `thirds_grid`, `cinema_bars` | 0 | The same |
-| `[cloak_fx]` | `opacity`, `water_*`, `zoom*`, `stencil*`, `outline_*`, `fringe_*` | | The phase cloak's look on your own screen, as the **O** panel saves it (missing: the defaults) |
-| | `order` | `opacity,tones,zoom,water,outline,fringe` | The order its filters are applied in (the O panel's Up and Down) |
 
 Environment variables, for testing (set them before starting `Oni.exe`):
 
@@ -177,7 +176,7 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `/help` | Lists the commands |
 | `/name New Name` | Changes your name (saved, like typing it in F2); everyone sees "Old is now known as New" |
 | `/whisper Name text`, `/w Name text` | Only that player reads it (pink on both screens, no bubble over your head). A start of the name is enough when only one player's name fits |
-| `/movelist`, `/moves` | Your current character's moves, the move's name and its input in two columns (moves.md's list without the moves every character has); `/movelist` adds gray lines on what everyone has and on blocking, `/moves` leaves them out. The chat stays open so you can scroll it |
+| `/movelist`, `/moves` | Your current character's moves, the move's name and its input in two columns, without the moves every character has. Read from the character's loaded animations the way the game looks them up, so a mod's set or character gets a list too, its new moves without a name (moves.md lists the game's own characters). Inputs are in a fighting game's notation: P punch, K kick, ↑ ↓ ← → forward, back, left, right, `+` together, `,` one after the other (a line on top says so); Crouch, Jump and Action stay words, and so does the situation before a colon ("Running: P"). `/movelist` adds gray lines on what everyone has and on blocking, `/moves` leaves them out. The chat stays open so you can scroll it |
 | `/taunt` or `/t`, `/taunt2` or `/t2` | Plays your character's first taunt, or its rare second one: Konoko's, the Ninja's moonwalk, Tanker's (the taunt key picks one at random, the second seldom) |
 | `/sneeze` | Konoko sneezes (her rare idle; other characters have none) |
 | `/idle` or `/i` | Plays your character's special idle, one made for its body: Konoko's (also Red, Shinatama), Comguy's (also Griffin, Muro, Thug, Ninjabot), Striker's (also Barabas, Elite, TCTF SWAT), Tanker's. Ninja has none |
@@ -195,8 +194,8 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `/yes`, `/no` | Answers the vote (as Y and N do) |
 | `\/text` | Sends "/text" as a message, not a command |
 
-**Votes**: `/callvote map`, `/callvote kick` and `/callvote restart` start a 30-second vote on every screen, with a soft
-prompt sound: what it's about, the Yes and No counts, the seconds left. Answer with **Y** or
+**Votes**: `/callvote map`, `/callvote kick` and `/callvote restart` start a 30-second vote on every screen, with a loud
+buzz (the locked-console sound) and on a dark panel, its first line bigger: what it's about ("Vote: Restart match"), the Yes and No counts and the seconds left ("Yes:1 No:0 (30s)"). Every answer plays a short blip. Answer with **Y** or
 **N** (while the chat is closed), `/yes` or `/no`, or the Yes and No buttons under the F1
 Scoreboard; you can change your answer while it's on, and calling a vote counts as your Yes. Only
 players vote, never spectators. It ends after 30 seconds, or as soon as everyone answered, and
@@ -328,9 +327,26 @@ game from the same address (one router, or a provider's shared address) stay.
 `ARKLITE_SERVER_STDIO=1` reads the commands from standard input and writes to standard output
 (a pipe or a file) instead of a console window.
 
+## Oni's developer mode
+
+With Oni's developer mode on (the `thedayismine` cheat), Arklite's keys that are developer keys too
+do nothing, so the developer keys work: F2 (the character menu), F3 (ready), F4 (photo mode) and
+Enter (the chat; the hint says so). Y and N (votes) still work, but not
+while Ctrl is held (Ctrl+Shift or Ctrl+Alt with a letter is a developer key). F1 and F12 aren't
+developer keys and keep working. `/` commands need the chat, so they wait until developer mode is off, and
+so does readying up for a match (the lobby says "Developer mode: F3 is off").
+
+## Starting single player after a network game
+
+New Game and Load Game (from the main menu, or from the pause menu during a network game) leave the
+network game first, as Custom Game's Play does: no lobby, ready prompt, chat, mutators or host
+rules come along, and a host's level0 that this PC switched to for joining is replaced by your own
+again as the level loads. To make sure that switch back is always possible, Oni switches to a
+host's level0 only while one more switch is left after it (3 per run, then Oni needs a restart).
+
 ## Photo mode
 
-F10 in a single-player level, cutscenes included, freezes the game and frees the camera. F10 again (or Esc) leaves, and everything goes back as it was: the camera (in whatever mode it was, a cutscene's included), the field of view, the HUD, the sounds. It refuses in network games (the lobby included), with a player 2 on a multiplayer map, and while `ARKLITE_RECORD` or `ARKLITE_REPLAY` is on; `AE/logs` says `photo: not in multiplayer` when F10 was refused.
+F4 in a single-player level, cutscenes included, freezes the game and frees the camera. F4 again (or Esc) leaves, and everything goes back as it was: the camera (in whatever mode it was, a cutscene's included), the field of view, the HUD, the sounds. It refuses in network games (the lobby included), with a player 2 on a multiplayer map, and while `ARKLITE_RECORD` or `ARKLITE_REPLAY` is on; `AE/logs` says `photo: not in multiplayer` when F4 was refused.
 
 | Key | Free fly | Orbit |
 | --- | --- | --- |
@@ -350,7 +366,7 @@ The panel (Tab, Esc or Resume close it; the game stays frozen behind it and the 
 - **Camera**: Free fly or Orbit (and whom it orbits), Field of view in degrees (vertical, 5 to 120; Oni's is 45), Flight speed (0.10 to 20.00 times), Tilt in degrees, Stop at walls (the camera slides along walls as a spectator's does).
 - **Picture**: Show HUD (off: no HUD, crosshair, laser sight, subtitles or speaker portraits), Hide player, Thirds grid (left out of screenshots), Cinema bars (2.39:1), Pause sounds (the music plays on).
 - **Next Frame** runs one game tick (1/60 s) with no input from you. These ticks are real game time and aren't taken back when photo mode ends.
-- **Screenshot** closes the panel and saves the picture as F12 does, without the panel or the key hints. F12 works in photo mode too; the key hints shown for 6 seconds after F10 or the panel never end up in a screenshot.
+- **Screenshot** closes the panel and saves the picture as F12 does, without the panel or the key hints. F12 works in photo mode too; the key hints shown for 6 seconds after F4 or the panel never end up in a screenshot.
 - **Reset Camera** puts the camera back where photo mode began. **Exit Photo** leaves photo mode.
 
 A cutscene's letterbox bars are hidden in photo mode (Cinema bars draws your own). The panel's toggles and the flight speed are kept in `[photo]`; the field of view and tilt start from the game's every time.
@@ -385,6 +401,12 @@ A game with player 2 is a **multiplayer game**, and in one:
 
 - **Auto-aim is off**, as it will have to be over the network, where each player sees
   different characters.
+- **Melee auto-facing is narrower**: an attack started on the ground turns you toward an opponent
+  only within 30 degrees to either side of the attack's direction (Oni: 90), and never toward a
+  cloaked player (while the cloak hides them: all but its last 2 seconds). Throws are as in Oni.
+- **An interrupted reload drops its clip**: knocked down, disarmed, killed, or the reload otherwise
+  cut short before the new rounds go in, the ammo clip or energy cell it used falls to the floor,
+  where anyone can pick it up (Oni loses it).
 - **Nothing pauses**: the game keeps running behind the pause menu and behind the help and
   objectives screen (F1), and F1 doesn't turn the sound down. A console's text page opens only
   for the player who used the console, and the game goes on behind it too.
@@ -449,23 +471,35 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
   Janice 268435456, BGI Sarai 536870912, Kit Ballard 1073741824, Lara the sign bit (make the sum
   negative: subtract 2147483648). Shinatama Evolved, RAYMAN, Dragon Unit and other mods'
   characters have no number: only -1 offers them. So `5` is Konoko and Muro.
-- **Phase cloak**: a player who picks up invisibility sees themselves half see-through (50%,
-  without the shimmer): only the body's near side, in its own colors with the white parts still
-  white, and players or items behind it show through; a slow turbulence (a 20-second loop)
-  makes it waver and ripple, as if seen under water, what's behind it seen through it slightly
-  zoomed in (as through a narrower field of view, only inside the body), its shading
-  cut to a few flat tones, a thin pale-blue outline around it and red and blue color fringes at
-  its edges. **O** opens a panel on the right of the screen (in any level) with a slider and a
-  number field for each of these: drag a slider, click a number and type one (Enter keeps it, Esc
-  puts it back), or turn the wheel over a row for a fine step. Each filter's Up and Down change
-  the order they're applied in, opacity included (faded first, the outline and fringes keep their
-  strength; faded last, they fade too). While it's open your own character shows the look
-  (Preview), cloaked or not, and the game gets no input; **Cloak me** gives you a 30-second phase
-  cloak outside network games; **Reset** puts every value and the order back. O or Esc closes it
-  and saves the values in `[cloak_fx]`. O is also stock Oni's second key for swapping weapons
-  (`key_config.txt`: `bind o to swap`), so opening the panel may swap your weapon once. The look
-  needs a graphics driver with OpenGL 2.0 shaders and framebuffer objects; without them the body
-  is simply half see-through. Everyone else sees nothing of them: no body, shadow or name, not even
+- **Map scripts get more control over dialogue**: the game plays one line of dialogue at a
+  time, and its `sound_dialog_play_interrupt` leaves the old line's subtitle on screen for that
+  line's whole time, so both show at once. Arklite adds three commands:
+
+  ```
+  ark_sound_dialog_play_interrupt c01_01_04griffin
+  ark_sound_dialog_play_interrupt(c01_01_04griffin, true)
+  ark_sound_dialog_stop_all
+  ark_sound_dialog_stop_all(true)
+  ark_sound_dialog_play_overlap c01_01_02shinatama
+  ```
+
+  | Command | What it does |
+  |---|---|
+  | `ark_sound_dialog_play_interrupt name [immediate]` | As `sound_dialog_play_interrupt`, and the subtitles of the lines it cuts off go too |
+  | `ark_sound_dialog_stop_all [immediate]` | Stops every line playing and hides their subtitles; a `sound_dialog_play_block` waiting goes on at once |
+  | `ark_sound_dialog_play_overlap name` | Starts a line while another plays: both are heard and both subtitles show (`sound_dialog_play` would skip it). `sound_dialog_play_block` waits until both are done, and any interrupt or `stop_all` stops both. With nothing playing it's `sound_dialog_play` |
+
+  Subtitles fade out in about a second; with `true` (immediate) they're gone at once. A subtitle
+  still showing in the second after its line ended counts too. Other text on screen (`message`
+  lines, other subtitles) stays. Without Arklite the game doesn't know these commands, and the
+  script stops there with an error.
+- **Phase cloak**: a player who picks up invisibility sees themselves barely there (5%, without
+  the shimmer): only the body's near side, in its own colors, and players or items behind it show
+  through; a fast ripple (a 2-second loop) makes it waver as if seen under water, what's behind it
+  seen through it slightly zoomed in (only inside the body), its shading in soft tones, a faint
+  white outline and color fringes at its edges. Only the cloaked player sees this, on their own
+  screen. The look needs a graphics driver with OpenGL 2.0 shaders and framebuffer objects;
+  without them the body is simply 5% see-through. Everyone else sees nothing of them: no body, shadow or name, not even
   when they're hit. Only when they land a blow does their shimmer flash up for a moment and fade.
   Spectators (/spectate) see every cloaked player as Oni shows them, the fading body and the
   shimmer, with their name. When the cloak wears off the character is back to normal: in stock
@@ -555,10 +589,13 @@ differs. Copy that file or folder from one PC to the other and join again.
 When only `level0_Final` differs (two AE installs whose patches didn't come out the same), the
 joiner gets the host's version and switches to it without restarting Oni, the way Unreal
 Tournament fetches a server's packages: the level reloads, and its loading box shows the
-download (Esc cancels). Only what differs comes over the network: your game looks for the
-host's version's pieces in your own `level0` and every version already in the cache, and asks
-the host for the rest (a mod's `level0` of 197 MB took 35 MB against the stock one; the whole
-pair comes only if that fails). The files are kept in `AE/cache/<dat hash>-<raw hash>/`, so the
+download (Esc cancels). Only what differs comes over the network. First the host makes a patch
+from a `level0` both PCs have, the original files every AE install keeps in `AE/AEInstaller/vanilla`
+or a stock AE pair (Zstandard, `src/level0_patch.c`), once, and keeps it in `AE/cache/.patch/`; your
+game rebuilds the host's files from your own and checks them (a mod's `level0` of 197 MB took
+7.5 MB). Without such a pair in common, your game looks for the host's version's pieces in your own
+`level0` and every version already in the cache, and asks the host for the rest (that mod took
+35 MB); the whole pair comes only if that fails too. The files are kept in `AE/cache/<dat hash>-<raw hash>/`, so the
 next game with that version starts at once. Your own `GameDataFolder` files are never written.
 The host's version is only used while you play on that host: when you host or play alone again,
 Oni switches back to your own (through a link to your files in the cache, at the next level
@@ -628,7 +665,8 @@ with the match instead. Someone joining during a match plays alone until it ends
 A match ends at the host's **Time limit** or **Score limit** (the Host dialog; 0 means none of
 that limit). A negative score limit is reached going down, so the players race to kill
 themselves. When it ends, the game stands still and shows who won, with the ranking if there were
-more than two players; press **fire** (the left mouse button) to go back. When everyone did, or after 30 seconds, the level reloads on every PC
+more than two players; press **fire** (the left mouse button) to go back. Fire does nothing for the first 8 seconds, so
+players still hitting punch see the result first (the line counts them down). When everyone did, or after 30 seconds, the level reloads on every PC
 into the warm-up, where F3 starts the next match.
 
 **F1** opens the help screen as usual, with the game still running. In a multiplayer game its
@@ -797,3 +835,7 @@ AE's Bink and put Arklite's loader in as `install.bat` does. It lives in `AE/ark
 
 Arklite is under the ISC license; see `LICENSE`. Oni, the Anniversary Edition, Daodan and Bink
 belong to their owners and aren't covered by it.
+
+`Arklite.dll` includes Zstandard 1.5.7 (`src/zstd/`, for level0 patches), Copyright (c) Meta
+Platforms, Inc. and affiliates, under its BSD license: see `LICENSE-zstd.txt` in the zip
+(`src/zstd/LICENSE.txt` here).
