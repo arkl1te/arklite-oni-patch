@@ -18,7 +18,8 @@
  * When: the first DESYNC of a session, a player who stopped answering or the host lost, a bad
  * free heap_check.c caught (once a session each), and a crash: the fault handler can't send, so it leaves logs\report-pending.txt
  * and the next start of Oni sends that log. Sending runs on its own thread; a failure is logged
- * and dropped (no retries, nothing piles up).
+ * and dropped (no retries, nothing piles up). Runs with ARKLITE_PLAYBACK or ARKLITE_BENCH set send
+ * nothing, and write no pending crash report.
  *
  * Wire format (little-endian), one report per TCP connection: "AKRP", version 1, body length,
  * then the body: Arklite's version (32 bytes), its source hash, the reason, this PC's player slot,
@@ -524,9 +525,9 @@ void report_install(void *instance)
 	g_on = GetPrivateProfileIntA("reports", "send", 1, ini_path()) != 0;
 	net_helper_address(g_helper, sizeof g_helper);   /* (a test build: the dev helper) */
 	if (!g_helper[0]) g_on = 0;
-	{   /* a recording playing (net.c "Playback") sends nothing */
+	{   /* a recording playing (net.c "Playback") or a bench run (bench.c) sends nothing: its crashes are tests' */
 		char v[4];
-		if (GetEnvironmentVariableA("ARKLITE_PLAYBACK", v, sizeof v)) g_on = 0;
+		if (GetEnvironmentVariableA("ARKLITE_PLAYBACK", v, sizeof v) || GetEnvironmentVariableA("ARKLITE_BENCH", v, sizeof v)) g_on = 0;
 	}
 	for (int i = 0; i < 2; i++) {   /* Oni.exe's folder and Arklite.dll's */
 		n = GetModuleFileNameA(i ? instance : 0, path, sizeof path);
@@ -545,7 +546,7 @@ void report_install(void *instance)
 		g_prefix[1].label = l;
 	}
 	if (!g_on) {
-		log_msg("report: problem reports off (Arklite.ini [reports] send=0, or no helper)");
+		log_msg("report: problem reports off (Arklite.ini [reports] send=0, no helper, or ARKLITE_PLAYBACK/ARKLITE_BENCH set)");
 		return;
 	}
 	log_msg("report: problem reports on, to the helper %s (desyncs, dropped players, crashes, heap damage; with the players' names, chat and the machine and setup dump; [reports] send=0 turns them off)", g_helper);

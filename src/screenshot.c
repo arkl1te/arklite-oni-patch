@@ -71,7 +71,7 @@ static char g_to_written[MAX_PATH];   /* that shot, written (screenshot_written)
 static volatile int g_to_ready;
 static int g_gl_state;           /* 0 not looked up, 1 ok, 2 missing */
 
-typedef struct { u8 *pixels; int w, h, stride; } Shot;
+typedef struct { u8 *pixels; int w, h, stride; char camera[96]; } Shot;   /* camera: bug_camera_text at capture */
 static Shot g_shot;
 
 static int focused(void)
@@ -212,7 +212,7 @@ static u32 WINAPI write_thread(void *unused)
 		ok = save_bmp(s, path);
 	}
 	if (!GetFullPathNameA(path, sizeof full, full, 0)) str_cpy(full, sizeof full, path);
-	if (ok) log_msg("screenshot: %dx%d saved to %s", s->w, s->h, full);
+	if (ok) log_msg("screenshot: %dx%d saved to %s (%s)", s->w, s->h, full, s->camera);
 	else    log_msg("screenshot: couldn't write %s", full);
 
 	VirtualFree(s->pixels, 0, 0x8000 /* MEM_RELEASE */);
@@ -281,6 +281,7 @@ static void capture(void *dc)
 	}
 
 	g_shot.pixels = pixels;
+	bug_camera_text(g_shot.camera);   /* (where a shot was taken from, to compare with the level's geometry) */
 	g_shot.w = w;
 	g_shot.h = h;
 	g_shot.stride = stride;
@@ -311,12 +312,15 @@ static int WINAPI swap_buffers(void *dc)
 	}
 	/* photo mode's key hints and grid were drawn before F12 came: the next frame, which leaves
 	 * them out (photo.c sees screenshot_pending) */
-	if (photo_overlay_take() && g_request) return (*(SwapBuffersFn *)ONcSwapBuffersImport)(dc);
-	if (g_request) {
+	if (!(photo_overlay_take() && g_request) && g_request) {
 		g_request = 0;
 		if (!g_busy && gl_ready()) capture(dc);
 	}
-	return (*(SwapBuffersFn *)ONcSwapBuffersImport)(dc);
+	{
+		int r = (*(SwapBuffersFn *)ONcSwapBuffersImport)(dc);
+		bench_present();
+		return r;
+	}
 }
 
 /* photo.c's Screenshot button, and whether a frame is about to be saved (it leaves its hints and

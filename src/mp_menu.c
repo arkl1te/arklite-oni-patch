@@ -1408,13 +1408,13 @@ static const Mutator g_mutatorList[] = {
 	{ NET_CHARS_MUTANT_MURO, "Mutant Muro", "Players may pick Mutant Muro in the character menu (F2)." },
 	{ NET_CHARS_SHINATAMA, "Shinatama and Hasegawa", "Players may pick Shinatama and Hasegawa in the character menu (F2)." },
 	{ NET_CHARS_MINI_STRIKER, "Mini Striker", "Players may pick the half-size Mini Striker in the character menu (F2)." },
-	{ NET_MUT_DAODAN, "Daodan for All", "Overhealed, everyone gets Konoko's Daodan power and Muro's shield." },
+	{ NET_MUT_DAODAN, "Daodan for All", "Overhealed, everyone gets Konoko's Daodan power." },
 	{ NET_MUT_NO_WEAPONS, "No Weapons", "No weapons in the map, and players spawn without one." },
 	{ NET_MUT_FAST_SCREAMER, "Fast Screamer", "The Screaming Cannon's Screaming Cell flies twice as fast." },
 	{ NET_MUT_FAST_PLASMA, "Fast Plasma", "The Plasma Rifle fires twice as fast." },
 	{ NET_MUT_FAST_BALL, "Fast Ball", "The Super Ball Gun's ball flies twice as fast." },
 	{ NET_MUT_BOMBS, "Bombs For Days", "Everyone dies as the Mad Bomber does: a blast 3 seconds later." },
-	{ NET_MUT_JAMMING, "Jamming Guns", "A gun may jam (5% every 0.3 s): reload it 1-3 times, maybe drop it." },
+	{ NET_MUT_JAMMING, "Jamming Guns", "A shot may jam its gun (5%, max once per 0.3 s): reload it 1-3 times." },
 	{ NET_MUT_ONE_CHARACTER, "One Character", "A match picks one random character for all: any of its variations." },
 };
 #define MUTATORS ((int)(sizeof g_mutatorList / sizeof g_mutatorList[0]))

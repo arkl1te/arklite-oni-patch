@@ -46,16 +46,21 @@
  * then a player's body isn't drawn (players_hidden, net.c's draw-pass hook) and leaves no corpse
  * when they respawn (NoCorpse).
  *
- * Jamming Guns (NET_MUT_JAMMING): every JAM_ROLL_TICKS (300 ms) a gun a player holds has a
- * JAM_CHANCE (5%) chance to get a jam ready, and its next shot jams it (user, 2026-11-16; up to then
- * each shot had the 5%). Every shot passes through WPiPulseShooter (0x519c50: ECX weapon, DX shooter
+ * Jamming Guns (NET_MUT_JAMMING): a player's shot jams the gun JAM_CHANCE (5%) of the time, but a
+ * gun rolls at most once in each JAM_ROLL_TICKS (300 ms) window of the game's clock: the window's
+ * first shot rolls, its other shots don't (user, 2026-11-16: "every 300 ms, 5% chance the next
+ * bullet jams"). A slow gun has the 5% on every shot, a fast one 5% per 300 ms of firing, and
+ * holding the gun without firing counts for nothing (2026-11-19; from 2026-11-16 a roll every 300 ms
+ * while a player held the gun armed its next shot, so the odds piled up while it wasn't fired and
+ * most first shots jammed; before that, every shot had the 5%). Every shot passes through WPiPulseShooter (0x519c50: ECX weapon, DX shooter
  * index, the shooter attachment on the stack, ret 4), which spends the ammo: from the trigger's
  * first pull (the Start event in WPiDoEvent, 0x51a104), from an autofire weapon's held trigger
  * (WPiFireShooter, 0x51a354) and from the update's continuous fire (WPiUpdate, 0x5194e6). Those
  * three calls come here. A jamming shot isn't fired and its round stays in the gun, and the
  * trigger lets go at the weapon's next update (flag DeferUpdate_StopFiring 0x4000; the event
- * loop that called us mustn't get Stop events in the middle). The jam asks for 1 to 3 reloads and 0
- * or 1 drop (user, 2026-11-16; it was 1-3 drops and 0-1 reload), in any order; an unreloadable
+ * loop that called us mustn't get Stop events in the middle). The jam asks for 1 to 3 reloads and,
+ * JAM_DROP_CHANCE (10%) of the time, 1 drop (user, 2026-11-16; it was 1-3 drops and 0-1 reload; the
+ * drop was 50% until the user asked for far fewer, 2026-11-19), in any order; an unreloadable
  * class (flag 0x800) 1 to 3 drops and no reload. A drop counts when the
  * dropped gun touches the ground (weapon flag HitGround 0x2, which picking it up clears), a reload
  * when the reload animation reloads it (WPrNotifyReload 0x5181e0, called once at 0x4dfb7d).
@@ -192,15 +197,16 @@ static u8 *g_scorch;                        /* d_SCORCH */
 #define WCLASS_MAX_AMMO(k)      (*(u16 *)((k) + 0xc0))
 
 #define JAM_CHANCE              5     /* percent, each roll */
-#define JAM_ROLL_TICKS          18    /* a roll every 300 ms */
+#define JAM_ROLL_TICKS          18    /* a gun rolls at most once in each 300 ms window */
+#define JAM_DROP_CHANCE         10    /* percent of jams that also want a drop (reloadable guns) */
 #define JAM_CLICK_TICKS         15    /* a held trigger clicks this often */
 
 typedef struct {
-	u32 born;           /* the weapon's birth time: another weapon in the slot isn't jammed (or armed) */
+	u32 born;           /* the weapon's birth time: another weapon in the slot isn't jammed (or rolled) */
 	u8 jammed, held;    /* held: in a hand since its last drop counted */
 	u8 drops, reloads;  /* still needed */
 	u32 click;          /* the tick of its last click */
-	u8 armed;           /* a roll hit: the gun's next shot by a player jams it */
+	u32 window;         /* 1 + the JAM_ROLL_TICKS window of the gun's last roll (0: none yet) */
 } Jam;
 
 static Jam g_jam[WP_WEAPON_SLOTS] TICK_STATE;
@@ -347,14 +353,13 @@ static void jam_start(u8 *w, Jam *j, const u8 *owner, u32 r)
 
 	j->born = WEAPON_BORN(w);
 	j->jammed = 1;
-	j->armed = 0;
 	j->held = 1;
 	if (WCLASS_FLAGS(k) & WCLASS_UNRELOADABLE) {   /* nothing to reload: drops alone, as many as before */
 		j->drops = (u8)(1 + mix(r ^ 0x68e31da4u) % 3);
 		j->reloads = 0;
 	} else {
 		j->reloads = (u8)(1 + mix(r ^ 0xb5297a4du) % 3);
-		j->drops = (u8)(mix(r ^ 0x68e31da4u) & 1);
+		j->drops = (u8)(mix(r ^ 0x68e31da4u) % 100 < JAM_DROP_CHANCE);
 	}
 	j->click = GS_TICK(ONgGameState);
 	WPrOutOfAmmoSound(w);
@@ -375,12 +380,20 @@ static void ONI_FC pulse_hook(u8 *w, u32 shooter, u8 *attachment)
 			WEAPON_FLAGS(w) |= WEAPON_DEFER_STOP;
 			return;
 		}
-		if (CHR_TYPE(owner) == 0 && j->armed && j->born == WEAPON_BORN(w)) {   /* a player's shot, and a roll hit */
+		u32 window = GS_TICK(gs) / JAM_ROLL_TICKS + 1;
+		if (j->born != WEAPON_BORN(w)) {   /* another weapon in the slot: it hasn't rolled yet */
+			j->born = WEAPON_BORN(w);
+			j->window = 0;
+		}
+		if (CHR_TYPE(owner) == 0 && j->window != window) {   /* a player's shot, the gun's first in this window */
 			u32 slot = (u32)(j - g_jam);
 			u32 r = mix(GS_TICK(gs) * 0x9e3779b9u ^ mix(UUgRandomSeed ^ slot << 24 ^ WEAPON_BORN(w) ^ (u32)WEAPON_AMMO(w) << 8));
-			jam_start(w, j, owner, r);
-			WEAPON_FLAGS(w) |= WEAPON_DEFER_STOP;   /* the trigger lets go at the weapon's next update */
-			return;
+			j->window = window;
+			if (mix(r ^ 0x3c6ef372u) % 100 < JAM_CHANCE) {
+				jam_start(w, j, owner, r);
+				WEAPON_FLAGS(w) |= WEAPON_DEFER_STOP;   /* the trigger lets go at the weapon's next update */
+				return;
+			}
 		}
 	}
 	((void (ONI_FC *)(u8 *, u32, u8 *))WPiPulseShooter)(w, shooter, attachment);
@@ -425,32 +438,12 @@ static void ONI_FC reload_hook(u8 *w)
 }
 
 /* Every tick: a jammed gun that was let go counts a drop when it touches the ground */
-/* Every JAM_ROLL_TICKS: a gun a player holds, not jammed or armed, gets its jam ready JAM_CHANCE of
- * the time. The dice are a hash of the tick, the slot, the gun and the game's RNG seed, as for
- * the jam itself: the same on every PC, nothing drawn from the RNG. */
-static void jam_roll(u32 slot, u8 *w, Jam *j)
-{
-	u8 *gs = ONgGameState, *owner = WEAPON_HOLDER(w);
-	u32 r;
-
-	if (j->armed && (!(WEAPON_FLAGS(w) & WEAPON_INUSE) || WEAPON_BORN(w) != j->born)) j->armed = 0;   /* the gun is gone */
-	if (j->armed || GS_TICK(gs) % JAM_ROLL_TICKS || !(WEAPON_FLAGS(w) & WEAPON_INUSE) || !owner || CHR_TYPE(owner) != 0) return;
-	r = mix(GS_TICK(gs) * 0x85ebca6bu ^ mix(UUgRandomSeed ^ slot << 24 ^ WEAPON_BORN(w) ^ 0x3c6ef372u));
-	if (r % 100 >= JAM_CHANCE) return;
-	j->armed = 1;
-	j->born = WEAPON_BORN(w);
-	if (!net_rerun()) log_msg("mutators: %s's %s will jam at its next shot (tick %u)", (const char *)owner + 0x14, weapon_name(w), GS_TICK(gs));
-}
-
 static void jams_tick(void)
 {
 	for (u32 i = 0; i < WP_WEAPON_SLOTS; i++) {
 		Jam *j = &g_jam[i];
 		u8 *w = WP_WEAPONS + i * WP_WEAPON_SIZE;
-		if (!j->jammed) {
-			jam_roll(i, w, j);
-			continue;
-		}
+		if (!j->jammed) continue;
 		if (!(WEAPON_FLAGS(w) & WEAPON_INUSE) || WEAPON_BORN(w) != j->born) {   /* the weapon is gone */
 			j->jammed = 0;
 			continue;
@@ -656,7 +649,8 @@ void mutators_level(void)
 	memset(g_jam, 0, sizeof g_jam);
 	if (net_mutator(NET_MUT_JAMMING)) {
 		g_jam_on = 1;
-		log_msg("mutators: Jamming Guns: a gun a player holds gets a jam ready %d%% of the time every %d ticks", JAM_CHANCE, JAM_ROLL_TICKS);
+		log_msg("mutators: Jamming Guns: a player's shot jams the gun %d%% of the time, at most one roll a gun every %d ticks; "
+		        "%d%% of jams also want a drop", JAM_CHANCE, JAM_ROLL_TICKS, JAM_DROP_CHANCE);
 	}
 }
 

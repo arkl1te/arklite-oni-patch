@@ -639,6 +639,17 @@ static u32 g_rec_mseed[2];             /* the seeds its level loaded with (g_mat
 static u8 *g_journal;                 /* per rolling frame: ticks run, rollback depth, flags (1 waited) */
 static u32 g_journal_n;
 static int g_playback;                 /* ARKLITE_PLAYBACK: a recording plays, no network (see "Playback") */
+static int g_pb_started, g_pb_said;    /* playback: its settings in place; its end logged (pb_end) */
+static u32 g_pb_from = 0xffffffffu;    /* playback: the tick it plays at the game's speed from, shown (ARKLITE_PLAYBACK_REALTIME) */
+static u32 g_pb_t0;                     /* playback: GetTickCount at its first tick (pb_end) */
+/* bench.c: -1 no playback, 0 before ARKLITE_PLAYBACK_REALTIME's tick, 1 at the game's speed, 2 ended */
+int net_playback_phase(void)
+{
+	if (!g_playback) return -1;
+	if (g_pb_said) return 2;
+	return g_pb_from != 0xffffffffu && (u32)g_ticks >= g_pb_from;
+}
+static u32 pb_num(const char **s, int hex);
 static void pb_start(void);
 static void pb_fill(void);
 static void pb_end(const char *how);
@@ -4977,6 +4988,7 @@ static void cover_end(const char *why)
 static const char *cover_done(u32 now)
 {
 	if (g_mode != NET_JOIN) return "this PC stopped joining";
+	if (g_playback && (g_pb_said || (u32)g_ticks >= g_pb_from)) return "the recording plays at the game's speed";   /* (shown) */
 	if (live_menu_open()) return "the pause menu opened";
 	if (g_state == S_RUN && !g_joining) return "it was in the game";
 	if (g_state == S_RUN && spect_place(g_slot)) return "it was watching";
@@ -6374,22 +6386,34 @@ static u32 catchup_frame(u32 count, void *actions, u32 *ticks_run, u32 now)
 		hist_request(now);
 	}
 	{
-		static int realtime = -1;
-		if (realtime < 0) { char v[4]; realtime = GetEnvironmentVariableA("ARKLITE_PLAYBACK_REALTIME", v, sizeof v) ? 1 : 0; }
-		g_pb_realtime_n = g_playback && realtime ? (count & 0xffff) : 0xffffffffu;
+		static int read;
+		if (!read) {   /* ARKLITE_PLAYBACK_REALTIME[=<tick>]: at the game's speed (from that tick on, fast before it) */
+			char v[16];
+			const char *c = v;
+			read = 1;
+			if (GetEnvironmentVariableA("ARKLITE_PLAYBACK_REALTIME", v, sizeof v)) g_pb_from = pb_num(&c, 0);
+		}
+		g_pb_realtime_n = g_playback && (u32)g_ticks >= g_pb_from ? (count & 0xffff) : 0xffffffffu;
 	}
 	while (g_ticks < g_hist_n && us(counter() - t0) < CATCHUP_US && g_pb_realtime_n) {
 		u32 n = g_hist_n - g_ticks, before = g_ticks;
 		if (n > 6) n = 6;
+		if (g_pb_realtime_n == 0xffffffffu && (u32)g_ticks < g_pb_from && n > g_pb_from - (u32)g_ticks)
+			n = g_pb_from - (u32)g_ticks;   /* (fast up to the tick, then at the game's speed) */
 		if (n > g_pb_realtime_n) n = g_pb_realtime_n;
 		g_pb_realtime_n = g_pb_realtime_n == 0xffffffffu ? g_pb_realtime_n : g_pb_realtime_n - n;
 		memset(g_frames, 0, sizeof g_frames);
 		for (u32 k = 0; k < n; k++)
 			for (int p = 0; p < PLS; p++) memcpy(g_frames[p][k], g_hist + (g_ticks + k) * HIST_TICK + p * 12, 0x30);
-		if (!g_ticks) lockstep_set_seeds(g_seed, g_local_seed);
+		if (!g_ticks) {
+			lockstep_set_seeds(g_seed, g_local_seed);
+			if (g_playback && !g_pb_t0) g_pb_t0 = GetTickCount();
+		}
 		players_net_frame(g_frames, n);
 		err = run_update(n, &ran);
 		total += ran;
+		if (g_playback && g_pb_t0 && (u32)g_ticks / 2000 != before / 2000)   /* (spans to compare builds or maps by) */
+			log_msg("playback: tick %u at %u ms", g_ticks, GetTickCount() - g_pb_t0);
 		if (g_ticks == before || g_cu_abort) break;
 	}
 	if (g_playback && (g_cu_abort || g_ticks >= g_hist_n)) {   /* came apart, or played to the end: the game stands */
@@ -6574,9 +6598,10 @@ static void rec_write_to(const char *given, const char *why, int send)
  * catch-up runs every recorded tick with every player's recorded input, comparing the state hash
  * every HASH_EVERY ticks with the recording's (catchup_check: a differing one is logged with the
  * characters, the images and the tick ring, as a joiner's would be). No network at all: no socket,
- * no helper, no reports. As fast as it can, or at the game's speed with ARKLITE_PLAYBACK_REALTIME;
- * the game stands at the end, or Oni closes with ARKLITE_PLAYBACK_QUIT. */
-static int g_pb_started, g_pb_said;
+ * no helper, no reports. As fast as it can, or at the game's speed with ARKLITE_PLAYBACK_REALTIME
+ * (=<tick>: fast up to that tick, at the game's speed from there); the loading popup covers the
+ * fast part, the game shows from there and at the end, where it stands, or Oni closes with
+ * ARKLITE_PLAYBACK_QUIT. */
 static struct {
 	u32 level, players, load_players, warm, rules, respawn, items, limit_min, dedicated, ticks, nh, start_tick, start_state;
 	u32 seed[2], mseed[2];
@@ -6741,7 +6766,17 @@ static void pb_end(const char *how)
 {
 	if (g_pb_said) return;
 	g_pb_said = 1;
-	log_msg("playback: %s at tick %u of %u: %u hashes compared, %u differed", how, g_ticks, g_pb.ticks, g_checks, g_bad_checks);
+	{
+		char cam[96];
+		bug_camera_text(cam);
+		log_msg("playback: %s at tick %u of %u: %u hashes compared, %u differed; %s", how, g_ticks, g_pb.ticks, g_checks, g_bad_checks, cam);
+	}
+	{   /* how long the ticks took (as fast as it can, frames drawn between included), and their parts */
+		char ph[640];
+		if (g_pb_t0) log_msg("playback: %u ticks in %u ms", g_ticks, GetTickCount() - g_pb_t0);
+		rollback_phase_text(ph, sizeof ph);
+		if (ph[0]) log_msg("playback: a tick's parts: %s", ph);
+	}
 	{
 		char v[4];
 		if (GetEnvironmentVariableA("ARKLITE_PLAYBACK_QUIT", v, sizeof v)) *(u8 *)0x630ffd = 1;   /* Oni's quit flag */
@@ -8820,17 +8855,18 @@ void net_server_quit(void)
  * each arrives once, in order); a call it refuses gets a server line back, to that player alone.
  * The state goes to every joiner in a PKT_VOTE every VOTE_SEND_MS, with that joiner's own answer.
  * Every PC says the start and the result in the chat and plays the sounds itself, from the state
- * it sees (vote_note): console_locked as a vote starts (a loud triple buzz no match plays: the
- * objective_prompt chime used up to 0.6.0 was easy to miss, 2026-11-16; level0's SNDD in retail
- * and AE), objective_complete when it passes (not objective_new: the match's start and end have
- * it), door_fail
- * (Oni's "that door is locked", ONcEventSound_DoorAction_Fail) when it fails. Votes are never game
- * state: nothing goes into the inputs.
+ * it sees (vote_note), all three a console's own sounds (OniFoxed OT_Console.c; level0's SNDDs in
+ * retail and AE): console_already_used as a vote starts (two loud buzzes no match plays: the
+ * objective_prompt chime used up to 0.6.0 was easy to miss, 2026-11-16), console_activate (access
+ * granted) when it passes, console_locked (a beep and a voice: "access denied") when it fails. Up to
+ * 2026-11-19 the start played console_locked and a pass objective_complete, so a vote that passed
+ * at once said "access denied". Votes are never game state: nothing goes into the inputs.
  *
  * Who votes (vote_eligible): the players in the game; not spectators, a dedicated server's own
  * player or a PC still joining. A call counts as its caller's Yes, and an answer can be changed
- * while the vote is on. It ends after VOTE_MS, or once every player answered; it passes when at
- * least half of the players answered Yes (yes * 2 >= players, those still playing at the end).
+ * while the vote is on. It ends after VOTE_MS, or once every player answered; it passes when more
+ * than half of the players answered Yes (yes * 2 > players, those still playing at the end; Quake
+ * 3's rule). Up to 2026-11-19 half was enough, so with 2 players the caller's Yes alone passed it.
  * Its command follows VOTE_ACT_MS later.
  *
  * Player numbers (/players, /callvote kick <number>): pid_of gives each internet address the next
@@ -8953,10 +8989,10 @@ static void vote_note(u32 id, u32 state, u32 kind, const char *caller, const cha
 	vote_what(what, sizeof what, kind, subject, reason);
 	if (state == NET_VOTE_OPEN) {
 		fmt(t, "%s called a vote: %s. Y: yes, N: no", caller, what);
-		mp_sound("console_locked");
+		mp_sound("console_already_used");
 	} else {
 		fmt(t, state == NET_VOTE_PASSED ? "Vote passed: %s" : "Vote failed: %s", what);
-		mp_sound(state == NET_VOTE_PASSED ? "objective_complete" : "door_fail");
+		mp_sound(state == NET_VOTE_PASSED ? "console_activate" : "console_locked");
 		g_vn_result_at = GetTickCount() | 1;
 	}
 	t[CHAT_MAX - 1] = 0;
@@ -9295,7 +9331,7 @@ static int vote_frame(u32 now)
 	if (g_vote.state == NET_VOTE_OPEN) {
 		vote_count(&yes, &no, &voters);
 		if ((int)(now - g_vote.ends) >= 0 || yes + no >= voters) {
-			int pass = voters && yes * 2 >= voters;
+			int pass = voters && yes * 2 > voters;
 			char what[160];
 			g_vote.final[0] = yes, g_vote.final[1] = no, g_vote.final[2] = voters;
 			g_vote.state = pass ? NET_VOTE_PASSED : NET_VOTE_FAILED;

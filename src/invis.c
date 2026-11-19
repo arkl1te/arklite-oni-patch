@@ -1,5 +1,6 @@
-/* The phase cloak in network games: the cloaked player sees themselves barely there (the body at
- * the opacity knob, 5% by default, with its outline and tones; no shimmer); every other player sees nothing of them at all, except the shimmer
+/* The phase cloak in network games: the cloaked player sees themselves faintly (the body's
+ * nearest surfaces at 30%, no shimmer; Arklite.ini [multiplayer] cloak_preset=1: the filter
+ * chain's preset instead, 5% with its outline and tones); every other player sees nothing of them at all, except the shimmer
  * flashing up when the cloaked player lands a blow. Being hit shows nothing.
  *
  * Oni (ONrCharacter_Invis_Update 0x4ef530, the character draw around 0x4e1d00 with ESI the active
@@ -17,19 +18,24 @@
  *
  * In a network game, for a character that isn't the one this screen belongs to (gs+0xac during
  * the display: this PC's player, or the one a spectator follows; net.c view_character):
- *   - body and shadow alpha are 0 while the cloak is on (invis_active and more than 120 ticks
- *     left); the last 120 ticks fade the body back in as Oni does.
+ *   - body and shadow fade out as in Oni when the cloak comes on (1 to 0 in ~2 s; instantly 0 up
+ *     to 2026-11-19, user request), then stay at 0 while the cloak is on (invis_active and more
+ *     than 120 ticks left): Oni's alpha, but never back up (pickup_fade: the lowest seen, so a
+ *     blow's lift to 0.6 shows nothing); the last 120 ticks fade the body back in as Oni does.
+ *     No shimmer in that fade (only blows show it, below).
  *   - the shimmer is drawn only after this character attacked: the two attacker sites are calls
  *     that note the game tick of the blow (and answer invis_active as before, so the game itself
  *     does what it did). Its opacity is the one Oni would have given the body for the blow: 0.6,
  *     fading 0.0085 a tick, gone ~71 ticks (1.2 s) later (Oni's own shimmer never passes 0.22).
  * For the character this screen belongs to (in a network game, not a spectator's screen): the
- * body and shadow alpha are at least the opacity knob while invis_active (Oni's fade from 1 at
+ * body alpha is at least the opacity knob while invis_active (Oni's fade from 1 at
  * pickup stops there, and its fade back in at the end starts once it passes it; a blow's 0.6 still
- * shows; 0.5 up to 2026-11-19, 0.05 now), and
+ * shows; 0.3 (0.5 until 2026-11-19), or the opacity knob, 0.05, with cloak_preset; the shadow
+ * keeps Oni's alpha, so it fades out completely, user request 2026-11-19), and
  * the shimmer isn't drawn (user request, 2026-11-13). How that body is drawn (user request,
  * 2026-11-14: only its front surfaces, and the textures' white showing) is "The see-through body".
- * Off the network everything is as in Oni (single player's cloaked ninjas keep their shimmer and
+ * Off the network everything is as in Oni (unless Arklite.ini [singleplayer] use_new_cloak_shader=1:
+ * then the player's own body is drawn as above there too; single player's cloaked ninjas keep their shimmer and
  * flashes), and so it is for a spectator (/spectate, net_watching): they take no part in the
  * fight, so they see every cloaked player as Oni draws them, the fading body and the shimmer, and
  * their names. Drawing only: the noted ticks are Arklite's, not game state, so nothing can desync
@@ -222,6 +228,13 @@ static void order_load(const char *v)
 }
 #define FX(i)                 (g_fx[i].value)
 static int g_fx_loaded, g_fx_preview;
+/* The look of the cloaked player's own body (user, 2026-11-19): plain, its nearest surfaces at
+ * PLAIN_OPACITY (as on 2026-11-14 before the filters), unless Arklite.ini [multiplayer]
+ * cloak_preset=1 (no menu shows it) or the O menu is built in: then the filter chain, with g_fx */
+#define PLAIN_OPACITY         0.3f   /* (user, 2026-11-19; 0.5 before) */
+static int g_fx_chain;
+static int g_single_player;   /* Arklite.ini [singleplayer] use_new_cloak_shader=1: self_view off the network too */
+static float self_opacity(void) { return g_fx_chain ? FX(FX_OPACITY) : PLAIN_OPACITY; }
 
 int invis_fx_count(void) { return FX_COUNT; }
 InvisFx *invis_fx(int i) { return i >= 0 && i < FX_COUNT ? &g_fx[i] : 0; }
@@ -252,6 +265,10 @@ static void fx_load(void)
 	if (g_fx_loaded) return;
 	g_fx_loaded = 1;
 	invis_fx_reset();
+	g_fx_chain = CLOAK_FX_MENU || GetPrivateProfileIntA("multiplayer", "cloak_preset", 0, ini_path()) != 0;
+	g_single_player = GetPrivateProfileIntA("singleplayer", "use_new_cloak_shader", 0, ini_path()) != 0;
+	if (g_single_player) log_msg("invis: [singleplayer] use_new_cloak_shader=1: the player's own cloaked look off the network too (single player, local Custom Game)");
+	log_msg("invis: the cloaked player's own body: %s", g_fx_chain ? "the filter chain's preset (cloak_preset=1)" : "plain, at 30%");
 	if (!CLOAK_FX_MENU) return;   /* (no menu: the defaults, whatever an older Arklite.ini kept) */
 	for (int i = 0; i < FX_COUNT; i++) {
 		float f;
@@ -332,11 +349,13 @@ static int as_stock(u8 *c)
 	return !net_active() || !gs || c == GS_PLAYER(gs) || net_watching() != -1;
 }
 
-/* The character this screen belongs to, in a network game (not on a spectator's screen) */
+/* The character this screen belongs to, in a network game (not on a spectator's screen); off the
+ * network too with [singleplayer] use_new_cloak_shader=1 (user request, 2026-11-19: off by default) */
 static int self_view(u8 *c)
 {
 	u8 *gs = ONgGameState;
-	return net_active() && gs && c == GS_PLAYER(gs) && net_watching() == -1;
+	if (!gs || c != GS_PLAYER(gs)) return 0;
+	return net_active() ? net_watching() == -1 : g_single_player;
 }
 
 int invis_hidden(u8 *c)
@@ -348,16 +367,56 @@ int invis_hidden(u8 *c)
 	return a && ACT_INVIS_ACTIVE(a) && ACT_INVIS_ALPHA(a) < 1.0f;
 }
 
+/* What others see of a cloak coming on: Oni's alpha a, but never back up (a blow lifts Oni's to
+ * 0.6), so the lowest seen since the cloak came on. A character unseen for more than 120 ticks
+ * (the cloak's end lasts that long) or on a new level starts again from a. Drawing only. */
+#define FADE_SLOTS 16
+static struct { u8 *chr; u32 tick; float low; } g_fade[FADE_SLOTS];
+static u32 g_fade_next;
+
+static float pickup_fade(u8 *c, float a)
+{
+	u8 *gs = ONgGameState;
+	u32 now = gs ? GS_TICK(gs) : 0, i;
+	for (i = 0; i < FADE_SLOTS && g_fade[i].chr != c; i++) {}
+	if (i == FADE_SLOTS) {
+		i = g_fade_next++ % FADE_SLOTS;
+		g_fade[i].chr = c;
+		g_fade[i].low = a;
+	} else if (now < g_fade[i].tick || now - g_fade[i].tick > INVIS_FADE_IN_TICKS) g_fade[i].low = a;
+	if (a < g_fade[i].low) g_fade[i].low = a;
+	g_fade[i].tick = now;
+	return g_fade[i].low;
+}
+
+static void pickup_fade_forget(u8 *c)
+{
+	for (u32 i = 0; i < FADE_SLOTS; i++)
+		if (g_fade[i].chr == c) g_fade[i].chr = 0;
+}
+
 /* Body and shadow alpha (as float bits) */
 u32 invis_body_alpha(u8 *act, u8 *c)
 {
 	u32 bits;
 	float a = ACT_INVIS_ALPHA(act);
+	if (ACT_INVIS_ACTIVE(act) && CHR_INVIS_LEFT(c) > INVIS_FADE_IN_TICKS && !as_stock(c)) a = pickup_fade(c, a);
+	else pickup_fade_forget(c);
 	if (ACT_INVIS_ACTIVE(act)) {
-		if (CHR_INVIS_LEFT(c) > INVIS_FADE_IN_TICKS && !as_stock(c)) return 0;
-		if (a < FX(FX_OPACITY) && self_view(c)) a = FX(FX_OPACITY);
+		if (a < self_opacity() && self_view(c)) a = self_opacity();
 	}
 	memcpy(&bits, &a, 4);
+	return bits;
+}
+
+/* Shadow alpha (as float bits): as the body's, but for self_view Oni's own alpha, not floored at
+ * the body's opacity, so the shadow fades out completely (1 to 0 in ~2 s after pickup) and back in
+ * when the cloak wears off, as in stock Oni (user request, 2026-11-19) */
+u32 invis_shadow_alpha(u8 *act, u8 *c)
+{
+	u32 bits;
+	if (!ACT_INVIS_ACTIVE(act) || !self_view(c)) return invis_body_alpha(act, c);
+	memcpy(&bits, &ACT_INVIS_ALPHA(act), 4);
 	return bits;
 }
 
@@ -525,6 +584,8 @@ static void ONI_FC body_draw(void *body, void *extra, void *matrices, u32 parts,
 
 /* ---- The filter chain: water, stencil tones, outline, color fringe, opacity (user requests,
  * 2026-11-14) ------------------------------------------------------------------------------------- *
+ * Only with Arklite.ini [multiplayer] cloak_preset=1 (or the O menu built in); otherwise the body is
+ * the plain ghost at 30% (ghost_plain), as before the filters (user, 2026-11-19).
  * The body is drawn into a layer of its own (a framebuffer object the size of Oni's viewport, with
  * a color and a depth texture), and the filters run over that layer one after another in the order
  * the O menu sets (g_order), each a full-screen pass from one color texture into the other; then
@@ -895,7 +956,7 @@ static int fx_ready(void)
 	fx.f_radius = fx.GetUniformLocation(fx.filter, "u_radius");
 	fx.f_color = fx.GetUniformLocation(fx.filter, "u_color");
 	fx.f_bg = fx.GetUniformLocation(fx.filter, "u_bg");
-	log_msg("invis: the cloaked player's own body goes through its filter chain (O: the effect's menu)");
+	log_msg("invis: OpenGL shaders and framebuffer objects ready (force fields%s)", g_fx_chain ? ", the cloak's filter chain" : "");
 	return 1;
 }
 
@@ -1032,8 +1093,8 @@ static void ghost_draw(void)
 	M3rDraw_State_SetInt(DRAW_CONSTANT_BLEND, 0);
 	M3rDraw_State_SetInt(DRAW_ZWRITE, 1);
 	M3rGeom_State_Commit();
-	if (fx_ready()) fx.GetIntegerv(GL_VIEWPORT, vp);
-	if (!fx.body || !layer_ready(vp[2], vp[3])) {
+	if (g_fx_chain && fx_ready()) fx.GetIntegerv(GL_VIEWPORT, vp);
+	if (!g_fx_chain || !fx.body || !layer_ready(vp[2], vp[3])) {   /* (fx_ready: force fields' too) */
 		ghost_plain(alpha);
 		M3rGeom_State_Pop();
 		M3rGeom_State_Commit();
@@ -1275,6 +1336,21 @@ __attribute__((naked)) static void body_alpha(void)   /* edx = alpha */
 		"ret");
 }
 
+__attribute__((naked)) static void shadow_alpha(void)   /* edx = alpha */
+{
+	__asm__ volatile(
+		"pushl %eax\n\t"
+		"pushl %ecx\n\t"
+		"pushl %ebp\n\t"
+		"pushl %esi\n\t"
+		"call _invis_shadow_alpha\n\t"
+		"movl %eax, %edx\n\t"
+		"addl $8, %esp\n\t"
+		"popl %ecx\n\t"
+		"popl %eax\n\t"
+		"ret");
+}
+
 __attribute__((naked)) static void shimmer_read(void)   /* al = draw the shimmer */
 {
 	__asm__ volatile(
@@ -1405,7 +1481,7 @@ void invis_install(void)
 		return;
 	}
 	call_at(ONcDraw_BodyAlpha, body_alpha, 6);
-	call_at(ONcDraw_ShadowAlpha, body_alpha, 6);
+	call_at(ONcDraw_ShadowAlpha, shadow_alpha, 6);
 	call_at(ONcDraw_InvisRead, shimmer_read, 6);
 	call_at(ONcDraw_InvisAmount, shimmer_amount, 12);
 	call_at(ONcMelee_Attacker, melee_attacker, 6);
@@ -1440,5 +1516,5 @@ void invis_install(void)
 		}
 		if (!ok) log_msg("invis: Oni's body draw or display calls changed: the cloaked player's own body is drawn as in Oni");
 	}
-	log_msg("invis: in network games a cloaked player sees themselves half see-through, others see them only as a shimmer when they strike");
+	log_msg("invis: in network games a cloaked player sees themselves faintly (30 percent), others see them only as a shimmer when they strike");
 }

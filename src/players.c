@@ -542,8 +542,8 @@ static void emote_tick(int who, u32 word)
 
 static void spectate_tick(int who, u32 word);
 
-/* The Daodan mutator (mp_rules.c): when a player's super amount (+0x1668) passes Muro's shield
- * threshold (0.5) either way. Logging only, at most once a tick per player. */
+/* The Daodan mutator (mp_rules.c): when a player's Daodan power (super amount +0x1668 over 0: the
+ * glow and the stronger blows) starts or ends. Logging only, at most once a tick per player. */
 static void daodan_log(int who)
 {
 	static u8 on[PL];
@@ -553,9 +553,9 @@ static void daodan_log(int who)
 	if (!c || !net_mutator_daodan() || at[who] == tick) return;
 	at[who] = tick;
 	float super = *(float *)(c + 0x1668);
-	if ((super > 0.5f) != on[who]) {
-		on[who] = super > 0.5f;
-		log_msg("players: player %d's Daodan shield %s (health %d of %d, tick %u)", who + 1, on[who] ? "on" : "off",
+	if ((super > 0.0f) != on[who]) {
+		on[who] = super > 0.0f;
+		log_msg("players: player %d's Daodan power %s (health %d of %d, tick %u)", who + 1, on[who] ? "on" : "off",
 		        *(int *)(c + 0x38), *(int *)(c + 0x3c), tick);
 	}
 }
@@ -888,6 +888,7 @@ static u32 ONI_FC spawn_players(u32 type, void *callback, u32 param)
 	if (g_spawn_seed_due || g_next_spawn_seed_set) g_spawn_seed = choose_spawn_seed();
 	OBJrEnumerate(OBJcType_CHAR, collect_spawn, 0);
 	mp_rules_level();   /* multiplayer_map() is known now, and no character is made yet */
+	weapon_check_level();
 	char_menu_level_spawns();   /* F2 on by default on a multiplayer map */
 	g_ntaken = 0;
 	for (int s = 1; s < PL; s++) g_pl[s] = -1;

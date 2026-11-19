@@ -272,12 +272,12 @@ void net_menu_local(void);     /* Play (a mode set at startup stays) */
 void net_menu_host(u32 port, const char *name, u32 max_players, u32 time_limit, int score_limit, u32 char_rules);
 /* The host's mutators (the Host page's Mutators; protocol 21: LOBBY carries them). The first three
  * let players pick characters that are otherwise left out; Daodan gives every character Konoko's
- * and Muro's overhealing powers. */
+ * overhealing power (Muro's glow on men is only its look). */
 #define NET_CHARS_MUTANT_MURO 1   /* mutantmuro */
 #define NET_CHARS_SHINATAMA   2   /* SH_generic, SH_dream_lab and Hasegawa (Shinzom_generic) */
 #define NET_CHARS_MINI_STRIKER 4  /* striker_dream_lab, the half-size striker */
 #define NET_CHARS_ALL         7
-#define NET_MUT_DAODAN        8   /* every class superHypo and superShield (mp_rules.c) */
+#define NET_MUT_DAODAN        8   /* every class Konoko's superHypo 1, superShield 0 (mp_rules.c) */
 #define NET_MUT_NO_WEAPONS    16  /* no weapons in the map, none at the spawns (mutators.c) */
 #define NET_MUT_FAST_SCREAMER 32  /* the Screaming Cell flies twice as fast */
 #define NET_MUT_FAST_PLASMA   64  /* the Plasma Rifle fires twice as fast */
@@ -417,7 +417,7 @@ enum {
 #define NETBAD_LAST NETBAD_SPECTATE
 const char *net_kick_note(void);   /* joiner: why the server removed this PC, and for how long ("" none) */
 /* Votes (net.c "Votes"): /callvote map <name>, /callvote kick <player> [reason], /callvote restart; the host runs them. A
- * vote lasts NET_VOTE_SECONDS; it passes when at least half of the players answered Yes, and its
+ * vote lasts NET_VOTE_SECONDS; it passes when more than half of the players answered Yes, and its
  * command follows 3 s later. Only players vote, never spectators. */
 #define NET_VOTE_SECONDS 30
 enum { NET_VOTE_NONE, NET_VOTE_OPEN, NET_VOTE_PASSED, NET_VOTE_FAILED };
@@ -819,6 +819,10 @@ u16  live_menu_modal(u32 id, WMtWindow *parent, WMtDialogProc proc, u32 param, u
 /* ---- vertex_light.c ---------------------------------------------------------------------- */
 
 void bench_frame(void);           /* every frame: ARKLITE_BENCH timing (bench.c) */
+void weapon_check_level(void);    /* each level: weapon classes without a model, by file (weapon_check.c) */
+void weapon_check_frame(void);    /* every frame: a weapon on the ground whose class lost its model */
+void bench_present(void);         /* after each SwapBuffers: the frame's drawing time (bench.c) */
+int  net_playback_phase(void);    /* -1 no playback, 0 fast part, 1 at the game's speed, 2 ended (net.c) */
 void vertex_light_level_end(void);   /* from any level unload */
 void vertex_light_install(void);     /* flickering lights' ambients play only while they fail */
 void vertex_light_frame(void);   /* every frame: animated corners of a custom level (vertexlight.bin) */
@@ -851,6 +855,7 @@ void lagometer_draw(int width, int height);                         /* mp_hud.c 
 void net_ping_text(char *out, u32 size);   /* net.c: each other player's ping, for the Lag-o-meter */
 const char *bug_report(const char *text);   /* bug.c: /bug <text>; returns what the chat says */
 void bug_frame(void);                     /* lockstep.c, every level frame */
+void bug_camera_text(char *out);          /* bug.c: "camera at X Y Z, looking X Y Z (the view x1000), F degrees high" (96 bytes), or "no camera" */
 void lagometer_note(char *out, u32 size); /* lagometer.c: its last samples as text (bug.c) */
 int  net_rec_snapshot(const char *path);  /* net.c: the session's recording so far, 0 if none */
 void screenshot_request_to(const char *stem);   /* screenshot.c: the next frame as stem.png */
@@ -901,7 +906,8 @@ int  invis_cloak_me(void);              /* off the network: this PC's player clo
 int  float_parse(const char *s, float *out);           /* 1 if s is a number */
 void float_text(char *out, u32 size, float v, int decimals);
 /* fx_menu.c: O opens the cloak effect's menu on the right of the screen. Off (0, user, 2026-11-19):
- * O does nothing and Arklite.ini [cloak_fx] isn't read, so everyone gets invis.c's defaults */
+ * O does nothing and Arklite.ini [cloak_fx] isn't read, so the filter chain (only with [multiplayer]
+ * cloak_preset=1) gets invis.c's defaults, the user's preset. 1 also turns the chain on */
 #define CLOAK_FX_MENU 0
 void fx_menu_frame(void);               /* every frame after the update (live_menu.c) */
 void fx_menu_draw(int width, int height);   /* inside mp_hud.c's text setup */

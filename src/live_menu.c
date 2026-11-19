@@ -347,6 +347,7 @@ static void main_loop_sound(void)
 	text_frame();
 	vertex_light_frame();
 	spin_particle_frame();
+	weapon_check_frame();
 	bench_frame();
 	if (net_dedicated_host()) g_pending = g_console.pending = 0;   /* a dedicated server shows no dialog: nobody would close it */
 	if (g_pending) {

@@ -93,13 +93,13 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `mutant_muro` | 0 | The Mutant Muro mutator: 1, players may pick Mutant Muro in the character menu (F2); 0, he's left out. The Host page's Mutators save it, and joiners get the host's |
 | | `shinatama_hasegawa` | 0 | The same for Shinatama and Hasegawa |
 | | `mini_striker` | 0 | The same for Mini Striker (striker_dream_lab, the half-size Striker variation) |
-| | `daodan` | 0 | The Daodan for All mutator: every character, overhealed, gets Konoko's Daodan power (stronger blows) and Muro's shield, shown as Daodan particles (Konoko's on women, Muro's on men) instead of the shield texture |
+| | `daodan` | 0 | The Daodan for All mutator: every character, overhealed, gets Konoko's Daodan power (stronger blows) and no immunity, the same rules as Konoko's for every character, shown as Daodan particles (Konoko's on women, Muro's on men) |
 | | `no_weapons` | 0 | The No Weapons mutator: the map's weapons and the players' spawn weapons are left out (power-ups stay) |
 | | `fast_screamer` | 0 | The Fast Screamer mutator: the Screaming Cannon's cell flies twice as fast |
 | | `fast_plasma` | 0 | The Fast Plasma mutator: the Plasma Rifle fires twice as fast |
 | | `bombs` | 0 | The Bombs For Days mutator: everyone dies as the Mad Bomber does, a blast three seconds later. With or without it, a bomb's body vanishes when it goes off and leaves a black scorch |
 | | `fast_ball` | 0 | The Fast Ball mutator: the Super Ball Gun's ball flies twice as fast |
-| | `jamming_guns` | 0 | The Jamming Guns mutator: every 0.3 seconds a gun a player holds has a 5% chance to jam at its next shot (that shot isn't fired, its round stays). A jammed gun clicks instead of firing until it has been reloaded 1 to 3 times and dropped 0 or 1 times (a drop counts when it lands), in any order; a gun that can't be reloaded wants 1 to 3 drops instead. Reloading a jammed gun only clears the jam: it works with a full magazine and without a clip, uses no clip and adds no rounds. The screen says what's left. The jam stays with the gun, whoever picks it up |
+| | `jamming_guns` | 0 | The Jamming Guns mutator: a player's shot jams the gun 5% of the time (that shot isn't fired, its round stays), but a gun rolls at most once every 0.3 seconds, so a fast gun jams no more often per second of firing than one firing every 0.3 seconds, and holding a gun without firing it never counts. A jammed gun clicks instead of firing until it has been reloaded 1 to 3 times and, for 1 jam in 10, dropped once (a drop counts when it lands), in any order; a gun that can't be reloaded wants 1 to 3 drops instead. Reloading a jammed gun only clears the jam: it works with a full magazine and without a clip, uses no clip and adds no rounds. The screen says what's left. The jam stays with the gun, whoever picks it up |
 | | `one_character` | 0 | The One Character mutator: each match picks one character at random (the F2 menu's game characters and the mods Arklite knows, those the other mutators allow), and everyone plays it from the match's start; the F2 menu shows only it, and you pick among its variations, as usual for your next respawn. The warm-up is free |
 | | `motd` | (empty) | The message of the day: a server line in the chat ("Server MOTD: ...") for each player who enters the game, only them. The host sees it too: a listen host in its chat when the first warm-up starts, a dedicated server on its console at the start and in `status`. The Host page's field saves it; up to 114 characters here, as many as fit in the field there. Empty: none |
 | `[servers]` | `count`, `1`, `2`, ... | | The Join list's saved addresses (`<ip or name>[:port]`), kept by + and - |
@@ -107,7 +107,9 @@ The Options dialog writes `[options]` and `[volume]`; `[players]` and `[multipla
 | | `item_respawn` | 30 | Seconds until a taken weapon or power-up comes back, for items the level doesn't set; 0: never (in a network game, the host's). Force fields and phase cloaks always take 60 |
 | | `characters` | every character loaded | The **F2** menu's characters, when you want your own list instead of every character in the game and your mods: class names separated by commas, e.g. `konoko_generic,griffin_generic,ninja_med_1` (at most 96). To pick a character's variations yourself, separate them with `\|`: `konoko_generic\|k3\|k4_A` |
 | | `name` | Player | Your name in multiplayer games. You can also change it in the **F2** menu, which saves it here |
+| | `cloak_preset` | 0 | 1: a phase cloak shows its wearer the stylized look (5%, ripple, tones, outline, fringes) on their own screen instead of the plain 30% body (see "Phase cloak") |
 | `[reports]` | `send` | 1 | 0: never send problem reports (see "Problem reports" under Troubleshooting) |
+| `[singleplayer]` | `use_new_cloak_shader` | 0 | 1: a phase cloak shows its wearer the same look off the network (single player, local Custom Game) as in network games, instead of Oni's shimmer |
 | `[chat]` | `fade` | 10 | Seconds a chat message stays on screen while the chat is closed; 0: they stay |
 | `[photo]` | `speed` | 100 | Photo mode's flight speed in hundredths (100 = 1.00 times, 160 units a second), 10–2000 (the panel saves it) |
 | | `stop_at_walls`, `pause_sounds` | 1 | Photo mode's panel toggles (it saves them) |
@@ -129,7 +131,7 @@ Environment variables, for testing (set them before starting `Oni.exe`):
 | `ARKLITE_DECOR_FIX=0` | Decorative particles that only look draw from the game tick's shared effects random numbers again, as before 0.5.0 (two PCs whose particle quality differs then desync at once), for comparing |
 | `ARKLITE_MOTION_BLUR_FIX=0` | Motion blur afterimages draw with depth writes, as stock Oni does, for comparing |
 | `ARKLITE_SPRITE_ASPECT=0` | Screen-facing sprites (aiming rings, glows, sky stars) are sized for 4:3 as stock Oni does, so they stretch on wide screens, for comparing |
-| `ARKLITE_BENCH=<seconds>` | Once a level has run for 5 seconds, times every frame for that long, logs the frame times and closes Oni. `tools/oni-bench.sh` runs it hands off in a private KWin |
+| `ARKLITE_BENCH=<seconds>` | Once a level has run for 5 seconds, times every frame for that long, logs the frame times and closes Oni. `tools/oni-bench.sh` runs it hands off in a private KWin. Each frame's drawing (from the update's end to the end of SwapBuffers, `draws`) is timed too, and each second's means logged; a frame cap or vsync hides both (Mesa: `vblank_mode=0`). With `ARKLITE_PLAYBACK` it times the part played at the game's speed instead, to the recording's end. Problem reports are off for the run, crashes included |
 
 On Windows: `cd "C:\Program Files (x86)\Oni\AE"`, `set ARKLITE_RECORD=test.akr`, `Oni.exe`.
 
@@ -195,12 +197,13 @@ enters or leaves the game. With the chat closed, messages stay on screen for 10 
 | `\/text` | Sends "/text" as a message, not a command |
 
 **Votes**: `/callvote map`, `/callvote kick` and `/callvote restart` start a 30-second vote on every screen, with a loud
-buzz (the locked-console sound) and on a dark panel, its first line bigger: what it's about ("Vote: Restart match"), the Yes and No counts and the seconds left ("Yes:1 No:0 (30s)"). Every answer plays a short blip. Answer with **Y** or
+buzz (the used-console sound) and on a dark panel, its first line bigger: what it's about ("Vote: Restart match"), the Yes and No counts and the seconds left ("Yes:1 No:0 (30s)"). Every answer plays a short blip. Answer with **Y** or
 **N** (while the chat is closed), `/yes` or `/no`, or the Yes and No buttons under the F1
 Scoreboard; you can change your answer while it's on, and calling a vote counts as your Yes. Only
 players vote, never spectators. It ends after 30 seconds, or as soon as everyone answered, and
-passes when at least half of the players answered Yes: "Vote passed" with the objective-complete
-sound, its command 3 seconds later; or "Vote failed" with the locked-door sound. One vote at a
+passes when more than half of the players answered Yes (with 2 players, both): "Vote passed" with
+the console's access-granted sound, its command 3 seconds later; or "Vote failed" with its
+"access denied". One vote at a
 time. A passed map vote changes the map for everyone without hosting again: every PC reloads
 into the new map (a player without it, or with another version, downloads the files that
 differ), and the warm-up starts once they're all back. A passed kick keeps the player out for 5
@@ -493,13 +496,16 @@ On a **multiplayer map** (two or more IsPlayer characters, see below), also:
   still showing in the second after its line ended counts too. Other text on screen (`message`
   lines, other subtitles) stays. Without Arklite the game doesn't know these commands, and the
   script stops there with an error.
-- **Phase cloak**: a player who picks up invisibility sees themselves barely there (5%, without
-  the shimmer): only the body's near side, in its own colors, and players or items behind it show
-  through; a fast ripple (a 2-second loop) makes it waver as if seen under water, what's behind it
-  seen through it slightly zoomed in (only inside the body), its shading in soft tones, a faint
-  white outline and color fringes at its edges. Only the cloaked player sees this, on their own
-  screen. The look needs a graphics driver with OpenGL 2.0 shaders and framebuffer objects;
-  without them the body is simply 5% see-through. Everyone else sees nothing of them: no body, shadow or name, not even
+- **Phase cloak**: a player who picks up invisibility sees themselves faintly (30% opaque,
+  without the shimmer): only the body's near side, in its own colors, and players or items behind
+  it show through. Their shadow fades out completely, as in Oni. Only the cloaked player sees this,
+  on their own screen, and only in network games (`use_new_cloak_shader=1` in `[singleplayer]`: in
+  single player and local Custom Game too; otherwise the cloak looks as in Oni there). With `cloak_preset=1`
+  in `[multiplayer]` they see a stylized look instead: barely there (5%), a fast ripple (a 2-second
+  loop) making it waver as if seen under water, what's behind it seen through it slightly zoomed in
+  (only inside the body), its shading in soft tones, a faint white outline and color fringes at
+  its edges. That look needs a graphics driver with OpenGL 2.0 shaders and framebuffer objects;
+  without them the body is simply 5% see-through. Everyone else sees them fade out as in Oni (about 2 seconds, body and shadow, without the shimmer), then nothing of them: no body, shadow or name, not even
   when they're hit. Only when they land a blow does their shimmer flash up for a moment and fade.
   Spectators (/spectate) see every cloaked player as Oni shows them, the fading body and the
   shimmer, with their name. When the cloak wears off the character is back to normal: in stock
@@ -565,12 +571,19 @@ with the same game files:
 ```sh
 cd "/path/to/Oni/AE"
 ARKLITE_AUTOSTART=<the map> ARKLITE_PLAYBACK=<file>.akn wine Oni.exe   # as fast as it can, then the game stands
-# ARKLITE_PLAYBACK_REALTIME=1: at the game's speed;  ARKLITE_PLAYBACK_QUIT=1: Oni closes at the end
+# ARKLITE_PLAYBACK_REALTIME=1: at the game's speed;  =<tick>: fast up to that tick, at the game's speed from there
+# ARKLITE_PLAYBACK_QUIT=1: Oni closes at the end
 ```
 
 It runs the game the way a player joining a game in progress catches up, with no network at all, and the log
-ends with `playback: played to the end ... N hashes compared, 0 differed`, or `came apart at tick T` with the
-characters that differ. `tools/akn.py FILE` shows a recording; `tools/akn.py A B` compares two PCs' recordings
+ends with `playback: played to the end ... N hashes compared, 0 differed; camera at X Y Z, looking ...`, or
+`came apart at tick T` with the characters that differ, then how long the ticks took (`playback: N ticks in M
+ms`, with `playback: tick T at M ms` every 2000 ticks before it, to compare two builds or two builds of a map over
+the same ticks). A map rebuilt with even a slightly different geometry plays differently, so a recording made on
+one build of a map comes apart on another (Condemned before and after Catwalk's coordinate snap, 2026-11-19). The loading popup covers the fast part; the game shows
+from the realtime tick on and stands at the end, where F12 saves it. Every F12 screenshot's log line says where
+the camera was, where it looked and the field of view, as does a `/bug` note, so a view can be compared with the
+map's geometry. `tools/akn.py FILE` shows a recording; `tools/akn.py A B` compares two PCs' recordings
 of one game.
 
 ## Network test
@@ -754,6 +767,10 @@ seconds after it stops hosting, and logs only counts.
 - **Oni crashes**: the end of the newest `AE/logs/Arklite_<date>_<time>.log` has the crash registers and stack. Include
   it, and the version on its first line, when you report the problem. A register that points into one of Oni's small
   blocks gets a line saying when and from where that block was allocated and freed.
+- **Weapons without a model**: each level's load logs `weapons: N weapon classes, all with a model (by file: ...)`, or
+  names each ONWC whose model is missing and the file it came from (Oni crashes at `0x41f8b3` drawing the glow of
+  one lying on the ground). If a class loses its model after the load, the first frame a weapon of it lies on the
+  ground logs `weapons: weapon N on the ground at tick T: its ONWC ... has no model now` before the crash.
 - **Memory guard**: every free of Oni's small blocks (up to 1016 bytes) is checked first. A block that is already free,
   or whose end was written over, isn't freed: the log gets `heap: ... can't be freed: ...` with the code freeing it and
   the block's last allocation and free (the tick, and whether it was a tick, a rollback's re-run, outside a tick or
@@ -766,7 +783,7 @@ seconds after it stops hosting, and logs only counts.
 - **Problem reports**: Arklite sends one by itself, once per game for each kind, when a network game goes out of sync
   (the log, `Arklite-desync-*.bin`, `Arklite-desyncticks-*.bin` and `Arklite-rollbackcheck_*.txt`), when a player stops
   answering or the host is lost (the log), when the memory guard stops a bad free (the log), and after a crash (that
-  run's log, at the next start). It goes to the Arklite
+  run's log, at the next start; not for runs with `ARKLITE_PLAYBACK` or `ARKLITE_BENCH` set). It goes to the Arklite
   helper (`[net] helper`, TCP on the same port), packed (LZ4): a desync's is about 1 MB. Before anything leaves your PC,
   internet addresses become `[address]`, the server's name `[server name]`, and paths are cut to the game's folder
   (`<Oni>\`) and Arklite.dll's (`<Arklite>\`): any other folder becomes `[path]\`. Players' names and chat stay, so the

@@ -2,7 +2,9 @@
  *   - the frame on the screen (screenshot.c, saved as <log>.bug<n>.png: what Oni drew, which a
  *     desktop capture of a fullscreen game often misses);
  *   - a note (<log>.bug<n>.txt): the player's words, the nickname, the time, the session, the tick,
- *     every other player's ping and the Lag-o-meter's last 128 frames and input packets;
+ *     where the camera was and where it looked (to put a test camera there: walls missing from a
+ *     view, 2026-11-19), every other player's ping and the Lag-o-meter's last 128 frames and input
+ *     packets;
  *   - the session's recording so far (<log>.bug<n>.akn, net.c: playable with ARKLITE_PLAYBACK);
  *   - the log and the machine and setup dump (report.c adds them).
  * The screenshot comes with the next frame drawn and is written on a thread; the report goes when it's
@@ -16,6 +18,8 @@ __declspec(dllimport) void WINAPI GetLocalTime(void *);
 
 #define ONgGameState  (*(u8 **)0x5ece7c)
 #define GS_TICK(gs)   (*(u32 *)((gs) + 0x144))
+#define GS_CAMERA(gs) (*(u8 **)((gs) + 0x80))   /* +0x58 position, +0x64 view (photo.c) */
+#define M3gCamera     (*(u8 **)0x63112c)
 #define BUG_MAX       8
 #define BUG_WAIT_MS   8000
 
@@ -28,6 +32,22 @@ static void put_line(HANDLE f, const char *s)
 	u32 w;
 	WriteFile(f, s, str_len(s), &w, 0);
 	WriteFile(f, "\r\n", 2, &w, 0);
+}
+
+static int round_i(float f) { return (int)(f < 0 ? f - 0.5f : f + 0.5f); }
+
+void bug_camera_text(char *out)   /* (out: 96 bytes) */
+{
+	u8 *gs = ONgGameState, *cam = gs ? GS_CAMERA(gs) : 0;
+	const float *p, *v;
+	if (!cam) { str_cpy(out, 64, "no camera"); return; }
+	p = (const float *)(cam + 0x58);
+	v = (const float *)(cam + 0x64);
+	fmt(out, "camera at %d %d %d, looking %d %d %d", round_i(p[0]), round_i(p[1]), round_i(p[2]),
+	    round_i(v[0] * 1000), round_i(v[1] * 1000), round_i(v[2] * 1000));
+	if (M3gCamera)   /* the renderer's camera: +0x38 the vertical field of view in radians (photo.c) */
+		fmt(out + str_len(out), ", %d.%d degrees high", round_i(*(float *)(M3gCamera + 0x38) * 572.958f) / 10,
+		    round_i(*(float *)(M3gCamera + 0x38) * 572.958f) % 10);
 }
 
 /* chat.c: returns what the chat says */
@@ -64,6 +84,8 @@ const char *bug_report(const char *text)
 		fmt(line, "time: %04u-%02u-%02u %02u:%02u:%02u", t.year, t.month, t.day, t.hour, t.minute, t.second);
 		put_line(f, line);
 		fmt(line, "session: %s, slot %d, tick %u, Arklite %s", net_session_id(), net_local_slot(), g_tick, ARKLITE_VERSION);
+		put_line(f, line);
+		bug_camera_text(line);
 		put_line(f, line);
 		net_ping_text(line, sizeof line);
 		put_line(f, "ping:");
