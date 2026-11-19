@@ -24,14 +24,18 @@ Safety:
   counts, never addresses.
 
 Problem reports (TCP, the same port number; --reports DIR, off without it):
-- Arklite sends one when a network game goes out of sync, a player drops, or Oni crashed: the log
-  and the dumps, cleaned on the player's PC (no addresses, chat or absolute paths; names stay),
-  each file an LZ4 block. One report per connection: "AKRP", version, body length, the body
+- Arklite sends one when a network game goes out of sync (desync), a player drops (drop), Oni
+  crashed (crash, at its next start), its memory guard stopped a bad free (heap), a warm-up or
+  match of 30 s or more ended (match: with its recording, .akn) and when a player types /bug (bug:
+  a note, a screenshot and the recording so far): the log, the machine and setup dump and the
+  dumps, cleaned on the player's PC (no addresses or absolute paths; names and chat stay), each
+  file an LZ4 block, up to 7 files and 12 MB packed (Arklite 0.6.0). One report per connection: "AKRP", version, body length, the body
   (Arklite version, source hash, reason, player slot, tick, session ID, the files), answered "OK".
 - Kept in DIR/<day>/<session>/<slot>-<reason>-<time>-<n>/: info.json and each file as <name>.lz4.
   With --by-commit (the dev helper, for test builds): DIR/<commit>/<day>/..., the commit taken from the
   sender's Arklite version (0.6.0+aae9b9f), "unknown" without one.
-  The sender's address is never written (it only rate-limits, in memory). Reports older than
+  The sender's address is never written (it only rate-limits, in memory: reports and bytes an hour
+  per IP, so every PC of a LAN behind one address gets its match reports in). Reports older than
   REPORT_KEEP_DAYS go, and the oldest go first when DIR holds more than --reports-max-mb.
 """
 import argparse
@@ -75,12 +79,16 @@ REPORT_FILE = struct.Struct("<64sII")        # name, raw size, packed size
 REPORT_MAX = 16 << 20       # a report's body, at most
 REPORT_FILE_MAX = 64 << 20  # a file unpacked, at most
 REPORT_FILES = 8
-REPORT_RATE = 12.0 / 3600   # reports per second per IP (12 an hour: players behind one address share it)...
-REPORT_BURST = 12.0         # ...with this many at once
-REPORT_CONNS = 6            # connections at once (each holds up to REPORT_MAX in memory)
-REPORT_TIMEOUT_S = 60       # a connection that hasn't sent its report by then is closed
+REPORT_RATE = 120.0 / 3600  # reports per second per IP: 120 an hour (0.6.0 sends one per warm-up or match from every
+REPORT_BURST = 40.0         # PC, and players behind one address share it), with this many at once
+REPORT_BYTES_RATE = (256 << 20) / 3600   # bytes per second per IP: 256 MB an hour...
+REPORT_BYTES_BURST = 128 << 20           # ...with this many at once (a flood can't push everyone's reports out)
+REPORT_CONNS = 6            # connections at once (each holds up to REPORT_MAX in memory)...
+REPORT_CONNS_PER_IP = 2     # ...and from one IP (a slow sender can't keep everyone else's out)
+REPORT_IDLE_S = 60          # a connection that sent nothing for this long is closed...
+REPORT_TIMEOUT_S = 900      # ...and one that hasn't sent its report by then (12 MB on a slow upload takes minutes)
 REPORT_KEEP_DAYS = 30
-REASONS = {1: "desync", 2: "crash", 3: "drop", 4: "heap"}
+REASONS = {1: "desync", 2: "crash", 3: "drop", 4: "heap", 5: "match", 6: "bug"}
 
 
 class Bucket:
@@ -90,12 +98,12 @@ class Bucket:
         self.tokens = burst
         self.at = time.monotonic()
 
-    def take(self, rate, burst, now):
+    def take(self, rate, burst, now, amount=1.0):
         self.tokens = min(burst, self.tokens + (now - self.at) * rate)
         self.at = now
-        if self.tokens < 1.0:
+        if self.tokens < amount:
             return False
-        self.tokens -= 1.0
+        self.tokens -= amount
         return True
 
 
@@ -116,8 +124,8 @@ class Reports:
         self.by_commit = by_commit
         self.max_bytes = max_bytes
         self.count = count
-        self.conns = {}           # socket -> [buffer, opened at, ip]
-        self.buckets = {}         # ip -> Bucket (memory only)
+        self.conns = {}           # socket -> [buffer, opened at, ip, last data at]
+        self.buckets = {}         # ip -> [reports Bucket, bytes Bucket] (memory only)
         self.serial = 0
         os.makedirs(folder, exist_ok=True)
 
@@ -137,12 +145,12 @@ class Reports:
                 c, addr = self.sock.accept()
             except (BlockingIOError, OSError):
                 return
-            if len(self.conns) >= REPORT_CONNS:
+            if len(self.conns) >= REPORT_CONNS or sum(1 for st in self.conns.values() if st[2] == addr[0]) >= REPORT_CONNS_PER_IP:
                 self.count("report refused: busy")
                 c.close()
                 continue
             c.setblocking(False)
-            self.conns[c] = [bytearray(), now, addr[0]]
+            self.conns[c] = [bytearray(), now, addr[0], now]
 
     def readable(self, c, now):
         st = self.conns.get(c)
@@ -160,6 +168,7 @@ class Reports:
             return
         buf = st[0]
         buf += data
+        st[3] = now
         if len(buf) >= REPORT_HEAD.size:
             magic, version, n = REPORT_HEAD.unpack_from(buf)
             if magic != REPORT_MAGIC or version != 1 or n > REPORT_MAX or n < REPORT_INFO.size:
@@ -172,10 +181,12 @@ class Reports:
     def finish(self, c, body, ip, now):
         b = self.buckets.get(ip)
         if b is None:
-            b = self.buckets[ip] = Bucket(REPORT_BURST)
+            b = self.buckets[ip] = [Bucket(REPORT_BURST), Bucket(REPORT_BYTES_BURST)]
         answer = b"NO\0\0"
-        if not b.take(REPORT_RATE, REPORT_BURST, now):
+        if not b[0].take(REPORT_RATE, REPORT_BURST, now):
             self.count("report refused: too many")
+        elif not b[1].take(REPORT_BYTES_RATE, REPORT_BYTES_BURST, now, float(len(body))):
+            self.count("report refused: too many bytes")
         else:
             try:
                 self.store(body)
@@ -226,10 +237,10 @@ class Reports:
             json.dump(info, f, indent=1)
 
     def expire(self, now):
-        for c in [c for c, st in self.conns.items() if now - st[1] > REPORT_TIMEOUT_S]:
+        for c in [c for c, st in self.conns.items() if now - st[3] > REPORT_IDLE_S or now - st[1] > REPORT_TIMEOUT_S]:
             self.count("report closed: too slow")
             self.close(c)
-        for ip in [ip for ip, b in self.buckets.items() if now - b.at > 3 * 3600]:
+        for ip in [ip for ip, b in self.buckets.items() if now - max(b[0].at, b[1].at) > 3 * 3600]:
             del self.buckets[ip]
 
     def tidy(self):
